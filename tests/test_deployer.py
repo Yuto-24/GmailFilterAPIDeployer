@@ -162,6 +162,21 @@ class TestDeployer(unittest.TestCase):
         with self.assertRaises(d.DeploymentError):
             d.make_plan(self.base,self.target,self.b[:-1],'test@example.invalid',{})
 
+    def test_selected_target_preserves_declined_group(self):
+        from pathlib import Path
+        original = self.b + [{'criteria':{'from':'extra@example.invalid'},
+                              'action':{'addLabelIds':['label:Action/Delete'],'removeLabelIds':[]}}]
+        initial=d.make_plan(None,self.target,original,'test@example.invalid',{})
+        subset=d.select_plan_groups(initial,['other'])
+        self.assertEqual(subset['selected_groups'],['other'])
+        base,target=d.planned_states(subset)
+        self.assertEqual(d.counter(base),d.counter(original))
+        self.assertTrue(any(x['criteria'].get('from')=='extra@example.invalid' for x in target))
+        self.assertEqual(sum(d.is_delete(x) for x in target),2)
+        self.assertEqual(sum(d.is_delete(x) for x in subset['add']),0)
+        self.assertEqual(sum(d.is_delete(x) for x in subset['remove']),0)
+        self.assertEqual(subset['target_size'],len(target))
+
     def test_plan_and_resume(self):
         labels={v[6:]:'id' for f in self.b for v in f['action']['addLabelIds'] if v.startswith('label:')}
         plan=d.make_plan(self.base,self.target,self.b,'test@example.invalid',labels)

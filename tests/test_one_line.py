@@ -28,6 +28,75 @@ class TestOneLine(unittest.TestCase):
         self.addCleanup(self.auth.stop); self.addCleanup(self.user.stop); self.addCleanup(self.env.stop)
         self.argv = ['run','--local-dir',str(self.local),'--batch-size','1']
 
+    def test_group_approvals_once_at_end(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        out=StringIO()
+        approvals=[]
+        def fake_confirm(prompt=""):
+            self.assertIn("[5/6]",out.getvalue())
+            approvals.append(prompt)
+            return True
+        with patch.object(d,"confirm_interactive",side_effect=fake_confirm),redirect_stdout(out):
+            self.assertEqual(d.main(self.argv),0)
+        self.assertEqual(len(approvals),1)  # Ordinary changes only.
+        self.assertIn("その他",approvals[0])
+        self.assertEqual(d.counter([x['filter'] for x in d.api_fetch(self.client)[0]]),
+                         d.counter(d.compile_xml(self.xml)))
+
+    def test_decline_delete_but_approve_other_then_resume_next_run(self):
+        base=d.compile_xml(self.base)
+        custom_delete={'criteria':{'from':'custom.delete@example.invalid'},
+                       'action':{'addLabelIds':['label:Action/Delete'],'removeLabelIds':[]}}
+        self.client=FakeClient([x for x in base if not d.is_delete(x)]+[custom_delete])
+        def approve_except_delete(prompt):
+            return "Action/Delete" not in prompt
+        with patch.object(d,'get_client',return_value=(self.client,object())), \
+             patch.object(d,'confirm_interactive',side_effect=approve_except_delete) as ask:
+            self.assertEqual(d.main(self.argv),0)
+            self.assertEqual(ask.call_count,2)
+        now=[x['filter'] for x in d.api_fetch(self.client)[0]]
+        self.assertIn(custom_delete,now)
+        self.assertNotEqual(d.counter(now),d.counter(d.compile_xml(self.xml)))
+        self.assertFalse((self.local/'run_pending.json').exists())
+        with patch.object(d,'get_client',return_value=(self.client,object())), \
+             patch.object(d,'confirm_interactive',return_value=True) as ask:
+            self.assertEqual(d.main(self.argv),0)
+            ask.assert_called_once()
+        now=[x['filter'] for x in d.api_fetch(self.client)[0]]
+        self.assertEqual(d.counter(now),d.counter(d.compile_xml(self.xml)))
+
+    def test_approve_delete_only_other_kept_untouched(self):
+        base=d.compile_xml(self.base)
+        foreign={'criteria':{'from':'obsolete.delete@example.invalid'},
+                 'action':{'addLabelIds':['label:Action/Delete'],'removeLabelIds':[]}}
+        self.client=FakeClient([x for x in base if not d.is_delete(x)] + [foreign])
+        def approve_only_delete(prompt):
+            return "Action/Delete" in prompt
+        with patch.object(d,'get_client',return_value=(self.client,object())), \
+             patch.object(d,'confirm_interactive',side_effect=approve_only_delete) as ask:
+            self.assertEqual(d.main(self.argv),0)
+            self.assertEqual(ask.call_count,2)
+        now=[x['filter'] for x in d.api_fetch(self.client)[0]]
+        self.assertEqual(sum(d.is_delete(x) for x in now),1)
+        self.assertTrue(any(x["criteria"].get("from")=="ads@example.invalid" for x in now))
+        self.assertTrue(any(x["criteria"].get("from")=="service@example.invalid" and
+                            "query" not in x["criteria"] for x in now))
+        self.assertFalse((self.local/'run_pending.json').exists())
+
+    def test_all_groups_declined_no_gmail_changes(self):
+        base=d.compile_xml(self.base)
+        foreign={'criteria':{'from':'obsolete.delete@example.invalid'},
+                 'action':{'addLabelIds':['label:Action/Delete'],'removeLabelIds':[]}}
+        self.client=FakeClient(base+[foreign])
+        before=d.counter([x['filter'] for x in d.api_fetch(self.client)[0]])
+        with patch.object(d,'get_client',return_value=(self.client,object())), \
+             patch.object(d,'confirm_interactive',return_value=False) as ask:
+            self.assertEqual(d.main(self.argv),0)
+            self.assertEqual(ask.call_count,2)
+        self.assertEqual(before,d.counter([x['filter'] for x in d.api_fetch(self.client)[0]]))
+        self.assertFalse((self.local/'run_pending.json').exists())
+
     def test_run_full_deploy_and_idempotent_second_run(self):
         with patch.object(d,'confirm_interactive',return_value=True) as confirmation:
             self.assertEqual(d.main(self.argv),0)

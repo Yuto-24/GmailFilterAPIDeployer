@@ -378,6 +378,81 @@ def compare_base_live(base: list[dict], target: list[dict], live: list[dict]) ->
     return "drift"
 
 
+RULE_GROUPS = ("trash", "delete", "other")
+RULE_GROUP_NAMES = {"trash": "Trash（実際のゴミ箱移動）",
+                    "delete": "Action/Delete（ラベル付与）",
+                    "other": "その他（Type・Service・Org等）"}
+
+
+def filter_group(rule: dict) -> str:
+    # Trash takes precedence for a live filter with multiple actions.
+    if is_trash(rule):
+        return "trash"
+    if is_delete(rule):
+        return "delete"
+    return "other"
+
+
+def selected_master_target(master: list[dict], live_base: list[dict],
+                           selected: list[str]) -> list[dict]:
+    """Approved categories follow Master. Declined categories retain live base."""
+    demand(len(selected) == len(set(selected)) and
+           all(name in RULE_GROUPS for name in selected), "無効な承認グループ")
+    approved = set(selected)
+    return ([row for row in master if filter_group(row) in approved] +
+            [row for row in live_base if filter_group(row) not in approved])
+
+
+def select_plan_groups(plan: dict, selected: list[str]) -> dict:
+    """Pin a subset of groups to the original live snapshot and XML hash."""
+    demand(plan.get("schema") == "gmail-filters-deploy-plan/v3" and
+           not plan.get("selected_groups"), "新規の差分計画のみ選択できます")
+    master = compile_xml(Path(plan["target_path"]))
+    demand(file_hash(plan["target_path"]) == plan["target_sha256"],
+           "承認前にMaster XMLが変更されました。再計画してください")
+    base = [canonical_template(x) for x in plan["baseline_snapshot"]]
+    effective = selected_master_target(master, base, selected)
+    added, removed = delta(base, effective)
+    demand(len(base) + len(added) <= FILTER_LIMIT,
+           f"追加先行時にGmailの上限1000件を超えます（現在{len(base)}、追加{len(added)}）。"
+           "配備順序の最適化が必要です")
+    from copy import deepcopy
+    new_plan = deepcopy(plan)
+    new_plan["schema"] = "gmail-filters-deploy-plan/v4"
+    new_plan["selected_groups"] = sorted(selected)
+    new_plan["target_size"] = len(effective)
+    new_plan["add"] = added
+    new_plan["remove"] = removed
+    new_plan["new_label_names"] = sorted(
+        {lab[6:] for row in added for lab in row["action"]["addLabelIds"]
+         if lab.startswith("label:")} - set(plan["expected_label_names"]))
+    new_plan["target_delete_count"] = sum(is_delete(x) for x in effective)
+    new_plan["target_trash_count"] = sum(is_trash(x) for x in effective)
+    new_plan["trash_add_count"] = sum(is_trash(x) for x in added)
+    new_plan["trash_remove_count"] = sum(is_trash(x) for x in removed)
+    new_plan["approval_digest"] = json_hash({
+        k: v for k, v in new_plan.items() if k not in {"created_utc", "approval_digest"}})
+    return new_plan
+
+
+def interactive_group_selection(plan: dict) -> list[str]:
+    """Ask per non-empty category, after the entire diff has been displayed."""
+    approved = []
+    for group in RULE_GROUPS:
+        added = sum(filter_group(x) == group for x in plan["add"])
+        removed = sum(filter_group(x) == group for x in plan["remove"])
+        if not (added or removed):
+            continue
+        print(f"\n{RULE_GROUP_NAMES[group]}: 追加 {added}件 / 削除 {removed}件", flush=True)
+        prompt = f"このグループの変更を承認しますか？ [y/N] ({RULE_GROUP_NAMES[group]}): "
+        if confirm_interactive(prompt):
+            approved.append(group)
+            print("  → 承認。", flush=True)
+        else:
+            print("  → 今回は見送り。Gmailの現在の設定を保持します。", flush=True)
+    return approved
+
+
 def make_plan(base_path: Path | None, target_path: Path, live: list[dict], acct: str, labels: dict,
               extra_baselines: list[Path] | None = None) -> dict:
     """Build a pinned, fully reviewed diff from a live API snapshot by default."""
@@ -434,24 +509,31 @@ def make_plan(base_path: Path | None, target_path: Path, live: list[dict], acct:
 
 def planned_states(plan: dict):
     """Pin actual baseline and target to the approved plan, including resume."""
-    target = compile_xml(Path(plan["target_path"]))
-    validate_delete_label_only(target)
+    master = compile_xml(Path(plan["target_path"]))
+    validate_delete_label_only(master)
     demand(file_hash(plan["target_path"]) == plan["target_sha256"], "計画作成後にTarget XMLが変わりました")
     source = plan.get("baseline_path")
     if source:
         base = compile_xml(Path(source))
         demand(file_hash(source) == plan["baseline_sha256"], "計画作成後に基準XMLが変わりました")
     else:
-        demand(plan.get("schema") == "gmail-filters-deploy-plan/v3", "旧版の配備計画は実行できません。実Gmailの状態を確認し、新しいrunで計画を作り直してください")
+        demand(plan.get("schema") in ("gmail-filters-deploy-plan/v3", "gmail-filters-deploy-plan/v4"),
+               "旧版の配備計画は実行できません。実Gmailの状態を確認してください")
         base = [canonical_template(x) for x in plan["baseline_snapshot"]]
     demand(counter(base) == counter(plan["baseline_snapshot"]), "プランの基準スナップショットが変わりました")
     demand(tokens_digest(base) == plan["live_snapshot_hash"], "基準スナップショットのハッシュが不一致")
-    demand(plan.get("schema") == "gmail-filters-deploy-plan/v3",
+    demand(plan.get("schema") in ("gmail-filters-deploy-plan/v3", "gmail-filters-deploy-plan/v4"),
            "旧形式の配備計画は適用できません。途中状態を手動照合してください")
+    if plan.get("schema") == "gmail-filters-deploy-plan/v4":
+        demand("selected_groups" in plan, "承認グループ情報がありません")
+        target = selected_master_target(master, base, plan["selected_groups"])
+    else:
+        target = master
     demand(counter(base) + Counter(json_hash(x) for x in plan["add"]) - Counter(json_hash(x) for x in plan["remove"]) == counter(target),
            "計画とMasterの差分が不一致")
     demand(plan["current_delete_count"] == sum(is_delete(x) for x in base)
            and plan["target_delete_count"] == sum(is_delete(x) for x in target), "Delete件数の記録が改変されました")
+    demand(plan["target_size"] == len(target), "承認対象の最終件数が改変されています")
     demand(plan.get("current_trash_count") == sum(is_trash(x) for x in base) and
            plan.get("target_trash_count") == sum(is_trash(x) for x in target) and
            plan.get("trash_add_count") == sum(is_trash(x) for x in plan["add"]) and
@@ -781,7 +863,8 @@ def cmd_run(args):
         plan_file = args.local_dir / 'run_plan.json'
         if pending_file.exists():
             plan = json.loads(pending_file.read_text(encoding='utf-8'))
-            demand(plan.get('schema') == 'gmail-filters-deploy-plan/v3', '旧版の配備計画が残っています。以前の配備状態を確認してから手動で整理してください')
+            demand(plan.get('schema') in ('gmail-filters-deploy-plan/v3','gmail-filters-deploy-plan/v4'),
+                   '旧版の配備計画が残っています。途中状態を確認してください')
             demand(plan['account'] == acct, '途中計画のアカウントが一致しません')
             demand(plan['target_path'] == str(target_path.resolve()), '途中計画の対象Masterと現行Masterが異なります。再開を停止しました')
             base, old_target = planned_states(plan)
@@ -804,16 +887,36 @@ def cmd_run(args):
         # The full plan is always available before accepting any modification.
         show_run_plan(plan, plan_file if not pending_file.exists() else pending_file)
         print("[5/6] 事前確認完了。上記の全変更内容を確認してください。", flush=True)
-        if not confirm_interactive():
-            print("承認されなかったためGmailは変更していません。")
-            return
-        if not pending_file.exists():
+        if pending_file.exists():
+            print("以前に承認した配備の続きです。変更対象を再確認してください。", flush=True)
+            if not confirm_interactive("承認済みの変更を再開しますか？ [y/N]: "):
+                print("今回は再開しません。途中計画は保持しました。")
+                return
+        else:
+            selected = interactive_group_selection(plan)
+            if not selected:
+                print("今回は全グループを見送りました。Gmail設定は変更していません。")
+                return
+            approved_plan = select_plan_groups(plan, selected)
+            print("\n今回承認したグループ: " +
+                  ", ".join(RULE_GROUP_NAMES[x] for x in selected), flush=True)
+            print(f"実行対象: 追加 {len(approved_plan['add'])}件 / 削除 {len(approved_plan['remove'])}件", flush=True)
+            print(f"見送りグループ: {', '.join(RULE_GROUP_NAMES[x] for x in RULE_GROUPS if x not in selected) or 'なし'}", flush=True)
+            plan = approved_plan
+            save_json(plan_file, plan)
             save_json(pending_file, plan)  # Write before any API mutation.
         journal = args.local_dir / 'logs' / (plan['approval_digest'] + '.json')
         print("[6/6] Gmailへ配備し、APIの読戻しで検証中...", flush=True)
         perform(client, plan, acct, plan['approval_digest'], journal, args.batch_size, verbose=args.verbose)
         pending_file.unlink()
-        print("API照合完了。Gmail UIのfresh exportと新着メール分類の確認は別途必要です。", flush=True)
+        if plan.get("schema") == "gmail-filters-deploy-plan/v4":
+            master = compile_xml(target_path)
+            if len(plan["selected_groups"]) < len(RULE_GROUPS) and counter(master) != counter(
+                    [x["filter"] for x in api_fetch(client)[0]]):
+                print("承認したグループはAPI照合完了。見送り分は次回のrunで再提案されます。", flush=True)
+            else:
+                print("全MasterルールのAPI照合が完了しました。", flush=True)
+        print("Gmail UIのfresh exportと新着メール分類の確認は別途必要です。", flush=True)
 
 
 def resolve_expected_email(cli_email: str | None) -> str:

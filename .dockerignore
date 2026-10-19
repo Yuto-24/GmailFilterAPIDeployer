@@ -1,0 +1,14 @@
+.git
+.github
+local
+examples
+**/credentials.json
+**/token.json
+**/*secret*.json
+*.xml
+.env
+.venv
+__pycache__
+.pytest_cache
+*.pyc
+*.zip

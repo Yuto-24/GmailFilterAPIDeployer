@@ -477,7 +477,7 @@ def make_plan(base_path: Path | None, target_path: Path, live: list[dict], acct:
     demand(all(x["action"]["addLabelIds"] == ["label:Action/Delete"] and
                not x["action"]["removeLabelIds"] for x in adds if is_delete(x)),
            "追加対象のAction/Deleteにラベル以外の処理が含まれています")
-    demand(len(live) + len(adds) <= FILTER_LIMIT, f"追加先行時に{len(live)+len(adds)}件となり上限1000超過")
+    # For interactive run, capacity is checked on the approved subset, not all proposed groups.
     existing_labels = set(labels)
     new_labels = sorted(set(x[6:] for t in adds for x in t["action"]["addLabelIds"] if x.startswith("label:")) - existing_labels)
     plan = {
@@ -570,6 +570,9 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
     demand(plan["approval_digest"] == json_hash({k: v for k, v in plan.items() if k not in {"created_utc", "approval_digest"}}), "承認済み計画が改変されています")
     demand(1 <= batch_size <= 25, "batch-sizeは1〜25件で指定してください")
     base, target = planned_states(plan)
+    demand(len(base) + len(plan["add"]) <= FILTER_LIMIT,
+           f"追加先行ではGmailの1000フィルタ上限を超えます（現行{len(base)}+追加{len(plan['add'])}）。"
+           "旧フィルタを先に削除する実行順序が必要です")
     current, labels = api_fetch(client)
     live = [x["filter"] for x in current]
     a_done, r_done = detect_position(base, plan, live)

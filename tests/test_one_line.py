@@ -215,7 +215,7 @@ class TestOneLine(unittest.TestCase):
                          'action':{'addLabelIds':['label:Service/Extra'],'removeLabelIds':[]}})
         self.client=FakeClient(more)
         output=StringIO()
-        def confirm_once():
+        def confirm_once(_prompt):
             content=output.getvalue()
             self.assertIn('[5/6]',content)
             self.assertIn('spammer0@example.invalid',content)
@@ -243,7 +243,7 @@ class TestOneLine(unittest.TestCase):
         from contextlib import redirect_stdout
         from io import StringIO
         out=StringIO()
-        def approval():
+        def approval(_prompt):
             text=out.getvalue()
             self.assertIn('【重要：ゴミ箱移動アクションの変更があります】',text)
             self.assertIn('TRASH',text)
@@ -266,7 +266,7 @@ class TestOneLine(unittest.TestCase):
                'action':{'addLabelIds':['TRASH'],'removeLabelIds':[]}}
         self.client=FakeClient(baseline+[extra])
         out=StringIO()
-        def approval():
+        def approval(_prompt):
             self.assertIn('【重要：ゴミ箱移動アクションの変更があります】',out.getvalue())
             self.assertIn('one-off@example.invalid',out.getvalue())
             return True

@@ -1,111 +1,68 @@
 # Gmail Filter API Deployer
 
-Gmailのフィルタを、Gmail設定画面からエクスポートしたAtom XMLを正本として、Gmail API経由で**差分配備**するPython CLIです。Docker Composeによる実行に対応します。
+Gmailの現行フィルタをAPIから取得し、最新のMaster XMLとの**差分を安全に配備**するPython CLIです。Docker Compose対応。
 
-**既定では書き込みをしません。** `plan`はGmailフィルタを読み取って差分計画を生成し、`apply`だけが承認ハッシュを要求して配備します。既存の`Action/Delete`ルールとSpam防御ルールは変更しない方針です。過去メールのラベルや受信トレイには触れません。
+**毎回のXMLリネームや旧Master XMLの準備は不要です。** `local/masters/`にバージョン付きのMaster XMLを元の名前で置くだけで、`validate` / `plan` / `verify` は最新版を自動選択します。`apply`は承認済み計画を使い、途中で別の最新版が届いても勝手に対象を切り替えません。
 
-> **公開リポジトリへの情報漏えい防止**：個人のMaster XML、GmailからのExport、OAuthクライアントJSON、アクセストークン、配備計画・ログをGitに登録しないでください。すべて `local/` に格納します。ファイル内容の検索式やラベル名から個人的な情報を推測できる場合があります。
-
-## 必要条件
-
-- Docker Engine / Docker Desktop と Docker Compose v2（`docker compose`）
-- Google Cloudで有効化した **Gmail API** とOAuthクライアント（**Desktop application**）
-- GmailのOAuth認可画面で利用するGoogleアカウントの許可
-
-OAuthの利用権限：`gmail.settings.basic`、`gmail.labels`、`openid`、`userinfo.email`。メール本文は読みません。OAuth同意画面がテストモードの場合、テストユーザーを登録してください。
-
-## 1. 秘密情報とXMLの配置
+## 使い方（Docker）
 
 ```bash
-mkdir -p local
-```
-
-次のように各ファイルを**ローカルの `local/` にだけ**置きます。
-
-```text
-local/
-├── credentials.json  # Google CloudのOAuth Desktop client JSON
-├── baseline.xml     # 配備済みと想定する旧Master（例 v0.12.0）
-├── target.xml       # 配備予定の新Master（例 v0.14.0）
-└── token.json        # 初回OAuth後に自動生成（共有・commit禁止）
-```
-
-`baseline.xml`は必ずしも現在のGmail設定と一致しているとは限りません。`plan`が実GmailのAPIフィルタを読み取り、**既知の基準と完全一致**した場合だけ配備計画を生成します。途中のMasterも検証する場合は `--also-baseline local/v013.xml` を指定します。
-
-Linuxで書き込み権限が不足する場合は、ホストの `id -u` / `id -g` を `.env` の `LOCAL_UID` / `LOCAL_GID` に設定してください。
-
-## 2. Dockerビルドとオフライン検証
-
-```bash
+mkdir -p local/masters
+# Google Cloud OAuth Desktop client JSONを local/credentials.json に配置
+# 例: local/masters/mailFilters_v0.14.0_proposed_master_20261019.xml を配置（リネーム不要）
 docker compose build
-docker compose run --rm deployer --help
 
-docker compose run --rm deployer validate \
-  --base local/baseline.xml \
-  --target local/target.xml \
-  --out local/validation.json
+# 1. 最も新しいMaster XMLを自動選択してオフライン検証
+docker compose run --rm deployer validate
+
+# 2. Gmailの現在のフィルタ一覧をAPIから取得し、差分を計画（書き込みなし）
+docker compose run --rm --service-ports deployer plan --expected-email your-address@gmail.com
+
+# 3. local/plan.jsonを読み、追加・削除対象と承認ハッシュを確認
+# 4. 明示的に承認したときだけ配備
+# 削除0件の場合は --allow-removals は省略可
+docker compose run --rm deployer apply --expected-email your-address@gmail.com \
+  --approve PLAN_OUTPUT_DIGEST --allow-removals
+
+# 5. 配備後のGmail API上の全ルールとMaster XMLを照合
+docker compose run --rm deployer verify --expected-email your-address@gmail.com
 ```
 
-`validate` はGmail認証なしでXMLの変換、重複、Delete/Trash変更、追加先行時1000件制限などを検査します。
+OAuth認証は初回 `plan` 時にブラウザから行います。DockerのOAuthコールバック用に `plan` には `--service-ports` を指定してください。Docker Composeは `127.0.0.1:8765` だけにポートを公開します。資格情報のアクセス権は `gmail.settings.basic`、`gmail.labels`、`openid`、`userinfo.email` です。
 
-## 3. 認証と配備計画（読み取りのみ）
+次回以降は、新版を`local/masters/`へ**そのまま追加保存**するだけで、自動的に最新版へ切り替わります。古い版は残して構いません。
 
-```bash
-docker compose run --rm --service-ports deployer plan \
-  --expected-email your-address@gmail.com \
-  --base local/baseline.xml \
-  --target local/target.xml \
-  --out local/plan.json
-```
+### Master XMLの自動選択ルール
 
-初回はターミナルにGoogle OAuth URLが表示されます。**実行したPCのブラウザ**で開いて認可します。OAuthリダイレクトは `http://localhost:8765/` で、Docker Composeはホストの `127.0.0.1:8765` だけを公開しています。
+- `local/masters/*.xml` と `local/*.xml` を検索します。
+- `mailFilters_v0.14.0_proposed_master_20261019.xml` のように、`vX.Y.Z` と `master` を含むファイルを候補にします。
+- `patch`、`export`、`cumulative`、`incremental`等は選びません。
+- **バージョン順、次にファイル名内の日付順**で最も新しいものを選びます。同順位が2つある場合は自動配備せず停止します。
+- 明示指定が必要な場合のみ `--target local/masters/ファイル名.xml` を付けます。
+- 旧来の `local/target.xml` も、候補が1つもない場合に限り互換性のため利用します。
 
-ブラウザが自動起動しないのは正常です。認証中はこのコマンドを実行したコンテナを終了しないでください。次回以降は保存された `local/token.json` を再利用します。
+### 比較元はGmail実設定
 
-Docker Composeの `run` で認証ポートを公開するには**`--service-ports`が必要**です。同時に複数の認証コンテナを起動しないでください。
+従来の`local/baseline.xml`は不要です。`plan`ではGmail APIからフィルタ一覧を取得し、ラベル名へ正規化した**実際の現行状態を基準スナップショット**として`local/plan.json`に保存します。そのスナップショットと最新版Masterとの差分を出します。比較元を任意に厳格指定したい場合に限って`--base some-old-master.xml`を指定できます。
 
-既存のGmailフィルタがMasterと一致しない場合は安全のため停止します。新しい設定を無条件に上書きしません。
+`plan.json`は個人情報を含む場合があるため、Gitへコミットしないでください。`apply`は計画の承認ハッシュ、OAuth認証アカウント、XMLのSHA-256、Gmail実状態を再確認します。追加後にAPI一覧を再取得し、古いフィルタの削除は最後に実施します。途中で中断しても元のplanとlogを保持して同じ承認ハッシュで再開できます。
 
-## 4. 承認して配備
+## 不変条件と安全制約
 
-`plan` が表示した差分と `local/plan.json` をレビューし、`approval_digest` を指定します。
+- `plan` / `validate` / `verify` はフィルタの書き込みを行いません。`apply`だけ書き込みます。
+- **Action/DeleteとTrash例外のフィルタは変更禁止**。ライブGmail設定との差分でも厳格検証します。
+- APIの現在状態を正本として差分計画に含めますが、**余分な既存フィルタの削除は `apply --allow-removals` と承認ハッシュの両方が必要**です。削除件数と詳細を`local/plan.json`で確認してください。
+- 未知の複雑な条件、未対応アクションや転送フィルタ、曖昧なMaster候補、追加中の1000件上限超過、大量差分、計画からの予期しない状態変化は停止します。
+- APIで読み戻して一致しても、Gmail UIのfresh exportと実際の新着メール分類を別途検証する必要があります。**実Gmailへの配備はまだ未検証**です。
+- `local/`内にはOAuthクライアントJSON、アクセストークン、Master XML、配備計画などの**個人的なデータ**があるため、公開GitHubリポジトリへPushしないでください。`local/`はGit / Docker buildから除外しています。
 
-```bash
-docker compose run --rm deployer apply \
-  --expected-email your-address@gmail.com \
-  --plan local/plan.json \
-  --approve <planが表示したapproval_digest> \
-  --log local/deploy_log.json
-```
-
-このコマンド**だけ**がフィルタを作成・削除します。プランのSHA検証、Googleアカウント照合、Delete/Trash不変検証、実状態の段階的照合を行います。新規フィルタを先に追加して検証し、最後に旧ルールを削除します。APIの操作は原子的ではないため、途中で中断した場合は**元のplanとlogを保持したまま**再実行してください。想定外の変更が見つかった場合は停止します。
-
-## 5. 配備後の確認
+## Dockerを使わず実行する場合
 
 ```bash
-docker compose run --rm deployer verify \
-  --expected-email your-address@gmail.com \
-  --target local/target.xml \
-  --out local/verify.json
-```
-
-APIから取り直したフィルタがMasterと完全一致したことを検証します。加えてGmail設定画面の**新しいExport**を取得し、XMLの意味的な差分確認と新着メールのラベル挙動監査をしてください。API一致だけではフィルタ検索式の期待動作を保証しません。
-
-## 開発者向け（Docker外）
-
-```bash
-python -m pip install -r requirements.txt
+pip install -r requirements.txt
+python gmail_filter_deployer.py validate
+python gmail_filter_deployer.py plan --expected-email your-address@gmail.com
 python -m unittest discover -s tests -v
-python gmail_filter_deployer.py validate --base local/baseline.xml --target local/target.xml
 ```
 
-## 安全性・制限
-
-- Gmail APIのフィルタ機能はXML直接インポートではないため、`criteria`/`action`に変換します。APIとUIの表現が一致しない複雑な検索式は安全側で止めます。
-- GoogleのOAuthトークンは `local/token.json` に保存します。`local/` はGitとDocker build contextから除外しますが、PC上のファイル権限も保護してください。
-- 作成中に既存フィルタ数が1000件を超える計画は拒否します。
-- 現行プログラムはルール一式を無差別に置き換えません。**`Action/Delete`とTrash例外を不変**として扱います。
-- Gmail APIによる実アカウントへの配備は未検証です。初回は `plan` と実際のGmail Exportによる整合確認を優先してください。
-- Windows PowerShellでは行継続はバックスラッシュではなくバッククォートです。コマンドを1行にしても構いません。
-
-Gmail API公式資料：[フィルタの管理](https://developers.google.com/workspace/gmail/api/guides/filter_settings)、[Filters API](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.settings.filters)。
+Gmail API公式資料：[Managing Filters](https://developers.google.com/workspace/gmail/api/guides/filter_settings) / [users.settings.filters](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.settings.filters)。

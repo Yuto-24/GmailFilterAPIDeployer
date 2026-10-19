@@ -199,6 +199,28 @@ class TestOneLine(unittest.TestCase):
         self.assertNotIn('new@example.invalid',result)
         self.assertNotIn('service@example.invalid',result)
 
+    def test_real_api_operation_order_is_deletion_before_creation(self):
+        from test_deployer import FakeFilters
+        from contextlib import redirect_stdout
+        from io import StringIO
+        sequence=[]
+        original_delete=FakeFilters.delete
+        original_create=FakeFilters.create
+        def record_delete(instance,*args,**kwargs):
+            sequence.append('delete')
+            return original_delete(instance,*args,**kwargs)
+        def record_create(instance,*args,**kwargs):
+            sequence.append('create')
+            return original_create(instance,*args,**kwargs)
+        with patch.object(FakeFilters,'delete',record_delete), \
+             patch.object(FakeFilters,'create',record_create), \
+             patch.object(d,'confirm_interactive',return_value=True), \
+             redirect_stdout(StringIO()):
+            self.assertEqual(d.main(self.argv),0)
+        self.assertEqual(sequence.count('delete'),1)
+        self.assertEqual(sequence.count('create'),2)
+        self.assertEqual(sequence,['delete','create','create'])
+
     def test_run_full_deploy_and_idempotent_second_run(self):
         with patch.object(d,'confirm_interactive',return_value=True) as confirmation:
             self.assertEqual(d.main(self.argv),0)
@@ -222,13 +244,12 @@ class TestOneLine(unittest.TestCase):
     def test_resume_partial_deploy(self):
         real_perform=d.perform
         def interrupt(client,plan,expected,digest,log,batch,verbose=False):
-            live, labels = d.api_fetch(client)
-            for name in plan['new_label_names']:
-                if name not in labels:
-                    lab=client.users().labels().create(userId='me',body={'name':name}).execute()
-                    labels[name]=lab['id']
-            client.users().settings().filters().create(userId='me',body=d.to_api(plan['add'][0],labels)).execute()
-            raise d.DeploymentError('simulated interruption')
+            current, _ = d.api_fetch(client)
+            original = plan['remove'][0]
+            matches=[x for x in current if x['filter']==original]
+            self.assertEqual(len(matches),1)
+            client.users().settings().filters().delete(userId='me',id=matches[0]['id']).execute()
+            raise d.DeploymentError('simulated interruption immediately after first deletion')
         with patch.object(d,'confirm_interactive',return_value=True), patch.object(d,'perform',side_effect=interrupt):
             self.assertEqual(d.main(self.argv),2)
         self.assertTrue((self.local/'run_pending.json').exists())

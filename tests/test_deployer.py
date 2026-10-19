@@ -183,7 +183,12 @@ class TestDeployer(unittest.TestCase):
         self.assertEqual((len(plan['add']),len(plan['remove'])),(2,1))
         self.assertEqual(d.detect_position(self.b,plan,self.b),(0,0))
         self.assertEqual(d.detect_position(self.b,plan,self.t),(2,1))
-        self.assertEqual(d.detect_position(self.b,plan,self.b+plan['add'][:1]),(1,0))
+        self.assertEqual(plan["operation_order"], "remove_first")
+        after_first_remove=[row for row in self.b if row != plan["remove"][0]]
+        self.assertEqual(d.detect_position(self.b,plan,after_first_remove),(0,1))
+        after_all_remove=[row for row in self.b if row not in plan["remove"]]
+        self.assertEqual(d.detect_position(self.b,plan,after_all_remove),(0,len(plan["remove"])))
+        self.assertEqual(d.detect_position(self.b,plan,after_all_remove+plan["add"][:1]),(1,len(plan["remove"])))
         with self.assertRaises(d.DeploymentError):
             d.detect_position(self.b,plan,self.b+[{'criteria':{'from':'x'},'action':{'addLabelIds':['TRASH'],'removeLabelIds':[]}}])
 
@@ -203,6 +208,39 @@ class TestDeployer(unittest.TestCase):
         plan=d.make_plan(None,self.target,self.b+[extra],'test@example.invalid',{})
         self.assertEqual(plan['trash_remove_count'],1)
         self.assertIn(extra,plan['remove'])
+
+    def test_846_to_930_plan_uses_delete_first_and_avoids_limit(self):
+        common = [{"from":f"shared{i}@example.invalid", "label":"Type/Account"}
+                  for i in range(589)]
+        old = [{"from":f"old{i}@example.invalid", "label":"Type/Account"}
+               for i in range(257)]
+        new = [{"from":f"new{i}@example.invalid", "label":"Type/Account"}
+               for i in range(341)]
+        old_path=Path(self.tmp.name)/"old846.xml"
+        master_path=Path(self.tmp.name)/"target930.xml"
+        write_xml(old_path,common+old)
+        write_xml(master_path,common+new)
+        base=d.compile_xml(old_path)
+        plan=d.make_plan(None,master_path,base,'test@example.invalid',{})
+        self.assertEqual((len(base),len(plan['add']),len(plan['remove']),
+                          plan['target_size']),(846,341,257,930))
+        approved=d.select_plan_groups(plan,['other'])
+        self.assertEqual(approved["operation_order"],"remove_first")
+        self.assertEqual(d.counter(d.planned_states(approved)[1]),
+                         d.counter(d.compile_xml(master_path)))
+        removed=[row for row in base if row not in approved["remove"]]
+        self.assertEqual(len(removed),589)
+        self.assertEqual(d.detect_position(base,approved,removed),(0,257))
+        self.assertEqual(d.detect_position(base,approved,removed+approved["add"][:100]),(100,257))
+        self.assertEqual(max(len(base),len(removed)+len(approved["add"])),930)
+
+    def test_legacy_add_first_plan_resume_is_not_reinterpreted(self):
+        plan=d.make_plan(None,self.target,self.b,'test@example.invalid',{})
+        del plan['operation_order']
+        plan['approval_digest']=d.json_hash({
+            k:v for k,v in plan.items() if k not in {'created_utc','approval_digest'}})
+        self.assertEqual(d.detect_position(self.b,plan,self.b+plan['add'][:1]),(1,0))
+        self.assertEqual(d.detect_position(self.b,plan,self.t),(2,1))
 
     def test_full_mock_and_idempotent(self):
         client=FakeClient(self.b)

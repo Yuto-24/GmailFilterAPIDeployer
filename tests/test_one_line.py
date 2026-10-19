@@ -75,6 +75,30 @@ class TestOneLine(unittest.TestCase):
             self.assertEqual(d.main(self.argv),2)
         self.assertTrue((self.local/'run_pending.json').exists())
 
+    def test_disabled_gmail_api_reports_no_changes_and_help_link(self):
+        class ApiDisabled(Exception):
+            def __str__(self):
+                return ('<HttpError 403: Gmail API has not been used in project 288039233263 '
+                        'before or it is disabled. reason=accessNotConfigured>')
+        with patch.object(d,'api_fetch',side_effect=ApiDisabled()), \
+             patch.object(d,'confirm_interactive',side_effect=AssertionError('must not prompt')):
+            with patch('sys.stderr') as stderr:
+                self.assertEqual(d.main(self.argv),2)
+                text=''.join(str(x) for x in stderr.write.call_args_list)
+                self.assertIn('288039233263',text)
+                self.assertIn('Gmail設定は一切変更していません',text)
+        self.assertFalse((self.local/'run_pending.json').exists())
+        self.assertFalse((self.local/'run_plan.json').exists())
+
+    def test_other_preflight_api_error_reports_safe_stop(self):
+        with patch.object(d,'api_fetch',side_effect=RuntimeError('test 401')), \
+             patch.object(d,'confirm_interactive',side_effect=AssertionError('must not prompt')):
+            with patch('sys.stderr') as stderr:
+                self.assertEqual(d.main(self.argv),2)
+                text=''.join(str(x) for x in stderr.write.call_args_list)
+                self.assertIn('Gmail設定は変更していません',text)
+        self.assertFalse((self.local/'run_pending.json').exists())
+
     def test_interactive_mode_required_before_mutation(self):
         before=len(self.client.filters)
         with patch('sys.stdin.isatty',return_value=False):

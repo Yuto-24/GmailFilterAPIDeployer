@@ -655,6 +655,30 @@ def confirm_interactive(prompt: str = "Gmailのフィルタ設定を変更しま
     return answer in {"y", "yes"}
 
 
+def read_gmail_filters_preflight(client):
+    """Report API configuration/read errors before any Gmail writes can occur."""
+    try:
+        return api_fetch(client)
+    except Exception as exc:
+        message = str(exc)
+        if "accessNotConfigured" in message or "Gmail API has not been used" in message:
+            project_match = re.search(r"project\s+(\d+)", message)
+            project = project_match.group(1) if project_match else None
+            url = "https://console.cloud.google.com/apis/library/gmail.googleapis.com"
+            if project:
+                url += f"?project={project}"
+            raise DeploymentError(
+                "Google Cloud側でGmail APIが無効です。次のURLでGmail APIを有効化してください: "
+                f"{url}。有効化後は同じコマンドで再実行できます。"
+                "エラーはフィルタの読取段階で発生しており、Gmail設定は一切変更していません。"
+            ) from exc
+        raise DeploymentError(
+            "Gmailのラベル・フィルタ取得に失敗しました。"
+            "配備前の読取段階で停止したため、Gmail設定は変更していません。"
+            f" 原因: {message}"
+        ) from exc
+
+
 def cmd_run(args):
     """One command: auth, preflight, plan, interactive consent, apply, verify.
 
@@ -698,7 +722,7 @@ def cmd_run(args):
         demand(acct == args.expected_email, f"認証Googleアカウント不一致: {acct} != {args.expected_email}")
         print(f"      認証済み: {acct}", flush=True)
         print("[3/6] Gmailの現行ラベル・フィルタを取得中...", flush=True)
-        current, labels = api_fetch(client)
+        current, labels = read_gmail_filters_preflight(client)
         live = [x['filter'] for x in current]
         print(f"      取得完了: {len(live)}フィルタ / {len(labels)}ラベル", flush=True)
         print("[4/6] 変更差分と保護ルールを照合中...", flush=True)

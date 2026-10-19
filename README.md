@@ -97,6 +97,12 @@ docker compose run --rm deployer apply --help
 
 `local/masters/*.xml`と`local/*.xml`のうち、ファイル名に`vX.Y.Z`と`master`を含むファイルからバージョン・日付が最も新しいものを選びます。`patch`、`export`、`cumulative`、`incremental`、`baseline`、`target`は候補から除外します。同順位の候補が複数あれば停止し、明示`--target`指定を求めます。候補がない場合のみ旧`local/target.xml`を使います。
 
+## トラブルシューティング：Gmail API無効（HTTP 403）
+
+`Gmail API has not been used in project ... or it is disabled` / `accessNotConfigured` は**Google CloudのGmail APIが有効になっていない**ことを示します。エラー内のGoogle Cloudプロジェクトを選択し、[Gmail API](https://console.cloud.google.com/apis/library/gmail.googleapis.com)を有効化してから同じコマンドを再実行してください。反映には数分かかる場合があります。
+
+これはOAuth同意やメールのラベル設定とは別の問題です。`[3/6] Gmailの現行ラベル・フィルタを取得中`で発生した場合は**配備処理は開始されておらず、Gmailフィルタは一切変更されていません**。スクリプトもこの原因を個別に表示するようにしてあります。配備が実際に開始された後で別のエラーが出た場合は、進捗ログと現在のGmail設定を確認してから再開してください。
+
 ## 安全上の制約
 
 - 配備対象アカウントを`.env`の`GMAIL_EXPECTED_EMAIL`で固定し、実際にOAuthログインしたGoogleアカウントと照合します。指定がない場合は停止します。

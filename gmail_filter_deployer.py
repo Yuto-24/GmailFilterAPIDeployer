@@ -17,6 +17,7 @@ from pathlib import Path
 import re
 import sys
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 
 ATOM = "http://www.w3.org/2005/Atom"
@@ -39,6 +40,29 @@ FILTER_LIMIT = 1000
 
 class DeploymentError(Exception):
     pass
+
+
+def timestamp_prefix() -> str:
+    """Use an offset-aware clock stamp; the Docker timezone may differ from the host."""
+    return f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] "
+
+
+def timed_operation(label: str, call, verbose: bool = False):
+    """Record wall-clock timestamps and monotonic duration without changing API semantics."""
+    started = time.perf_counter()
+    if verbose:
+        print(f"{timestamp_prefix()}[処理開始] {label}", flush=True)
+    try:
+        result = call()
+    except Exception:
+        if verbose:
+            print(f"{timestamp_prefix()}[処理失敗] {label} "
+                  f"({time.perf_counter() - started:.2f}s)", flush=True)
+        raise
+    if verbose:
+        print(f"{timestamp_prefix()}[処理完了] {label} "
+              f"({time.perf_counter() - started:.2f}s)", flush=True)
+    return result
 
 
 def demand(ok: bool, message: str) -> None:
@@ -361,10 +385,14 @@ def account_email(creds) -> str:
         raise DeploymentError(f"認証アカウントのemailを照合できません: {e}") from e
 
 
-def api_fetch(client) -> tuple[list[dict], dict[str, str]]:
-    labels = client.users().labels().list(userId="me").execute().get("labels", [])
+def api_fetch(client, *, verbose: bool = False) -> tuple[list[dict], dict[str, str]]:
+    labels = timed_operation(
+        "Gmail labels.list", lambda: client.users().labels().list(userId="me").execute(),
+        verbose).get("labels", [])
     names_by_id = {x["id"]: x["name"] for x in labels}
-    filters = client.users().settings().filters().list(userId="me").execute().get("filter", [])
+    filters = timed_operation(
+        "Gmail filters.list", lambda: client.users().settings().filters().list(userId="me").execute(),
+        verbose).get("filter", [])
     demand(len(filters) <= FILTER_LIMIT, f"Gmail側フィルタ数が異常: {len(filters)}")
     normalized = [{"id": x.get("id"), "filter": live_as_template(x, names_by_id)} for x in filters]
     return normalized, {x["name"]: x["id"] for x in labels if x.get("type") == "user" or x.get("type") == "USER"}
@@ -699,7 +727,7 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
     peak = max(len(base), len(target)) if order == "remove_first" else len(base) + len(plan["add"])
     demand(peak <= FILTER_LIMIT,
            f"配備中の最大フィルタ数{peak}件がGmail上限{FILTER_LIMIT}件を超えます")
-    current, labels = api_fetch(client)
+    current, labels = api_fetch(client, verbose=verbose)
     live = [x["filter"] for x in current]
     a_done, r_done = detect_position(base, plan, live)
     print(f"配備開始（{'削除→追加' if order == 'remove_first' else '旧版・追加→削除'}）: "
@@ -708,8 +736,8 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
     if order == "remove_first" and plan["remove"]:
         print("旧ルールを先に削除するため、新ルール追加まで一部の振り分け条件が一時的に無効になります。", flush=True)
     if verbose:
-        print(f"[詳細] 既存フィルタ照合: {len(live)}件一致 / 変更対象Master: {plan['target_path']}", flush=True)
-        print(f"[詳細] 進捗記録: {log}", flush=True)
+        print(f"{timestamp_prefix()}[詳細] 既存フィルタ照合: {len(live)}件一致 / 変更対象Master: {plan['target_path']}", flush=True)
+        print(f"{timestamp_prefix()}[詳細] 進捗記録: {log}", flush=True)
     state = {"account": expected, "plan_digest": digest, "completed_add": a_done,
              "completed_remove": r_done, "events": []}
     if log.exists():
@@ -720,7 +748,7 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
 
     def remove_old(start: int, verified_adds: int):
         for j in range(start, len(plan["remove"])):
-            existing, _ = api_fetch(client)
+            existing, _ = api_fetch(client, verbose=verbose)
             old = plan["remove"][j]
             matches = [x for x in existing if x["filter"] == old]
             if not matches:
@@ -746,15 +774,19 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
                 continue
             demand(len(matches) == 1 and matches[0].get("id"),
                    f"削除対象が一意ではありません: {json_hash(old)} ({len(matches)}件)")
-            client.users().settings().filters().delete(userId="me", id=matches[0]["id"]).execute()
+            timed_operation(
+                f"Gmail filters.delete [{j+1}/{len(plan['remove'])}]",
+                lambda: client.users().settings().filters().delete(
+                    userId="me", id=matches[0]["id"]).execute(),
+                verbose)
             state["events"].append({"kind": "delete_filter", "step": j+1,
                                     "id": matches[0]["id"], "sha256": json_hash(old)})
             state["completed_remove"] = j+1
             save_json(log, state)
             if verbose:
-                print(f"[詳細] 削除 [{j+1}/{len(plan['remove'])}] "
+                print(f"{timestamp_prefix()}[詳細] 削除 [{j+1}/{len(plan['remove'])}] "
                       f"id={matches[0]['id']} {format_filter_summary(old)}", flush=True)
-            verify_partial(client, base, plan, verified_adds, j+1)
+            verify_partial(client, base, plan, verified_adds, j+1, verbose=verbose)
             print(f"旧ルール削除済み: {j+1}/{len(plan['remove'])}", flush=True)
 
     def create_new(start: int, verified_removes: int):
@@ -763,33 +795,39 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
         # Create needed labels only after confirmation and before their filters.
         for name in plan["new_label_names"]:
             if name not in labels:
-                created = client.users().labels().create(
-                    userId="me", body={"name": name,
-                                        "labelListVisibility": "labelShow",
-                                        "messageListVisibility": "show"}).execute()
+                created = timed_operation(
+                    f"Gmail labels.create {name}",
+                    lambda: client.users().labels().create(
+                        userId="me", body={"name": name,
+                                            "labelListVisibility": "labelShow",
+                                            "messageListVisibility": "show"}).execute(),
+                    verbose)
                 labels[name] = created["id"]
                 if verbose:
-                    print(f"[詳細] ラベル作成: {name}", flush=True)
+                    print(f"{timestamp_prefix()}[詳細] ラベル作成: {name}", flush=True)
                 state["events"].append({"kind": "create_label",
                                         "name": name, "id": created["id"]})
                 save_json(log, state)
         for i in range(start, len(plan["add"])):
             templ = plan["add"][i]
-            result = client.users().settings().filters().create(
-                userId="me", body=to_api(templ, labels)).execute()
+            result = timed_operation(
+                f"Gmail filters.create [{i+1}/{len(plan['add'])}]",
+                lambda: client.users().settings().filters().create(
+                    userId="me", body=to_api(templ, labels)).execute(),
+                verbose)
             demand(result.get("id"), "フィルタ作成APIからIDが返りませんでした。停止します")
             state["events"].append({"kind": "create_filter", "step": i+1,
                                     "id": result["id"], "sha256": json_hash(templ)})
             state["completed_add"] = i+1
             save_json(log, state)
             if verbose:
-                print(f"[詳細] 追加 [{i+1}/{len(plan['add'])}] "
+                print(f"{timestamp_prefix()}[詳細] 追加 [{i+1}/{len(plan['add'])}] "
                       f"id={result['id']} {format_filter_summary(templ)}", flush=True)
             if (i+1) % batch_size == 0 or i+1 == len(plan["add"]):
                 if verbose:
-                    print(f"[詳細] Gmail API再取得・追加フィルタ照合中: "
+                    print(f"{timestamp_prefix()}[詳細] Gmail API再取得・追加フィルタ照合中: "
                           f"{i+1}/{len(plan['add'])}", flush=True)
-                verify_partial(client, base, plan, i+1, verified_removes)
+                verify_partial(client, base, plan, i+1, verified_removes, verbose=verbose)
                 print(f"追加済み: {i+1}/{len(plan['add'])}件、Gmail再取得一致", flush=True)
 
     if order == "remove_first":
@@ -801,9 +839,9 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
         remove_old(r_done, len(plan["add"]))
 
     if verbose:
-        print("[詳細] 最終API照合中（配備後の全フィルタ）", flush=True)
-    verify_partial(client, base, plan, len(plan["add"]), len(plan["remove"]))
-    demand(counter([x["filter"] for x in api_fetch(client)[0]]) == counter(target),
+        print(f"{timestamp_prefix()}[詳細] 最終API照合中（配備後の全フィルタ）", flush=True)
+    verify_partial(client, base, plan, len(plan["add"]), len(plan["remove"]), verbose=verbose)
+    demand(counter([x["filter"] for x in api_fetch(client, verbose=verbose)[0]]) == counter(target),
            "配備後の最終照合が一致しません")
     state["verified"] = True
     save_json(log, state)
@@ -811,7 +849,7 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
           "Gmail UI exportも別途取得して照合してください")
 
 
-def verify_partial(client, base: list[dict], plan: dict, add_count: int, remove_count: int):
+def verify_partial(client, base: list[dict], plan: dict, add_count: int, remove_count: int, *, verbose=False):
     expected = counter(base)
     for x in plan["add"][:add_count]:
         expected[json_hash(x)] += 1
@@ -821,7 +859,7 @@ def verify_partial(client, base: list[dict], plan: dict, add_count: int, remove_
         expected[k] -= 1
         if expected[k] == 0:
             del expected[k]
-    current, _ = api_fetch(client)
+    current, _ = api_fetch(client, verbose=verbose)
     actual = counter([x["filter"] for x in current])
     demand(expected == actual, f"API読戻しが不一致。expected={sum(expected.values())} / actual={sum(actual.values())}。後続操作を停止")
     return True
@@ -1031,14 +1069,16 @@ def cmd_run(args):
         target = compile_xml(target_path)  # Offline preflight before OAuth.
         print(f"      検証完了: {target_path.name}（{len(target)}件）", flush=True)
         if args.verbose:
-            print(f"[詳細] Master SHA-256: {file_hash(target_path)}", flush=True)
+            print(f"{timestamp_prefix()}[詳細] Master SHA-256: {file_hash(target_path)}", flush=True)
         print("[2/6] Google OAuth認証とアカウント照合中...", flush=True)
         client, creds = get_client(args.client_secrets, args.token)
         acct = account_email(creds)
         demand(acct == args.expected_email, f"認証Googleアカウント不一致: {acct} != {args.expected_email}")
         print(f"      認証済み: {acct}", flush=True)
         print("[3/6] Gmailの現行ラベル・フィルタを取得中...", flush=True)
-        current, labels = read_gmail_filters_preflight(client)
+        current, labels = timed_operation(
+            "Gmail初期フィルタ・ラベル取得",
+            lambda: read_gmail_filters_preflight(client), args.verbose)
         live = [x['filter'] for x in current]
         print(f"      取得完了: {len(live)}フィルタ / {len(labels)}ラベル", flush=True)
         print("[4/6] 変更差分と保護ルールを照合中...", flush=True)
@@ -1065,10 +1105,12 @@ def cmd_run(args):
                 return
             save_json(plan_file, plan)
         if args.verbose:
-            print(f"[詳細] 追加 {len(plan['add'])}件 / 削除 {len(plan['remove'])}件 / 新規ラベル {len(plan['new_label_names'])}件", flush=True)
-            print(f"[詳細] 計画SHA-256: {plan['approval_digest']}", flush=True)
+            print(f"{timestamp_prefix()}[詳細] 追加 {len(plan['add'])}件 / 削除 {len(plan['remove'])}件 / 新規ラベル {len(plan['new_label_names'])}件", flush=True)
+            print(f"{timestamp_prefix()}[詳細] 計画SHA-256: {plan['approval_digest']}", flush=True)
         conflicts = [] if pending_file.exists() else deletion_preview(plan, current)
         print("[5/6] 差分内容の確認と承認...", flush=True)
+        if args.verbose:
+            print(f"{timestamp_prefix()}[計測] 対話確認フェーズを開始（承認待ち時間を含む）", flush=True)
         show_run_plan(plan, plan_file if not pending_file.exists() else pending_file,
                       verbose=args.verbose, conflicts=conflicts)
         if pending_file.exists():
@@ -1087,7 +1129,7 @@ def cmd_run(args):
             # Validate the approved subset, labels, and live snapshot BEFORE
             # the final question. Keep this check read-only.
             planned_states(plan)
-            refreshed, _ = api_fetch(client)
+            refreshed, _ = api_fetch(client, verbose=args.verbose)
             demand(counter(x["filter"] for x in refreshed) == counter(live),
                    "承認操作中にGmail側でフィルタ設定が変更されました。再実行して差分を更新してください")
             skipped = plan["skipped_deletions"]
@@ -1104,7 +1146,7 @@ def cmd_run(args):
             print(f"実行件数: 追加 {len(plan['add'])}件 / 削除 {len(plan['remove'])}件"
                   f" / スキップ {len(plan['skipped_deletions'])}件", flush=True)
         # Every deterministic precondition is checked BEFORE final [y/N].
-        latest, _ = api_fetch(client)
+        latest, _ = api_fetch(client, verbose=args.verbose)
         journal = args.local_dir / 'logs' / (plan['approval_digest'] + '.json')
         validate_before_final_approval(plan, acct, journal, args.batch_size, latest)
         print("事前検証: 計画・削除ID・容量・進捗ログ・API payloadを確認済み。", flush=True)
@@ -1115,9 +1157,13 @@ def cmd_run(args):
             save_json(plan_file, plan)
             save_json(pending_file, plan)  # Save only after final approval, before API mutation.
         print("[6/6] Gmailへ配備し、APIの読戻しで検証中...", flush=True)
-        perform(client, plan, acct, plan['approval_digest'], journal, args.batch_size, verbose=args.verbose)
+        timed_operation(
+            "承認済み計画の配備（削除・追加・検証）",
+            lambda: perform(client, plan, acct, plan['approval_digest'],
+                            journal, args.batch_size, verbose=args.verbose),
+            args.verbose)
         pending_file.unlink()
-        actual, _ = api_fetch(client)
+        actual, _ = api_fetch(client, verbose=args.verbose)
         master = compile_xml(target_path)
         master_only, gmail_only = delta([x["filter"] for x in actual], master)
         skipped = plan.get("skipped_deletions", [])
@@ -1195,7 +1241,13 @@ def main(argv=None):
     try:
         if args.cmd in ("plan", "apply", "verify", "run"):
             args.expected_email = resolve_expected_email(args.expected_email)
-        args.func(args)
+        started = time.perf_counter()
+        try:
+            args.func(args)
+        finally:
+            if args.cmd == "run" and args.verbose:
+                print(f"{timestamp_prefix()}[計測] run全体（対話確認を含む）: "
+                      f"{time.perf_counter() - started:.2f}s", flush=True)
     except DeploymentError as exc:
         print("STOP: " + str(exc), file=sys.stderr)
         return 2

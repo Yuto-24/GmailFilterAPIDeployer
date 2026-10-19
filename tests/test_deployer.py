@@ -1,4 +1,4 @@
-"""Synthetic-only tests: never publish personal Gmail filter exports."""
+"""Synthetic fixtures only; never check personal filter exports into Git."""
 import json
 from pathlib import Path
 import sys
@@ -9,133 +9,173 @@ import xml.etree.ElementTree as ET
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import gmail_filter_deployer as d
 
-BASE = [
-    {"from": "service@example.invalid", "label": "Service/Example"},
-    {"from": "service@example.invalid", "label": "Type/Promotion"},
-    {"from": "ads@example.invalid", "label": "Action/Delete"},
-    {"hasTheWord": "in:spam {phishing}", "shouldTrash": "true"},
-]
-TARGET = [
-    BASE[0],
-    {"from": "service@example.invalid", "subject": "{sale coupon}", "label": "Type/Promotion"},
-    BASE[2], BASE[3],
-    {"from": "new@example.invalid", "label": "Service/New"},
-]
 
 def write_xml(path, rows):
-    ET.register_namespace("", d.ATOM)
-    ET.register_namespace("apps", d.APPS)
-    feed = ET.Element(f"{{{d.ATOM}}}feed")
+    ET.register_namespace('', d.ATOM)
+    ET.register_namespace('apps', d.APPS)
+    feed=ET.Element(f'{{{d.ATOM}}}feed')
     for props in rows:
-        entry = ET.SubElement(feed, f"{{{d.ATOM}}}entry")
-        for name, value in props.items():
-            ET.SubElement(entry, f"{{{d.APPS}}}property", {"name": name, "value": value})
-    ET.ElementTree(feed).write(path, encoding="utf-8", xml_declaration=True)
+        entry=ET.SubElement(feed, f'{{{d.ATOM}}}entry')
+        for k,v in props.items():
+            ET.SubElement(entry, f'{{{d.APPS}}}property', {'name':k,'value':v})
+    ET.ElementTree(feed).write(path, encoding='utf-8', xml_declaration=True)
+
+BASE=[
+    {'from':'service@example.invalid','label':'Service/Example'},
+    {'from':'service@example.invalid','label':'Type/Promotion'},
+    {'from':'ads@example.invalid','label':'Action/Delete'},
+    {'hasTheWord':'in:spam {phishing}', 'shouldTrash':'true'},
+]
+TARGET=[
+    BASE[0],
+    {'from':'service@example.invalid','subject':'{sale coupon}', 'label':'Type/Promotion'},
+    BASE[2], BASE[3],
+    {'from':'new@example.invalid','label':'Service/New'},
+]
 
 class Req:
-    def __init__(self, fn):
-        self.fn = fn
-    def execute(self):
-        return self.fn()
+    def __init__(self, fn): self.fn=fn
+    def execute(self): return self.fn()
 
 class FakeLabels:
-    def __init__(self, parent):
-        self.p = parent
-    def list(self, userId):
-        return Req(lambda: {"labels": [{"id": k, "name": v, "type": "user"} for k, v in self.p.id_to_label.items()]})
-    def create(self, userId, body):
+    def __init__(self,parent): self.p=parent
+    def list(self,userId): return Req(lambda:{'labels':[{'id':k,'name':v,'type':'user'} for k,v in self.p.id_to_label.items()]})
+    def create(self,userId,body):
         def act():
-            key = f"Label_{len(self.p.id_to_label) + 1}"
-            self.p.id_to_label[key] = body["name"]
-            return {"id": key, "name": body["name"]}
+            i=f'Label_{len(self.p.id_to_label)+1}'
+            self.p.id_to_label[i]=body['name']
+            return {'id':i,'name':body['name']}
         return Req(act)
-
 class FakeFilters:
-    def __init__(self, parent):
-        self.p = parent
-    def list(self, userId):
-        return Req(lambda: {"filter": list(self.p.filters.values())})
-    def create(self, userId, body):
+    def __init__(self,parent): self.p=parent
+    def list(self,userId): return Req(lambda:{'filter':list(self.p.filters.values())})
+    def create(self,userId,body):
         def act():
-            self.p.n += 1
-            key = f"filter_{self.p.n}"
-            self.p.filters[key] = {"id": key, **body}
-            return {"id": key}
+            self.p.n+=1
+            i=f'filter_{self.p.n}'
+            self.p.filters[i]={'id':i,**body}
+            return {'id':i}
         return Req(act)
-    def delete(self, userId, id):
-        def act():
-            del self.p.filters[id]
-            return {}
+    def delete(self,userId,id):
+        def act(): del self.p.filters[id]; return {}
         return Req(act)
-
 class FakeUsers:
-    def __init__(self, parent):
-        self.p = parent
-    def labels(self):
-        return FakeLabels(self.p)
-    def settings(self):
-        return self
-    def filters(self):
-        return FakeFilters(self.p)
-
+    def __init__(self,parent): self.p=parent
+    def labels(self): return FakeLabels(self.p)
+    def settings(self): return self
+    def filters(self): return FakeFilters(self.p)
 class FakeClient:
-    def __init__(self, templates):
-        names = sorted(set(x[6:] for t in templates for x in t["action"]["addLabelIds"] if x.startswith("label:")))
-        self.id_to_label = {f"Label_{i + 1}": x for i, x in enumerate(names)}
-        ids = {name: lid for lid, name in self.id_to_label.items()}
-        self.filters = {f"filter_{i + 1}": {"id": f"filter_{i + 1}", **d.to_api(t, ids)} for i, t in enumerate(templates)}
-        self.n = len(templates)
-    def users(self):
-        return FakeUsers(self)
+    def __init__(self,templates):
+        names=sorted(set(v[6:] for t in templates for v in t['action']['addLabelIds'] if v.startswith('label:')))
+        self.id_to_label={f'Label_{i+1}':v for i,v in enumerate(names)}
+        ids={v:k for k,v in self.id_to_label.items()}
+        self.filters={f'filter_{i+1}':{'id':f'filter_{i+1}',**d.to_api(t,ids)} for i,t in enumerate(templates)}
+        self.n=len(templates)
+    def users(self): return FakeUsers(self)
 
 class TestDeployer(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.base = Path(self.temp.name) / "baseline.xml"
-        self.target = Path(self.temp.name) / "target.xml"
-        write_xml(self.base, BASE)
-        write_xml(self.target, TARGET)
-        self.b = d.compile_xml(self.base)
-        self.t = d.compile_xml(self.target)
+        self.tmp=tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base=Path(self.tmp.name)/'base.xml'
+        self.target=Path(self.tmp.name)/'target.xml'
+        write_xml(self.base,BASE)
+        write_xml(self.target,TARGET)
+        self.b=d.compile_xml(self.base)
+        self.t=d.compile_xml(self.target)
 
-    def test_compile_delta_and_protection(self):
-        self.assertEqual((len(self.b), len(self.t)), (4, 5))
-        add, remove = d.delta(self.b, self.t)
-        self.assertEqual((len(add), len(remove)), (2, 1))
-        d.protect(self.b, self.t)
+    def test_select_latest_master_without_renaming(self):
+        masters=Path(self.tmp.name)/'masters'
+        masters.mkdir()
+        write_xml(masters/'mailFilters_v0.13.0_proposed_master_20261012.xml',BASE)
+        new=masters/'mailFilters_v0.14.0_proposed_master_20261019.xml'
+        write_xml(new,TARGET)
+        write_xml(masters/'mailFilters_v9.99.0_incremental_master_20990101.xml',BASE)
+        write_xml(masters/'mailFilters_v9.99.0_patch_20990101.xml',BASE)
+        self.assertEqual(d.select_master(Path(self.tmp.name)),new)
+        self.assertEqual(d.select_master(Path(self.tmp.name), self.base), self.base)
+        self.assertEqual(len(d.compile_xml(d.select_master(Path(self.tmp.name)))),5)
+
+    def test_same_version_and_date_requires_explicit_selection(self):
+        masters=Path(self.tmp.name)/'masters'
+        masters.mkdir()
+        write_xml(masters/'mailFilters_v0.14.0_proposed_master_20261019.xml',BASE)
+        write_xml(masters/'mailFilters_v0.14.0_revised_master_20261019.xml',TARGET)
+        with self.assertRaises(d.DeploymentError):
+            d.select_master(Path(self.tmp.name))
+
+    def test_live_baseline_plan_requires_no_legacy_file(self):
+        client=FakeClient(self.b)
+        live,labels=d.api_fetch(client)
+        plan=d.make_plan(None,self.target,[x['filter'] for x in live], 'test@example.invalid', labels)
+        self.assertEqual(plan['schema'],'gmail-filters-deploy-plan/v2')
+        self.assertIsNone(plan['baseline_path'])
+        self.assertEqual((len(plan['add']),len(plan['remove'])),(2,1))
+        self.assertEqual(d.counter(d.planned_states(plan)[0]),d.counter(self.b))
+        log=Path(self.tmp.name)/'live-log.json'
+        d.perform(client,plan,'test@example.invalid',plan['approval_digest'],log,batch_size=1)
+        d.perform(client,plan,'test@example.invalid',plan['approval_digest'],log,batch_size=1)
+        self.assertEqual(d.counter([x['filter'] for x in d.api_fetch(client)[0]]),d.counter(self.t))
+
+    def test_live_baseline_rejects_delete_change_and_unknown_state(self):
+        extra=[{'from':'other@example.invalid','label':'Action/Delete'}]
+        live=self.b+d.compile_xml(self._write_extra(extra))
+        with self.assertRaises(d.DeploymentError):
+            d.make_plan(None,self.target,live,'test@example.invalid',{})
+        plan=d.make_plan(None,self.target,self.b,'test@example.invalid',{})
+        altered=self.b[1:]+[{'criteria':{'from':'unrelated@example.invalid'},
+                              'action':{'addLabelIds':['label:Service/X'],'removeLabelIds':[]}}]
+        with self.assertRaises(d.DeploymentError):
+            d.detect_position(d.planned_states(plan)[0],plan,altered)
+
+    def _write_extra(self, rows):
+        out=Path(self.tmp.name)/'extra.xml'
+        write_xml(out, rows)
+        return out
+
+    def test_xml_compilation_and_diff(self):
+        self.assertEqual((len(self.b),len(self.t)),(4,5))
+        add,remove=d.delta(self.b,self.t)
+        self.assertEqual((len(add),len(remove)),(2,1))
+        d.protect(self.b,self.t)
 
     def test_compound_from_query(self):
-        template = d.build_template({"from": "a@example.invalid OR b@example.invalid", "subject": "{one two}", "label": "Type/Account"})
-        self.assertEqual(template["criteria"]["query"], "{from:a@example.invalid from:b@example.invalid} subject:{one two}")
+        f=d.build_template({'from':'a@example.invalid OR b@example.invalid','subject':'{one two}','label':'Type/Account'})
+        self.assertEqual(f['criteria']['query'],'{from:a@example.invalid from:b@example.invalid} subject:{one two}')
 
-    def test_delete_and_unlabeled_filter_rejection(self):
+    def test_reject_unsafe_delete(self):
         with self.assertRaises(d.DeploymentError):
-            d.check_xml_rules([{"from": "ads@example.invalid", "label": "Action/Delete", "shouldTrash": "true"}])
-        with self.assertRaises(d.DeploymentError):
-            d.check_xml_rules([{"from": "all@example.invalid", "shouldNeverSpam": "true"}])
-        changed = [dict(x) for x in self.b]
-        changed[2]["criteria"] = {"from": "different@example.invalid"}
-        with self.assertRaises(d.DeploymentError):
-            d.protect(self.b, changed)
+            d.check_xml_rules([{'from':'a@example.invalid','label':'Action/Delete','shouldTrash':'true'}])
+        changed=[dict(x) for x in self.b]
+        changed[2]['criteria']={'from':'changed@example.invalid'}
+        with self.assertRaises(d.DeploymentError): d.protect(self.b,changed)
 
-    def test_unknown_state_refused(self):
+    def test_unsupported_from(self):
         with self.assertRaises(d.DeploymentError):
-            d.make_plan(self.base, self.target, self.b[:-1], "test@example.invalid", {})
+            d.build_template({'from':'a@example.invalid OR (b@example.invalid AND c@example.invalid)','label':'Type/Account'})
 
-    def test_plan_resume_and_end_to_end(self):
-        mock = FakeClient(self.b)
-        rows, labels = d.api_fetch(mock)
-        plan = d.make_plan(self.base, self.target, [x["filter"] for x in rows], "test@example.invalid", labels)
-        self.assertEqual((len(plan["add"]), len(plan["remove"])), (2, 1))
-        self.assertEqual(d.detect_position(self.b, plan, self.b), (0, 0))
-        self.assertEqual(d.detect_position(self.b, plan, self.b + plan["add"][:1]), (1, 0))
-        self.assertEqual(d.detect_position(self.b, plan, self.t), (2, 1))
-        log = Path(self.temp.name) / "deploy.json"
-        d.perform(mock, plan, "test@example.invalid", plan["approval_digest"], log, batch_size=1)
-        d.perform(mock, plan, "test@example.invalid", plan["approval_digest"], log, batch_size=1)
-        self.assertEqual(d.counter([x["filter"] for x in d.api_fetch(mock)[0]]), d.counter(self.t))
-        self.assertTrue(json.loads(log.read_text())["verified"])
+    def test_unknown_live_state_rejected(self):
+        with self.assertRaises(d.DeploymentError):
+            d.make_plan(self.base,self.target,self.b[:-1],'test@example.invalid',{})
 
-if __name__ == "__main__":
-    unittest.main()
+    def test_plan_and_resume(self):
+        labels={v[6:]:'id' for f in self.b for v in f['action']['addLabelIds'] if v.startswith('label:')}
+        plan=d.make_plan(self.base,self.target,self.b,'test@example.invalid',labels)
+        self.assertEqual((len(plan['add']),len(plan['remove'])),(2,1))
+        self.assertEqual(d.detect_position(self.b,plan,self.b),(0,0))
+        self.assertEqual(d.detect_position(self.b,plan,self.t),(2,1))
+        self.assertEqual(d.detect_position(self.b,plan,self.b+plan['add'][:1]),(1,0))
+        with self.assertRaises(d.DeploymentError):
+            d.detect_position(self.b,plan,self.b+[{'criteria':{'from':'x'},'action':{'addLabelIds':['TRASH'],'removeLabelIds':[]}}])
+
+    def test_full_mock_and_idempotent(self):
+        client=FakeClient(self.b)
+        live,labels=d.api_fetch(client)
+        plan=d.make_plan(self.base,self.target,[x['filter'] for x in live],'test@example.invalid',labels)
+        log=Path(self.tmp.name)/'log.json'
+        d.perform(client,plan,'test@example.invalid',plan['approval_digest'],log,batch_size=1)
+        d.perform(client,plan,'test@example.invalid',plan['approval_digest'],log,batch_size=1)
+        self.assertEqual(d.counter([x['filter'] for x in d.api_fetch(client)[0]]),d.counter(self.t))
+        self.assertTrue(json.loads(log.read_text())['verified'])
+
+if __name__=='__main__': unittest.main()

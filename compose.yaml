@@ -1,0 +1,15 @@
+services:
+  deployer:
+    build: .
+    init: true
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    volumes:
+      - ./local:/app/local
+    environment:
+      GMAIL_OAUTH_HOST: localhost
+      GMAIL_OAUTH_BIND_ADDR: 0.0.0.0
+      GMAIL_OAUTH_PORT: "8765"
+      GMAIL_OAUTH_OPEN_BROWSER: "0"
+    ports:
+      - "127.0.0.1:8765:8765"
+    restart: "no"

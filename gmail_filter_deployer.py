@@ -821,7 +821,11 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
             if verbose:
                 print(f"{timestamp_prefix()}[詳細] 削除 [{j+1}/{len(plan['remove'])}] "
                       f"id={matches[0]['id']} {format_filter_summary(old)}", flush=True)
-            verify_partial(client, base, plan, verified_adds, j+1, verbose=verbose, label_cache=labels)
+            verify_partial(
+                client, base, plan, verified_adds, j+1, verbose=verbose, label_cache=labels,
+                expected_filter_ids={row["id"] for row in existing if row.get("id")}
+                                    - {matches[0]["id"]},
+                diagnostic_dir=log.parent / "diagnostics")
             print(f"旧ルール削除済み: {j+1}/{len(plan['remove'])}", flush=True)
 
     def create_new(start: int, verified_removes: int):
@@ -862,7 +866,9 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
                 if verbose:
                     print(f"{timestamp_prefix()}[詳細] Gmail API再取得・追加フィルタ照合中: "
                           f"{i+1}/{len(plan['add'])}", flush=True)
-                verify_partial(client, base, plan, i+1, verified_removes, verbose=verbose)
+                verify_partial(
+                    client, base, plan, i+1, verified_removes, verbose=verbose,
+                    diagnostic_dir=log.parent / "diagnostics")
                 print(f"追加済み: {i+1}/{len(plan['add'])}件、Gmail再取得一致", flush=True)
 
     if order == "remove_first":
@@ -875,7 +881,8 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
 
     if verbose:
         print(f"{timestamp_prefix()}[詳細] 最終API照合中（配備後の全フィルタ）", flush=True)
-    verify_partial(client, base, plan, len(plan["add"]), len(plan["remove"]), verbose=verbose)
+    verify_partial(client, base, plan, len(plan["add"]), len(plan["remove"]),
+                   verbose=verbose, diagnostic_dir=log.parent / "diagnostics")
     demand(counter([x["filter"] for x in fetch_for_deploy(client, verbose=verbose)[0]]) == counter(target),
            "配備後の最終照合が一致しません")
     state["verified"] = True
@@ -888,7 +895,9 @@ READBACK_DELAYS_SECONDS = (2, 5)  # Exactly three reads, no writes between reads
 
 
 def verify_partial(client, base: list[dict], plan: dict, add_count: int, remove_count: int,
-                   *, verbose=False, label_cache: dict[str, str] | None = None):
+                   *, verbose=False, label_cache: dict[str, str] | None = None,
+                   expected_filter_ids: set[str] | None = None,
+                   diagnostic_dir: Path | None = None):
     expected = counter(base)
     for x in plan["add"][:add_count]:
         expected[json_hash(x)] += 1
@@ -919,10 +928,37 @@ def verify_partial(client, base: list[dict], plan: dict, add_count: int, remove_
         unexpected = actual - expected
         missing_count = sum(missing.values())
         unexpected_count = sum(unexpected.values())
+        actual_ids = {row["id"] for row in current if row.get("id")}
+        missing_ids = sorted(expected_filter_ids - actual_ids) if expected_filter_ids is not None else []
+        unexpected_ids = sorted(actual_ids - expected_filter_ids) if expected_filter_ids is not None else []
+        if diagnostic_dir is not None:
+            # Retain the *first* inconsistent response, even if later reads recover.
+            # The directory is beside the local journal; local/ is gitignored.
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            snapshot = diagnostic_dir / (
+                f"readback_{stamp}_a{add_count}_r{remove_count}_{attempt+1}.json")
+            save_json(snapshot, {
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "attempt": attempt + 1,
+                "attempts": attempts,
+                "completed_add": add_count,
+                "completed_remove": remove_count,
+                "expected_count": sum(expected.values()),
+                "observed_count": sum(actual.values()),
+                "missing_rule_hashes": dict(missing),
+                "unexpected_rule_hashes": dict(unexpected),
+                "missing_filter_ids": missing_ids,
+                "unexpected_filter_ids": unexpected_ids,
+                "observed_filters": current,
+            })
+            print(f"{timestamp_prefix()}[診断保存] {snapshot}", flush=True)
         print(f"{timestamp_prefix()}API読戻し不一致 ({attempt + 1}/{attempts}): "
               f"expected={sum(expected.values())} / actual={sum(actual.values())} / "
               f"不足={missing_count} / 予定外={unexpected_count}", flush=True)
         if verbose:
+            if expected_filter_ids is not None:
+                print(f"{timestamp_prefix()}[詳細] フィルタID差分: "
+                      f"不足={missing_ids[:10]} / 予定外={unexpected_ids[:10]}", flush=True)
             for sha in sorted(missing)[:5]:
                 rule = expected_templates.get(sha)
                 print(f"{timestamp_prefix()}[詳細] 不足 SHA={sha[:16]} "

@@ -168,14 +168,46 @@ class TestOneLine(unittest.TestCase):
         with self.assertRaises(d.DeploymentError):
             d.check_xml_rules([{'from':'x@example.invalid','label':'Action/Delete','shouldTrash':'true'}])
 
-    def test_trash_mismatch_remains_hard_stop(self):
-        baseline = d.compile_xml(self.base)
-        altered = [x for x in baseline if not d.is_trash(x)]
-        self.client = FakeClient(altered)
+    def test_trash_mismatch_preview_last_prompt_then_apply(self):
+        baseline=d.compile_xml(self.base)
+        self.client=FakeClient([x for x in baseline if not d.is_trash(x)])
+        from contextlib import redirect_stdout
+        from io import StringIO
+        out=StringIO()
+        def approval():
+            text=out.getvalue()
+            self.assertIn('【重要：ゴミ箱移動アクションの変更があります】',text)
+            self.assertIn('TRASH',text)
+            self.assertIn('[5/6]',text)
+            self.assertIn('【追加するフィルタ',text)
+            return True
         with patch.object(d,'get_client',return_value=(self.client,object())), \
-             patch.object(d,'confirm_interactive',side_effect=AssertionError('must not prompt')):
-            self.assertEqual(d.main(self.argv),2)
-        self.assertFalse((self.local/'run_pending.json').exists())
+             patch.object(d,'confirm_interactive',side_effect=approval) as confirm,redirect_stdout(out):
+            self.assertEqual(d.main(self.argv),0)
+            confirm.assert_called_once()
+        current=[x['filter'] for x in d.api_fetch(self.client)[0]]
+        self.assertEqual(d.counter(current),d.counter(d.compile_xml(self.xml)))
+        self.assertEqual(sum(d.is_trash(x) for x in current),1)
+
+    def test_trash_extra_live_rule_removed_after_single_approval(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        baseline=d.compile_xml(self.base)
+        extra={'criteria':{'from':'one-off@example.invalid'},
+               'action':{'addLabelIds':['TRASH'],'removeLabelIds':[]}}
+        self.client=FakeClient(baseline+[extra])
+        out=StringIO()
+        def approval():
+            self.assertIn('【重要：ゴミ箱移動アクションの変更があります】',out.getvalue())
+            self.assertIn('one-off@example.invalid',out.getvalue())
+            return True
+        with patch.object(d,'get_client',return_value=(self.client,object())), \
+             patch.object(d,'confirm_interactive',side_effect=approval) as confirm,redirect_stdout(out):
+            self.assertEqual(d.main(self.argv),0)
+            confirm.assert_called_once()
+        current=[x['filter'] for x in d.api_fetch(self.client)[0]]
+        self.assertEqual(d.counter(current),d.counter(d.compile_xml(self.xml)))
+
 
     def test_interactive_mode_required_before_mutation(self):
         before=len(self.client.filters)

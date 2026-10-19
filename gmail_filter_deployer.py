@@ -299,15 +299,6 @@ def is_trash(t: dict) -> bool:
     return "TRASH" in t["action"]["addLabelIds"]
 
 
-def protect(base: list[dict], target: list[dict], actual: list[dict] | None = None) -> None:
-    """Master is authoritative for Delete labels; Trash remains an exception."""
-    demand(counter([x for x in base if is_trash(x)]) == counter([x for x in target if is_trash(x)]),
-           "Trashルールは誤削除防止のため自動変更しません")
-    if actual is not None:
-        demand(counter([x for x in base if is_trash(x)]) == counter([x for x in actual if is_trash(x)]),
-               "Gmail実設定のTrash保護ルールが基準と不一致")
-
-
 def validate_delete_label_only(target: list[dict]) -> None:
     for row in target:
         if is_delete(row):
@@ -407,14 +398,11 @@ def make_plan(base_path: Path | None, target_path: Path, live: list[dict], acct:
             adds, removes = delta(b0, live)
             raise DeploymentError(f"Gmail実設定が既知の基準XMLと一致しません（Gmailのみ: {len(adds)} / 基準のみ: {len(removes)}）。自動上書きしません")
         source_path, base = status
-    protect(base, target, live)
     adds, removes = delta(base, target)
-    demand(not any(is_trash(x) for x in adds + removes), "Trash保護ルールは変更禁止")
     demand(all(x["action"]["addLabelIds"] == ["label:Action/Delete"] and
                not x["action"]["removeLabelIds"] for x in adds if is_delete(x)),
            "追加対象のAction/Deleteにラベル以外の処理が含まれています")
     demand(len(live) + len(adds) <= FILTER_LIMIT, f"追加先行時に{len(live)+len(adds)}件となり上限1000超過")
-    demand(len(adds) <= 200 and len(removes) <= 30, "差分が安全上限（追加200・削除30）を超えました。中断します")
     existing_labels = set(labels)
     new_labels = sorted(set(x[6:] for t in adds for x in t["action"]["addLabelIds"] if x.startswith("label:")) - existing_labels)
     plan = {
@@ -435,7 +423,10 @@ def make_plan(base_path: Path | None, target_path: Path, live: list[dict], acct:
         "remove": removes,
         "current_delete_count": len([x for x in base if is_delete(x)]),
         "target_delete_count": len([x for x in target if is_delete(x)]),
-        "protected_trash_count": len([x for x in base if is_trash(x)]),
+        "current_trash_count": sum(is_trash(x) for x in base),
+        "target_trash_count": sum(is_trash(x) for x in target),
+        "trash_add_count": sum(is_trash(x) for x in adds),
+        "trash_remove_count": sum(is_trash(x) for x in removes),
     }
     plan["approval_digest"] = json_hash({k: v for k, v in plan.items() if k not in {"created_utc", "approval_digest"}})
     return plan
@@ -461,7 +452,11 @@ def planned_states(plan: dict):
            "計画とMasterの差分が不一致")
     demand(plan["current_delete_count"] == sum(is_delete(x) for x in base)
            and plan["target_delete_count"] == sum(is_delete(x) for x in target), "Delete件数の記録が改変されました")
-    protect(base, target)
+    demand(plan.get("current_trash_count") == sum(is_trash(x) for x in base) and
+           plan.get("target_trash_count") == sum(is_trash(x) for x in target) and
+           plan.get("trash_add_count") == sum(is_trash(x) for x in plan["add"]) and
+           plan.get("trash_remove_count") == sum(is_trash(x) for x in plan["remove"]),
+           "Trash差分の承認計画が改変されています")
     return base, target
 
 
@@ -495,7 +490,6 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
     base, target = planned_states(plan)
     current, labels = api_fetch(client)
     live = [x["filter"] for x in current]
-    protect(base, target, live if counter(live) in (counter(base), counter(target)) else None)
     a_done, r_done = detect_position(base, plan, live)
     print(f"配備開始: 追加 {len(plan['add'])}件（完了 {a_done}件） / 削除 {len(plan['remove'])}件（完了 {r_done}件）", flush=True)
     if verbose:
@@ -539,7 +533,6 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
         old = plan["remove"][j]
         matches = [x for x in current if x["filter"] == old]
         demand(len(matches) == 1, f"削除対象が一意ではありません: {json_hash(old)} ({len(matches)}件)")
-        demand(not is_trash(old), "Trash保護フィルタは削除できません")
         client.users().settings().filters().delete(userId="me", id=matches[0]["id"]).execute()
         state["events"].append({"kind": "delete_filter", "step": j+1, "id": matches[0]["id"], "sha256": json_hash(old)})
         state["completed_remove"] = j+1
@@ -584,9 +577,7 @@ def cmd_validate(args):
     }
     if args.base:
         base = compile_xml(args.base)
-        protect(base, target)
         added, removed = delta(base, target)
-        demand(not any(is_trash(x) for x in added+removed), "Trash保護ルールの変更を検出しました")
         demand(len(base) + len(added) <= FILTER_LIMIT, "追加先行時にGmail上限1000件を超えます")
         report.update({"base": str(args.base), "base_sha256": file_hash(args.base),
                        "base_health": check_xml_rules(atom_entries(args.base)),
@@ -594,7 +585,8 @@ def cmd_validate(args):
                        "expected_intermediate_count": len(base)+len(added),
                        "delete_add": sum(is_delete(x) for x in added),
                        "delete_remove": sum(is_delete(x) for x in removed),
-                       "changes_trash": False})
+                       "trash_add": sum(is_trash(x) for x in added),
+                       "trash_remove": sum(is_trash(x) for x in removed)})
     if args.out:
         save_json(args.out, report)
     print(json.dumps(report, ensure_ascii=False, indent=2))
@@ -613,7 +605,9 @@ def cmd_plan(args):
                       "new_labels": plan["new_label_names"], "approval_digest": plan["approval_digest"],
                       "plan_file": str(args.out), "requires_allow_removals": bool(plan["remove"]),
                       "delete_add": sum(is_delete(x) for x in plan["add"]),
-                      "delete_remove": sum(is_delete(x) for x in plan["remove"])}, ensure_ascii=False, indent=2))
+                      "delete_remove": sum(is_delete(x) for x in plan["remove"]),
+                      "trash_add": plan["trash_add_count"],
+                      "trash_remove": plan["trash_remove_count"]}, ensure_ascii=False, indent=2))
     print("ドライランのみ。Gmailは変更していません。削除対象はplan.jsonで必ず確認してください")
 
 
@@ -660,7 +654,12 @@ def show_run_plan(plan: dict, plan_path: Path) -> None:
     print(f"追加 {len(adds)}件 / 既存ルール削除 {len(removes)}件 / 新規ラベル {len(plan['new_label_names'])}件")
     print(f"Action/Delete: 現行 {plan['current_delete_count']}件 → Master {plan['target_delete_count']}件")
     print(f"Action/Deleteの追加 {sum(is_delete(x) for x in adds)}件 / 削除 {sum(is_delete(x) for x in removes)}件")
-    print(f"Trash保護例外 {plan['protected_trash_count']}件（変更禁止）")
+    print(f"実際のゴミ箱移動（TRASH）: 現行 {plan['current_trash_count']}件 → Master {plan['target_trash_count']}件")
+    print(f"TRASHアクションの追加 {plan['trash_add_count']}件 / 削除 {plan['trash_remove_count']}件")
+    if plan['trash_add_count'] or plan['trash_remove_count']:
+        print("\n【重要：ゴミ箱移動アクションの変更があります】")
+        print("  TRASHへの追加は、条件に一致する今後のメールを実際にゴミ箱へ移動させます。")
+        print("  以下の全フィルタの条件と処理を確認してください。")
     if plan['new_label_names']:
         print("\n【新規作成するラベル：全件】")
         for name in plan['new_label_names']:

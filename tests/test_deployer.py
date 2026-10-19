@@ -140,7 +140,6 @@ class TestDeployer(unittest.TestCase):
         self.assertEqual((len(self.b),len(self.t)),(4,5))
         add,remove=d.delta(self.b,self.t)
         self.assertEqual((len(add),len(remove)),(2,1))
-        d.protect(self.b,self.t)
 
     def test_compound_from_query(self):
         f=d.build_template({'from':'a@example.invalid OR b@example.invalid','subject':'{one two}','label':'Type/Account'})
@@ -151,7 +150,6 @@ class TestDeployer(unittest.TestCase):
             d.check_xml_rules([{'from':'a@example.invalid','label':'Action/Delete','shouldTrash':'true'}])
         changed=[dict(x) for x in self.b]
         changed[2]['criteria']={'from':'changed@example.invalid'}
-        d.protect(self.b, changed)  # Master may change Action/Delete conditions.
         with self.assertRaises(d.DeploymentError):
             d.validate_delete_label_only([{'criteria':{'from':'x'},'action':
                 {'addLabelIds':['label:Action/Delete'],'removeLabelIds':['UNREAD']}}])
@@ -173,6 +171,23 @@ class TestDeployer(unittest.TestCase):
         self.assertEqual(d.detect_position(self.b,plan,self.b+plan['add'][:1]),(1,0))
         with self.assertRaises(d.DeploymentError):
             d.detect_position(self.b,plan,self.b+[{'criteria':{'from':'x'},'action':{'addLabelIds':['TRASH'],'removeLabelIds':[]}}])
+
+    def test_trash_missing_in_live_is_planned_from_master(self):
+        original=[x for x in self.b if not d.is_trash(x)]
+        plan=d.make_plan(None,self.target,original,'test@example.invalid',{})
+        self.assertEqual(plan['trash_add_count'],1)
+        self.assertEqual(plan['trash_remove_count'],0)
+        self.assertEqual(plan['target_trash_count'],1)
+        self.assertEqual(len(plan['add']),3)
+        self.assertEqual(len(plan['remove']),1)
+        self.assertEqual(d.counter(d.planned_states(plan)[1]),d.counter(self.t))
+
+    def test_extra_live_trash_removed_by_master(self):
+        extra={'criteria':{'from':'unsolicited@example.invalid'},'action':
+               {'addLabelIds':['TRASH'],'removeLabelIds':[]}}
+        plan=d.make_plan(None,self.target,self.b+[extra],'test@example.invalid',{})
+        self.assertEqual(plan['trash_remove_count'],1)
+        self.assertIn(extra,plan['remove'])
 
     def test_full_mock_and_idempotent(self):
         client=FakeClient(self.b)

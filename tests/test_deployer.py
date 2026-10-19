@@ -224,6 +224,52 @@ class TestDeployer(unittest.TestCase):
         with self.assertRaises(d.DeploymentError):
             d.deletion_preview(plan,original+[{'id':'external','filter':extra}])
 
+    def test_missing_delete_already_satisfied_reconciles_next_state(self):
+        client=FakeClient(self.b)
+        plan=d.make_plan(None,self.target,self.b,'test@example.invalid',{})
+        log=Path(self.tmp.name)/'already-absent.json'
+        fetch=d.api_fetch
+        calls=0
+        def remove_externally_on_second_read(obj):
+            nonlocal calls
+            calls+=1
+            if calls==2:
+                current,_=fetch(obj)
+                old=plan["remove"][0]
+                matching=[x for x in current if x["filter"]==old]
+                self.assertEqual(len(matching),1)
+                obj.users().settings().filters().delete(userId='me',id=matching[0]["id"]).execute()
+            return fetch(obj)
+        with patch.object(d,'api_fetch',side_effect=remove_externally_on_second_read):
+            d.perform(client,plan,'test@example.invalid',plan["approval_digest"],log,batch_size=1)
+        self.assertEqual(d.counter([x["filter"] for x in d.api_fetch(client)[0]]),d.counter(self.t))
+        events=json.loads(log.read_text())["events"]
+        self.assertTrue(any(x["kind"]=="already_absent" for x in events))
+
+    def test_pre_final_check_catches_stale_journal_and_bad_batch(self):
+        client=FakeClient(self.b)
+        original,_=d.api_fetch(client)
+        plan=d.make_plan(None,self.target,self.b,'test@example.invalid',{})
+        log=Path(self.tmp.name)/'pre-final-log.json'
+        with self.assertRaises(d.DeploymentError):
+            d.validate_before_final_approval(plan,'test@example.invalid',log,0,original)
+        log.write_text(json.dumps({'plan_digest':'other-plan'}))
+        with self.assertRaises(d.DeploymentError):
+            d.validate_before_final_approval(plan,'test@example.invalid',log,1,original)
+        log.unlink()
+        d.validate_before_final_approval(plan,'test@example.invalid',log,1,original)
+
+    def test_pre_final_check_rejects_unexpected_deleted_filter_id(self):
+        client=FakeClient(self.b)
+        original,_=d.api_fetch(client)
+        plan=d.make_plan(None,self.target,self.b,'test@example.invalid',{})
+        for item in original:
+            if item["filter"]==plan["remove"][0]:
+                item["id"]=None
+        with self.assertRaises(d.DeploymentError):
+            d.validate_before_final_approval(plan,'test@example.invalid',
+                Path(self.tmp.name)/'pre-final-log.json',1,original)
+
     def test_plan_and_resume(self):
         labels={v[6:]:'id' for f in self.b for v in f['action']['addLabelIds'] if v.startswith('label:')}
         plan=d.make_plan(self.base,self.target,self.b,'test@example.invalid',labels)

@@ -40,7 +40,7 @@ class TestOneLine(unittest.TestCase):
         with patch.object(d,"confirm_interactive",side_effect=fake_confirm),redirect_stdout(out):
             self.assertEqual(d.main(self.argv),0)
         self.assertEqual(len(approvals),1)  # Ordinary changes only.
-        self.assertIn("その他",approvals[0])
+        self.assertIn("上記の内容でGmailのフィルタ設定を変更",approvals[0])
         self.assertEqual(d.counter([x['filter'] for x in d.api_fetch(self.client)[0]]),
                          d.counter(d.compile_xml(self.xml)))
 
@@ -62,17 +62,19 @@ class TestOneLine(unittest.TestCase):
         with patch.object(d,'get_client',return_value=(self.client,object())), \
              patch.object(d,'confirm_interactive',return_value=True) as ask:
             self.assertEqual(d.main(self.argv),0)
-            ask.assert_called_once()
+            self.assertEqual(ask.call_count, 2)
+            self.assertIn("Action/Delete", ask.call_args_list[0].args[0])
+            self.assertIn("上記の内容で", ask.call_args_list[1].args[0])
         now=[x['filter'] for x in d.api_fetch(self.client)[0]]
         self.assertEqual(d.counter(now),d.counter(d.compile_xml(self.xml)))
 
-    def test_approve_delete_only_other_kept_untouched(self):
+    def test_approve_delete_and_basic_with_final_confirmation(self):
         base=d.compile_xml(self.base)
         foreign={'criteria':{'from':'obsolete.delete@example.invalid'},
                  'action':{'addLabelIds':['label:Action/Delete'],'removeLabelIds':[]}}
         self.client=FakeClient([x for x in base if not d.is_delete(x)] + [foreign])
         def approve_only_delete(prompt):
-            return "Action/Delete" in prompt
+            return "Action/Delete" in prompt or "上記の内容で" in prompt
         with patch.object(d,'get_client',return_value=(self.client,object())), \
              patch.object(d,'confirm_interactive',side_effect=approve_only_delete) as ask:
             self.assertEqual(d.main(self.argv),0)
@@ -81,7 +83,7 @@ class TestOneLine(unittest.TestCase):
         self.assertEqual(sum(d.is_delete(x) for x in now),1)
         self.assertTrue(any(x["criteria"].get("from")=="ads@example.invalid" for x in now))
         self.assertTrue(any(x["criteria"].get("from")=="service@example.invalid" and
-                            "query" not in x["criteria"] for x in now))
+                            "query" in x["criteria"] for x in now))
         self.assertFalse((self.local/'run_pending.json').exists())
 
     def test_all_groups_declined_no_gmail_changes(self):
@@ -96,6 +98,106 @@ class TestOneLine(unittest.TestCase):
             self.assertEqual(ask.call_count,2)
         self.assertEqual(before,d.counter([x['filter'] for x in d.api_fetch(self.client)[0]]))
         self.assertFalse((self.local/'run_pending.json').exists())
+
+    def test_order_details_and_final_confirmation_before_api_mutation(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        base=d.compile_xml(self.base)
+        custom_delete={'criteria':{'from':'custom-delete@example.invalid'},
+                       'action':{'addLabelIds':['label:Action/Delete'],'removeLabelIds':[]}}
+        custom_trash={'criteria':{'from':'custom-trash@example.invalid'},
+                      'action':{'addLabelIds':['TRASH'],'removeLabelIds':[]}}
+        self.client=FakeClient([x for x in base if not d.is_delete(x) and not d.is_trash(x)] +
+                               [custom_delete,custom_trash])
+        output=StringIO()
+        prompts=[]
+        count_before=len(self.client.filters)
+        def confirm(prompt):
+            txt=output.getvalue()
+            prompts.append(prompt)
+            self.assertEqual(len(self.client.filters), count_before)
+            self.assertIn('【基本（Type・Service・Org等）】',txt)
+            self.assertIn('【Action/Delete（ラベル付与）】',txt)
+            if len(prompts)>1:
+                self.assertIn('【Trash（実際のゴミ箱移動）】',txt)
+            return True
+        with patch.object(d,'get_client',return_value=(self.client,object())), \
+             patch.object(d,'confirm_interactive',side_effect=confirm),redirect_stdout(output):
+            self.assertEqual(d.main(self.argv),0)
+        self.assertEqual(len(prompts),3)
+        self.assertIn('Action/Delete',prompts[0])
+        self.assertIn('Trash',prompts[1])
+        self.assertIn('上記の内容で',prompts[2])
+        txt=output.getvalue()
+        self.assertLess(txt.index('【基本（Type・Service・Org等）】'),
+                        txt.index('【Action/Delete（ラベル付与）】'))
+        self.assertLess(txt.index('【Action/Delete（ラベル付与）】'),
+                        txt.index('【Trash（実際のゴミ箱移動）】'))
+        self.assertIn('custom-delete@example.invalid',txt)
+        self.assertIn('custom-trash@example.invalid',txt)
+        self.assertIn('ads@example.invalid',txt)
+        self.assertEqual(d.counter([x['filter'] for x in d.api_fetch(self.client)[0]]),
+                         d.counter(d.compile_xml(self.xml)))
+
+    def test_final_decline_after_both_group_approvals_is_noop(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        baseline=d.compile_xml(self.base)
+        custom_delete={'criteria':{'from':'custom-delete@example.invalid'},
+                       'action':{'addLabelIds':['label:Action/Delete'],'removeLabelIds':[]}}
+        custom_trash={'criteria':{'from':'custom-trash@example.invalid'},
+                      'action':{'addLabelIds':['TRASH'],'removeLabelIds':[]}}
+        self.client=FakeClient(baseline+[custom_delete,custom_trash])
+        before=d.counter([x['filter'] for x in d.api_fetch(self.client)[0]])
+        prompts=[]
+        def choice(prompt):
+            prompts.append(prompt)
+            return len(prompts)<3
+        with patch.object(d,'get_client',return_value=(self.client,object())), \
+             patch.object(d,'confirm_interactive',side_effect=choice), \
+             redirect_stdout(StringIO()):
+            self.assertEqual(d.main(self.argv),0)
+        self.assertEqual(len(prompts),3)
+        self.assertIn('Action/Delete',prompts[0])
+        self.assertIn('Trash',prompts[1])
+        self.assertIn('上記の内容で',prompts[2])
+        self.assertEqual(before,d.counter([x['filter'] for x in d.api_fetch(self.client)[0]]))
+        self.assertFalse((self.local/'run_pending.json').exists())
+        self.assertFalse((self.local/'logs').exists())
+
+    def test_sensitive_declined_but_basic_applied_after_final_consent(self):
+        baseline=d.compile_xml(self.base)
+        custom_delete={'criteria':{'from':'custom-delete@example.invalid'},
+                       'action':{'addLabelIds':['label:Action/Delete'],'removeLabelIds':[]}}
+        custom_trash={'criteria':{'from':'custom-trash@example.invalid'},
+                      'action':{'addLabelIds':['TRASH'],'removeLabelIds':[]}}
+        self.client=FakeClient([x for x in baseline if not d.is_delete(x) and not d.is_trash(x)] +
+                               [custom_delete,custom_trash])
+        prompts=[]
+        def choice(prompt):
+            prompts.append(prompt)
+            return '上記の内容で' in prompt
+        with patch.object(d,'get_client',return_value=(self.client,object())), \
+             patch.object(d,'confirm_interactive',side_effect=choice):
+            self.assertEqual(d.main(self.argv),0)
+        self.assertEqual(len(prompts),3)
+        live=[x['filter'] for x in d.api_fetch(self.client)[0]]
+        self.assertIn(custom_delete,live)
+        self.assertIn(custom_trash,live)
+        self.assertTrue(any(x['criteria'].get('from')=='service@example.invalid'
+                            and 'query' in x['criteria'] for x in live))
+
+    def test_basic_default_summary_without_rule_details(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        out=StringIO()
+        with patch.object(d,'confirm_interactive',return_value=False),redirect_stdout(out):
+            self.assertEqual(d.main(self.argv),0)
+        result=out.getvalue()
+        self.assertIn('【基本（Type・Service・Org等）】',result)
+        self.assertIn('基本ルールの全件詳細は -v',result)
+        self.assertNotIn('new@example.invalid',result)
+        self.assertNotIn('service@example.invalid',result)
 
     def test_run_full_deploy_and_idempotent_second_run(self):
         with patch.object(d,'confirm_interactive',return_value=True) as confirmation:
@@ -221,11 +323,11 @@ class TestOneLine(unittest.TestCase):
             self.assertIn('spammer0@example.invalid',content)
             self.assertIn('spammer20@example.invalid',content)
             self.assertIn('Action/Delete',content)
-            self.assertIn('【削除する既存フィルタ',content)
+            self.assertIn('削除する既存ルール:',content)
             return False
         with patch.object(d,'get_client',return_value=(self.client,object())), \
              patch.object(d,'confirm_interactive',side_effect=confirm_once) as prompt, redirect_stdout(output):
-            self.assertEqual(d.main(self.argv),0)
+            self.assertEqual(d.main(self.argv+['-v']),0)
             prompt.assert_called_once()
         self.assertFalse((self.local/'run_pending.json').exists())
 
@@ -245,17 +347,17 @@ class TestOneLine(unittest.TestCase):
         out=StringIO()
         def approval(_prompt):
             text=out.getvalue()
-            self.assertIn('【重要：ゴミ箱移動アクションの変更があります】',text)
+            self.assertIn('【Trash（実際のゴミ箱移動）】',text)
             self.assertIn('TRASH',text)
             self.assertIn('[5/6]',text)
-            self.assertIn('【追加するフィルタ',text)
+            self.assertIn('新たに作成するルール（全件）:',text)
             return True
         with patch.object(d,'get_client',return_value=(self.client,object())), \
              patch.object(d,'confirm_interactive',side_effect=approval) as confirm,redirect_stdout(out):
             self.assertEqual(d.main(self.argv),0)
             self.assertEqual(confirm.call_count, 2)
             self.assertIn("Trash", confirm.call_args_list[0].args[0])
-            self.assertIn("その他", confirm.call_args_list[1].args[0])
+            self.assertIn("上記の内容で", confirm.call_args_list[1].args[0])
         current=[x['filter'] for x in d.api_fetch(self.client)[0]]
         self.assertEqual(d.counter(current),d.counter(d.compile_xml(self.xml)))
         self.assertEqual(sum(d.is_trash(x) for x in current),1)
@@ -269,7 +371,7 @@ class TestOneLine(unittest.TestCase):
         self.client=FakeClient(baseline+[extra])
         out=StringIO()
         def approval(_prompt):
-            self.assertIn('【重要：ゴミ箱移動アクションの変更があります】',out.getvalue())
+            self.assertIn('【Trash（実際のゴミ箱移動）】',out.getvalue())
             self.assertIn('one-off@example.invalid',out.getvalue())
             return True
         with patch.object(d,'get_client',return_value=(self.client,object())), \
@@ -277,7 +379,7 @@ class TestOneLine(unittest.TestCase):
             self.assertEqual(d.main(self.argv),0)
             self.assertEqual(confirm.call_count, 2)
             self.assertIn("Trash", confirm.call_args_list[0].args[0])
-            self.assertIn("その他", confirm.call_args_list[1].args[0])
+            self.assertIn("上記の内容で", confirm.call_args_list[1].args[0])
         current=[x['filter'] for x in d.api_fetch(self.client)[0]]
         self.assertEqual(d.counter(current),d.counter(d.compile_xml(self.xml)))
 

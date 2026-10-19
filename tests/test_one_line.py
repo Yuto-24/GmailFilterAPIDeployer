@@ -99,6 +99,51 @@ class TestOneLine(unittest.TestCase):
                 self.assertIn('Gmail設定は変更していません',text)
         self.assertFalse((self.local/'run_pending.json').exists())
 
+    def test_delete_mismatch_preserved_with_non_delete_update(self):
+        baseline = d.compile_xml(self.base)
+        gmail_only = next(x for x in baseline if d.is_delete(x))
+        # The target XML advertises a different Delete policy, which is deferred.
+        altered = [dict(x) for x in baseline if not d.is_delete(x)]
+        altered.append({'criteria':{'from':'legacy@ads.example.invalid'},
+                        'action':{'addLabelIds':['label:Action/Delete'],'removeLabelIds':[]}})
+        self.client = FakeClient(altered)
+        with patch.object(d, 'get_client', return_value=(self.client,object())), \
+             patch.object(d, 'confirm_interactive',return_value=True):
+            self.assertEqual(d.main(self.argv),0)
+        live = [x['filter'] for x in d.api_fetch(self.client)[0]]
+        self.assertEqual(len([x for x in live if d.is_delete(x)]),1)
+        self.assertEqual(next(x for x in live if d.is_delete(x))['criteria']['from'], 'legacy@ads.example.invalid')
+        self.assertNotIn(gmail_only,live)
+        self.assertFalse((self.local/'run_pending.json').exists())
+        with patch.object(d,'confirm_interactive',side_effect=AssertionError('must not prompt')):
+            self.assertEqual(d.main(self.argv),0)
+
+    def test_delete_mismatch_preserved_after_interruption_resume(self):
+        baseline = d.compile_xml(self.base)
+        altered = [x for x in baseline if not d.is_delete(x)]
+        self.client = FakeClient(altered)
+        actual_perform=d.perform
+        with patch.object(d,'get_client',return_value=(self.client,object())), \
+             patch.object(d,'confirm_interactive',return_value=True), \
+             patch.object(d,'perform',side_effect=d.DeploymentError('interrupted')):
+            self.assertEqual(d.main(self.argv),2)
+        self.assertTrue((self.local/'run_pending.json').exists())
+        with patch.object(d,'get_client',return_value=(self.client,object())), \
+             patch.object(d,'confirm_interactive',return_value=True), \
+             patch.object(d,'perform',actual_perform):
+            self.assertEqual(d.main(self.argv),0)
+        self.assertFalse((self.local/'run_pending.json').exists())
+        self.assertEqual(sum(1 for x in d.api_fetch(self.client)[0] if d.is_delete(x['filter'])),0)
+
+    def test_trash_mismatch_remains_hard_stop(self):
+        baseline = d.compile_xml(self.base)
+        altered = [x for x in baseline if not d.is_trash(x)]
+        self.client = FakeClient(altered)
+        with patch.object(d,'get_client',return_value=(self.client,object())), \
+             patch.object(d,'confirm_interactive',side_effect=AssertionError('must not prompt')):
+            self.assertEqual(d.main(self.argv),2)
+        self.assertFalse((self.local/'run_pending.json').exists())
+
     def test_interactive_mode_required_before_mutation(self):
         before=len(self.client.filters)
         with patch('sys.stdin.isatty',return_value=False):

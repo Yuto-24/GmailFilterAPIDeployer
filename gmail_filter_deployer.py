@@ -413,9 +413,8 @@ def select_plan_groups(plan: dict, selected: list[str]) -> dict:
     base = [canonical_template(x) for x in plan["baseline_snapshot"]]
     effective = selected_master_target(master, base, selected)
     added, removed = delta(base, effective)
-    demand(len(base) + len(added) <= FILTER_LIMIT,
-           f"追加先行時にGmailの上限1000件を超えます（現在{len(base)}、追加{len(added)}）。"
-           "配備順序の最適化が必要です")
+    demand(len(effective) <= FILTER_LIMIT,
+           f"反映後のフィルタ数{len(effective)}件がGmailの上限{FILTER_LIMIT}件を超えます")
     from copy import deepcopy
     new_plan = deepcopy(plan)
     new_plan["schema"] = "gmail-filters-deploy-plan/v4"
@@ -476,6 +475,8 @@ def make_plan(base_path: Path | None, target_path: Path, live: list[dict], acct:
             raise DeploymentError(f"Gmail実設定が既知の基準XMLと一致しません（Gmailのみ: {len(adds)} / 基準のみ: {len(removes)}）。自動上書きしません")
         source_path, base = status
     adds, removes = delta(base, target)
+    demand(len(target) <= FILTER_LIMIT,
+           f"Masterのフィルタ数{len(target)}件がGmailの上限{FILTER_LIMIT}件を超えます")
     demand(all(x["action"]["addLabelIds"] == ["label:Action/Delete"] and
                not x["action"]["removeLabelIds"] for x in adds if is_delete(x)),
            "追加対象のAction/Deleteにラベル以外の処理が含まれています")
@@ -484,6 +485,7 @@ def make_plan(base_path: Path | None, target_path: Path, live: list[dict], acct:
     new_labels = sorted(set(x[6:] for t in adds for x in t["action"]["addLabelIds"] if x.startswith("label:")) - existing_labels)
     plan = {
         "schema": "gmail-filters-deploy-plan/v3",
+        "operation_order": "remove_first",
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "account": acct,
         "baseline_path": str(source_path.resolve()) if source_path else None,
@@ -526,6 +528,8 @@ def planned_states(plan: dict):
     demand(tokens_digest(base) == plan["live_snapshot_hash"], "基準スナップショットのハッシュが不一致")
     demand(plan.get("schema") in ("gmail-filters-deploy-plan/v3", "gmail-filters-deploy-plan/v4"),
            "旧形式の配備計画は適用できません。途中状態を手動照合してください")
+    demand(plan.get("operation_order", "add_first") in ("remove_first", "add_first"),
+           "配備順序の指定が不正です")
     if plan.get("schema") == "gmail-filters-deploy-plan/v4":
         demand("selected_groups" in plan, "承認グループ情報がありません")
         target = selected_master_target(master, base, plan["selected_groups"])
@@ -545,23 +549,39 @@ def planned_states(plan: dict):
 
 
 def detect_position(base: list[dict], plan: dict, live: list[dict]) -> tuple[int, int]:
-    """Resume only if the live set is exactly one prefix of this plan's ordered operations."""
+    """Resume only from an exact prefix of the plan's pinned operation order."""
     cur = counter(base)
     live_counts = counter(live)
     if cur == live_counts:
         return 0, 0
-    for i, t in enumerate(plan["add"], 1):
-        cur[json_hash(t)] += 1
-        if cur == live_counts:
-            return i, 0
-    for j, t in enumerate(plan["remove"], 1):
-        k = json_hash(t)
-        demand(cur[k] >= 1, "不正な削除計画")
-        cur[k] -= 1
-        if cur[k] == 0:
-            del cur[k]
-        if cur == live_counts:
-            return len(plan["add"]), j
+
+    def remove_one(item: dict):
+        key = json_hash(item)
+        demand(cur[key] >= 1, "不正な削除計画")
+        cur[key] -= 1
+        if cur[key] == 0:
+            del cur[key]
+
+    if plan.get("operation_order", "add_first") == "remove_first":
+        for j, item in enumerate(plan["remove"], 1):
+            remove_one(item)
+            if cur == live_counts:
+                return 0, j
+        for i, item in enumerate(plan["add"], 1):
+            cur[json_hash(item)] += 1
+            if cur == live_counts:
+                return i, len(plan["remove"])
+    else:
+        # Plans approved by the earlier add-first implementation may be
+        # mid-flight; preserve their order for deterministic recovery.
+        for i, item in enumerate(plan["add"], 1):
+            cur[json_hash(item)] += 1
+            if cur == live_counts:
+                return i, 0
+        for j, item in enumerate(plan["remove"], 1):
+            remove_one(item)
+            if cur == live_counts:
+                return len(plan["add"]), j
     demand(False, "ライブ状態が承認計画の中間状態と一致しません。外部変更や失敗の可能性があります")
     raise AssertionError
 
@@ -569,72 +589,105 @@ def detect_position(base: list[dict], plan: dict, live: list[dict]) -> tuple[int
 def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_size=20, verbose=False):
     demand(expected.lower() == plan["account"].lower(), "対象アカウントが承認計画と不一致")
     demand(digest == plan["approval_digest"], "承認ハッシュが一致しません")
-    demand(plan["approval_digest"] == json_hash({k: v for k, v in plan.items() if k not in {"created_utc", "approval_digest"}}), "承認済み計画が改変されています")
+    demand(plan["approval_digest"] == json_hash(
+        {k: v for k, v in plan.items() if k not in {"created_utc", "approval_digest"}}),
+        "承認済み計画が改変されています")
     demand(1 <= batch_size <= 25, "batch-sizeは1〜25件で指定してください")
     base, target = planned_states(plan)
-    demand(len(base) + len(plan["add"]) <= FILTER_LIMIT,
-           f"追加先行ではGmailの1000フィルタ上限を超えます（現行{len(base)}+追加{len(plan['add'])}）。"
-           "旧フィルタを先に削除する実行順序が必要です")
+    order = plan.get("operation_order", "add_first")
+    demand(order in ("remove_first", "add_first"), "配備順序が不正です")
+    peak = max(len(base), len(target)) if order == "remove_first" else len(base) + len(plan["add"])
+    demand(peak <= FILTER_LIMIT,
+           f"配備中の最大フィルタ数{peak}件がGmail上限{FILTER_LIMIT}件を超えます")
     current, labels = api_fetch(client)
     live = [x["filter"] for x in current]
     a_done, r_done = detect_position(base, plan, live)
-    print(f"配備開始: 追加 {len(plan['add'])}件（完了 {a_done}件） / 削除 {len(plan['remove'])}件（完了 {r_done}件）", flush=True)
+    print(f"配備開始（{'削除→追加' if order == 'remove_first' else '旧版・追加→削除'}）: "
+          f"削除 {len(plan['remove'])}件（完了 {r_done}件） / "
+          f"追加 {len(plan['add'])}件（完了 {a_done}件）", flush=True)
+    if order == "remove_first" and plan["remove"]:
+        print("旧ルールを先に削除するため、新ルール追加まで一部の振り分け条件が一時的に無効になります。", flush=True)
     if verbose:
         print(f"[詳細] 既存フィルタ照合: {len(live)}件一致 / 変更対象Master: {plan['target_path']}", flush=True)
         print(f"[詳細] 進捗記録: {log}", flush=True)
-    state = {"account": expected, "plan_digest": digest, "completed_add": a_done, "completed_remove": r_done, "events": []}
+    state = {"account": expected, "plan_digest": digest, "completed_add": a_done,
+             "completed_remove": r_done, "events": []}
     if log.exists():
         previous = json.loads(log.read_text(encoding="utf-8"))
         demand(previous.get("plan_digest") == digest, "他の配備ログが存在します。別パスを指定してください")
         state["events"] = previous.get("events", [])
     save_json(log, state)
-    if a_done < len(plan["add"]):
-        # Newly introduced labels must exist before creating their filters.
-        # Do not delete or alter existing labels.
+
+    def remove_old(start: int, verified_adds: int):
+        for j in range(start, len(plan["remove"])):
+            existing, _ = api_fetch(client)
+            old = plan["remove"][j]
+            matches = [x for x in existing if x["filter"] == old]
+            demand(len(matches) == 1,
+                   f"削除対象が一意ではありません: {json_hash(old)} ({len(matches)}件)")
+            client.users().settings().filters().delete(userId="me", id=matches[0]["id"]).execute()
+            state["events"].append({"kind": "delete_filter", "step": j+1,
+                                    "id": matches[0]["id"], "sha256": json_hash(old)})
+            state["completed_remove"] = j+1
+            save_json(log, state)
+            if verbose:
+                print(f"[詳細] 削除 [{j+1}/{len(plan['remove'])}] "
+                      f"id={matches[0]['id']} {format_filter_summary(old)}", flush=True)
+            verify_partial(client, base, plan, verified_adds, j+1)
+            print(f"旧ルール削除済み: {j+1}/{len(plan['remove'])}", flush=True)
+
+    def create_new(start: int, verified_removes: int):
+        if start >= len(plan["add"]):
+            return
+        # Create needed labels only after confirmation and before their filters.
         for name in plan["new_label_names"]:
             if name not in labels:
-                created = client.users().labels().create(userId="me", body={"name": name, "labelListVisibility": "labelShow", "messageListVisibility": "show"}).execute()
+                created = client.users().labels().create(
+                    userId="me", body={"name": name,
+                                        "labelListVisibility": "labelShow",
+                                        "messageListVisibility": "show"}).execute()
                 labels[name] = created["id"]
                 if verbose:
                     print(f"[詳細] ラベル作成: {name}", flush=True)
-                state["events"].append({"kind": "create_label", "name": name, "id": created["id"]})
+                state["events"].append({"kind": "create_label",
+                                        "name": name, "id": created["id"]})
                 save_json(log, state)
-        for i in range(a_done, len(plan["add"])):
+        for i in range(start, len(plan["add"])):
             templ = plan["add"][i]
-            result = client.users().settings().filters().create(userId="me", body=to_api(templ, labels)).execute()
+            result = client.users().settings().filters().create(
+                userId="me", body=to_api(templ, labels)).execute()
             demand(result.get("id"), "フィルタ作成APIからIDが返りませんでした。停止します")
-            state["events"].append({"kind": "create_filter", "step": i + 1, "id": result["id"], "sha256": json_hash(templ)})
-            state["completed_add"] = i + 1
+            state["events"].append({"kind": "create_filter", "step": i+1,
+                                    "id": result["id"], "sha256": json_hash(templ)})
+            state["completed_add"] = i+1
             save_json(log, state)
             if verbose:
-                print(f"[詳細] 追加 [{i+1}/{len(plan['add'])}] id={result['id']} {format_filter_summary(templ)}", flush=True)
-            # Confirm via a fresh live list after each small batch.
-            if (i + 1) % batch_size == 0 or (i + 1) == len(plan["add"]):
+                print(f"[詳細] 追加 [{i+1}/{len(plan['add'])}] "
+                      f"id={result['id']} {format_filter_summary(templ)}", flush=True)
+            if (i+1) % batch_size == 0 or i+1 == len(plan["add"]):
                 if verbose:
-                    print(f"[詳細] Gmail API再取得・追加フィルタ照合中: {i+1}/{len(plan['add'])}", flush=True)
-                verify_partial(client, base, plan, state["completed_add"], state["completed_remove"])
+                    print(f"[詳細] Gmail API再取得・追加フィルタ照合中: "
+                          f"{i+1}/{len(plan['add'])}", flush=True)
+                verify_partial(client, base, plan, i+1, verified_removes)
                 print(f"追加済み: {i+1}/{len(plan['add'])}件、Gmail再取得一致", flush=True)
-    # All additions have been read back before any old filters are deleted.
-    for j in range(r_done, len(plan["remove"])):
-        current, _ = api_fetch(client)
-        old = plan["remove"][j]
-        matches = [x for x in current if x["filter"] == old]
-        demand(len(matches) == 1, f"削除対象が一意ではありません: {json_hash(old)} ({len(matches)}件)")
-        client.users().settings().filters().delete(userId="me", id=matches[0]["id"]).execute()
-        state["events"].append({"kind": "delete_filter", "step": j+1, "id": matches[0]["id"], "sha256": json_hash(old)})
-        state["completed_remove"] = j+1
-        save_json(log, state)
-        if verbose:
-            print(f"[詳細] 削除 [{j+1}/{len(plan['remove'])}] id={matches[0]['id']} {format_filter_summary(old)}", flush=True)
-        verify_partial(client, base, plan, len(plan["add"]), j+1)
-        print(f"旧ルール削除済み: {j+1}/{len(plan['remove'])}", flush=True)
+
+    if order == "remove_first":
+        remove_old(r_done, 0)
+        create_new(a_done, len(plan["remove"]))
+    else:
+        # Do not reinterpret incomplete plans from older versions.
+        create_new(a_done, 0)
+        remove_old(r_done, len(plan["add"]))
+
     if verbose:
         print("[詳細] 最終API照合中（配備後の全フィルタ）", flush=True)
     verify_partial(client, base, plan, len(plan["add"]), len(plan["remove"]))
-    demand(counter([x["filter"] for x in api_fetch(client)[0]]) == counter(target), "配備後の最終照合が一致しません")
+    demand(counter([x["filter"] for x in api_fetch(client)[0]]) == counter(target),
+           "配備後の最終照合が一致しません")
     state["verified"] = True
     save_json(log, state)
-    print(f"配備完了: {len(target)}件、API読戻し一致。Gmail UI exportも別途取得して照合してください")
+    print(f"配備完了: {len(target)}件、API読戻し一致。"
+          "Gmail UI exportも別途取得して照合してください")
 
 
 def verify_partial(client, base: list[dict], plan: dict, add_count: int, remove_count: int):

@@ -1,0 +1,99 @@
+"""End-to-end tests of the interactive one-line command with a fake Gmail API."""
+import json
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from test_deployer import BASE, TARGET, FakeClient, write_xml
+import gmail_filter_deployer as d
+
+class TestOneLine(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.local = Path(self.temp.name)
+        self.xml = self.local/'masters'/'mailFilters_v0.99.0_proposed_master_20261019.xml'
+        self.xml.parent.mkdir()
+        write_xml(self.xml, TARGET)
+        self.base = self.local/'baseline.xml'
+        write_xml(self.base, BASE)
+        self.client = FakeClient(d.compile_xml(self.base))
+        self.auth = patch.object(d, 'get_client', return_value=(self.client, object()))
+        self.user = patch.object(d, 'account_email', return_value='demo@example.invalid')
+        self.env = patch.dict('os.environ', {'GMAIL_EXPECTED_EMAIL':'demo@example.invalid'}, clear=True)
+        self.auth.start(); self.user.start(); self.env.start()
+        self.addCleanup(self.auth.stop); self.addCleanup(self.user.stop); self.addCleanup(self.env.stop)
+        self.argv = ['run','--local-dir',str(self.local),'--batch-size','1']
+
+    def test_run_full_deploy_and_idempotent_second_run(self):
+        with patch.object(d,'confirm_interactive',return_value=True) as confirmation:
+            self.assertEqual(d.main(self.argv),0)
+            confirmation.assert_called_once()
+        current = [x['filter'] for x in d.api_fetch(self.client)[0]]
+        self.assertEqual(d.counter(current),d.counter(d.compile_xml(self.xml)))
+        self.assertFalse((self.local/'run_pending.json').exists())
+        self.assertTrue((self.local/'run_plan.json').exists())
+        self.assertEqual(len(list((self.local/'logs').glob('*.json'))),1)
+        with patch.object(d,'confirm_interactive',side_effect=AssertionError('should not prompt')):
+            self.assertEqual(d.main(self.argv),0)
+
+    def test_decline_makes_no_mutations(self):
+        before=d.counter([x['filter'] for x in d.api_fetch(self.client)[0]])
+        with patch.object(d,'confirm_interactive',return_value=False):
+            self.assertEqual(d.main(self.argv),0)
+        self.assertEqual(before,d.counter([x['filter'] for x in d.api_fetch(self.client)[0]]))
+        self.assertFalse((self.local/'run_pending.json').exists())
+        self.assertTrue((self.local/'run_plan.json').exists())
+
+    def test_resume_partial_deploy(self):
+        real_perform=d.perform
+        def interrupt(client,plan,expected,digest,log,batch):
+            live, labels = d.api_fetch(client)
+            for name in plan['new_label_names']:
+                if name not in labels:
+                    lab=client.users().labels().create(userId='me',body={'name':name}).execute()
+                    labels[name]=lab['id']
+            client.users().settings().filters().create(userId='me',body=d.to_api(plan['add'][0],labels)).execute()
+            raise d.DeploymentError('simulated interruption')
+        with patch.object(d,'confirm_interactive',return_value=True), patch.object(d,'perform',side_effect=interrupt):
+            self.assertEqual(d.main(self.argv),2)
+        self.assertTrue((self.local/'run_pending.json').exists())
+        with patch.object(d,'confirm_interactive',return_value=True), patch.object(d,'perform',real_perform):
+            self.assertEqual(d.main(self.argv),0)
+        self.assertFalse((self.local/'run_pending.json').exists())
+        self.assertEqual(d.counter([x['filter'] for x in d.api_fetch(self.client)[0]]),d.counter(d.compile_xml(self.xml)))
+
+    def test_pending_plan_with_unrecognized_live_changes_fails(self):
+        with patch.object(d,'confirm_interactive',return_value=True), patch.object(d,'perform',side_effect=d.DeploymentError('interrupted')):
+            self.assertEqual(d.main(self.argv),2)
+        lid=self.client.users().labels().create(userId='me',body={'name':'Service/Foreign'}).execute()['id']
+        self.client.users().settings().filters().create(userId='me',body={'criteria':{'from':'other@example.invalid'},'action':{'addLabelIds':[lid],'removeLabelIds':[]}}).execute()
+        with patch.object(d,'confirm_interactive',side_effect=AssertionError('must stop before prompt')):
+            self.assertEqual(d.main(self.argv),2)
+        self.assertTrue((self.local/'run_pending.json').exists())
+
+    def test_interactive_mode_required_before_mutation(self):
+        before=len(self.client.filters)
+        with patch('sys.stdin.isatty',return_value=False):
+            self.assertEqual(d.main(self.argv),2)
+        self.assertEqual(len(self.client.filters),before)
+        self.assertFalse((self.local/'run_pending.json').exists())
+
+    def test_account_mismatch_stops(self):
+        with patch.object(d,'account_email',return_value='wrong@example.invalid'):
+            self.assertEqual(d.main(self.argv),2)
+        self.assertFalse((self.local/'run_plan.json').exists())
+
+    def test_no_account_pin_fails_closed(self):
+        with patch.dict('os.environ',{},clear=True):
+            self.assertEqual(d.main(self.argv),2)
+
+    def test_denied_incomplete_plan_does_not_permanently_lock(self):
+        with patch.object(d,'confirm_interactive',return_value=False):
+            self.assertEqual(d.main(self.argv),0)
+            self.assertEqual(d.main(self.argv),0)
+
+if __name__=='__main__': unittest.main()

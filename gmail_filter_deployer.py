@@ -602,6 +602,117 @@ def cmd_verify(args):
     demand(report["match"], "現行フィルタはMasterと一致しません")
 
 
+def format_filter_summary(row: dict) -> str:
+    criteria = json.dumps(row["criteria"], ensure_ascii=False, sort_keys=True)
+    action = json.dumps(row["action"], ensure_ascii=False, sort_keys=True)
+    return f"条件={criteria} / 処理={action}"
+
+
+def show_run_plan(plan: dict, plan_path: Path) -> None:
+    print(f"\nGmailフィルタ配備計画: {plan['account']}")
+    print(f"Master: {plan['target_path']}")
+    print(f"現行 {plan['baseline_size']}件 → 目標 {plan['target_size']}件")
+    print(f"追加 {len(plan['add'])}件 / 既存ルール削除 {len(plan['remove'])}件 / 新規ラベル {len(plan['new_label_names'])}件")
+    print(f"Action/Delete保護 {plan['protected_delete_count']}件 / Trash例外保護 {plan['protected_trash_count']}件")
+    if plan['new_label_names']:
+        print("作成予定ラベル: " + ", ".join(plan['new_label_names']))
+    if plan['remove']:
+        print("\n【削除予定の既存フィルタ：全件】")
+        for i, row in enumerate(plan['remove'], 1):
+            print(f"  - {i}. {format_filter_summary(row)}")
+    if plan['add']:
+        print("\n【追加予定フィルタ：冒頭12件】")
+        for i, row in enumerate(plan['add'][:12], 1):
+            print(f"  + {i}. {format_filter_summary(row)}")
+        if len(plan['add']) > 12:
+            print(f"  ...残り{len(plan['add']) - 12}件は計画ファイルを確認")
+    print(f"\n全ルールの差分・承認対象: {plan_path}")
+    print("新規ラベル・フィルタ作成と、表示した旧フィルタの削除を行います。メール自体は削除しません。")
+
+
+def confirm_interactive(prompt: str = "Gmailのフィルタ設定を変更しますか？ [y/N]: ") -> bool:
+    # No implicit approval through piped input or background/scheduled runs.
+    demand(sys.stdin.isatty(), "対話端末が必要です。docker compose run（-Tなし）で実行してください")
+    try:
+        answer = input(prompt).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("\nキャンセルしました。Gmailは変更していません。")
+        return False
+    return answer in {"y", "yes"}
+
+
+def cmd_run(args):
+    """One command: auth, preflight, plan, interactive consent, apply, verify.
+
+    A pending approved plan is resumed rather than replanning from a partial
+    live state. Separate per-plan journals allow indefinitely many releases.
+    """
+    from contextlib import contextmanager
+
+    @contextmanager
+    def exclusive_lock(path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open('a+b') as lockfile:
+            try:
+                import fcntl
+                fcntl.flock(lockfile.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise DeploymentError("別のrunが進行中です。二重実行を防ぐため停止しました") from exc
+            except ImportError:
+                # Docker/Linux is the reference runtime; Windows native falls
+                # back to API state verification and must not be used concurrently.
+                pass
+            try:
+                yield
+            finally:
+                try:
+                    import fcntl
+                    fcntl.flock(lockfile.fileno(), fcntl.LOCK_UN)
+                except ImportError:
+                    pass
+
+    with exclusive_lock(args.local_dir / 'run.lock'):
+        target_path = select_master(args.local_dir, args.target)
+        target = compile_xml(target_path)  # Offline preflight before OAuth.
+        client, creds = get_client(args.client_secrets, args.token)
+        acct = account_email(creds)
+        demand(acct == args.expected_email, f"認証Googleアカウント不一致: {acct} != {args.expected_email}")
+        current, labels = api_fetch(client)
+        live = [x['filter'] for x in current]
+        pending_file = args.local_dir / 'run_pending.json'
+        plan_file = args.local_dir / 'run_plan.json'
+        if pending_file.exists():
+            plan = json.loads(pending_file.read_text(encoding='utf-8'))
+            demand(plan.get('schema') == 'gmail-filters-deploy-plan/v2', '途中計画の形式が不正です')
+            demand(plan['account'] == acct, '途中計画のアカウントが一致しません')
+            demand(plan['target_path'] == str(target_path.resolve()), '途中計画の対象Masterと現行Masterが異なります。再開を停止しました')
+            base, old_target = planned_states(plan)
+            demand(counter(target) == counter(old_target), '途中計画のMasterが変更されています')
+            a_done, r_done = detect_position(base, plan, live)
+            if a_done == len(plan['add']) and r_done == len(plan['remove']):
+                print(f"前回の配備は既に反映済みです。API一致: {len(target)}件")
+                pending_file.unlink()
+                return
+            print(f"前回の中断計画を検出しました（追加済 {a_done}/{len(plan['add'])}、削除済 {r_done}/{len(plan['remove'])}）。")
+        else:
+            plan = make_plan(None, target_path, live, acct, labels)
+            if not plan['add'] and not plan['remove']:
+                print(f"変更不要：{acct} の{len(target)}フィルタが最新Masterに一致しています。")
+                return
+            save_json(plan_file, plan)
+        # The full plan is always available before accepting any modification.
+        show_run_plan(plan, plan_file if not pending_file.exists() else pending_file)
+        if not confirm_interactive():
+            print("承認されなかったためGmailは変更していません。")
+            return
+        if not pending_file.exists():
+            save_json(pending_file, plan)  # Write before any API mutation.
+        journal = args.local_dir / 'logs' / (plan['approval_digest'] + '.json')
+        perform(client, plan, acct, plan['approval_digest'], journal, args.batch_size)
+        pending_file.unlink()
+        print("API照合完了。Gmail UIのfresh exportと新着メール分類の確認は別途必要です。")
+
+
 def resolve_expected_email(cli_email: str | None) -> str:
     """Require an account pin, preferring the CLI flag over environment."""
     configured = cli_email if cli_email is not None else os.environ.get("GMAIL_EXPECTED_EMAIL", "")
@@ -617,6 +728,10 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
     # No renaming: latest versioned master is discovered in local/masters/ or local/.
     default_local = root / "local"
+    p = sub.add_parser("run", help="検証→差分表示→対話承認→配備→API照合を1コマンドで実行")
+    p.add_argument("--target", type=Path, help="任意: デフォルトは最新Masterを自動選択")
+    p.add_argument("--batch-size", type=int, default=20, help="API読戻しの間隔。1〜25、既定20")
+    p.set_defaults(func=cmd_run)
     p = sub.add_parser("validate", help="オフライン: 最新Master XMLを検証（--baseは任意）")
     p.add_argument("--base", type=Path, help="任意の厳格な比較元XML")
     p.add_argument("--target", type=Path, help="指定しなければ最新のversioned masterを選ぶ")
@@ -639,17 +754,17 @@ def main(argv=None):
     p.add_argument("--target", type=Path, help="指定しなければ最新版を自動選択")
     p.add_argument("--out", type=Path, default=default_local / "verify.json")
     p.set_defaults(func=cmd_verify)
-    for name in ("validate", "plan", "apply", "verify"):
+    for name in ("validate", "plan", "apply", "verify", "run"):
         sub.choices[name].add_argument("--local-dir", type=Path, default=default_local,
                                        help="Master XML保存フォルダ。既定はlocal/")
-    for name in ("plan", "apply", "verify"):
+    for name in ("plan", "apply", "verify", "run"):
         p = sub.choices[name]
         p.add_argument("--expected-email", help="対象Gmailアドレス。省略時はGMAIL_EXPECTED_EMAILを使用")
         p.add_argument("--client-secrets", type=Path, default=default_local / "credentials.json")
         p.add_argument("--token", type=Path, default=default_local / "token.json")
     args = ap.parse_args(argv)
     try:
-        if args.cmd in ("plan", "apply", "verify"):
+        if args.cmd in ("plan", "apply", "verify", "run"):
             args.expected_email = resolve_expected_email(args.expected_email)
         args.func(args)
     except DeploymentError as exc:

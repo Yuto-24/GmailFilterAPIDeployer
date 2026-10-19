@@ -275,8 +275,8 @@ class TestOneLine(unittest.TestCase):
         self.assertIn('[計測] run全体（対話確認を含む）:', log)
         self.assertRegex(
             log,
-            r'\\[\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}[+-]\\d{2}:\\d{2}\\] '
-            r'\\[処理完了\\] Gmail filters.delete \\[1/1\\] \\(\\d+\\.\\d{2}s\\)')
+            r'\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}\] '
+            r'\[処理完了\] Gmail filters.delete \[1/1\] \(\d+\.\d{2}s\)')
 
     def test_operation_timer_reports_failure_without_swallowing_exception(self):
         from contextlib import redirect_stdout

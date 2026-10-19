@@ -385,17 +385,34 @@ def account_email(creds) -> str:
         raise DeploymentError(f"認証アカウントのemailを照合できません: {e}") from e
 
 
+def filters_with_known_labels(client, labels_by_name: dict[str, str], *, verbose=False) -> list[dict]:
+    """Read live filters using labels validated by the immediately preceding pre-delete read.
+
+    The next pre-delete read and the final full verification still refresh labels.
+    This cache never skips a live filters.list and never authorizes mutations.
+    """
+    names_by_id = {lid: name for name, lid in labels_by_name.items()}
+    filters = timed_operation(
+        "Gmail filters.list", lambda: client.users().settings().filters().list(userId="me").execute(),
+        verbose).get("filter", [])
+    demand(len(filters) <= FILTER_LIMIT, f"Gmail側フィルタ数が異常: {len(filters)}")
+    return [{"id": x.get("id"), "filter": live_as_template(x, names_by_id)} for x in filters]
+
+
 def api_fetch(client, *, verbose: bool = False) -> tuple[list[dict], dict[str, str]]:
     labels = timed_operation(
         "Gmail labels.list", lambda: client.users().labels().list(userId="me").execute(),
         verbose).get("labels", [])
+    # Include system and user labels for normalization; only user labels may be
+    # created or referenced as names in new filter payloads.
+    label_names = {x["name"]: x["id"] for x in labels if x.get("type") in ("user", "USER")}
     names_by_id = {x["id"]: x["name"] for x in labels}
     filters = timed_operation(
         "Gmail filters.list", lambda: client.users().settings().filters().list(userId="me").execute(),
         verbose).get("filter", [])
     demand(len(filters) <= FILTER_LIMIT, f"Gmail側フィルタ数が異常: {len(filters)}")
     normalized = [{"id": x.get("id"), "filter": live_as_template(x, names_by_id)} for x in filters]
-    return normalized, {x["name"]: x["id"] for x in labels if x.get("type") == "user" or x.get("type") == "USER"}
+    return normalized, label_names
 
 
 def fetch_for_deploy(client, verbose: bool = False):
@@ -752,8 +769,10 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
     save_json(log, state)
 
     def remove_old(start: int, verified_adds: int):
+        nonlocal labels
         for j in range(start, len(plan["remove"])):
-            existing, _ = fetch_for_deploy(client, verbose=verbose)
+            existing, latest_labels = fetch_for_deploy(client, verbose=verbose)
+            labels = latest_labels
             old = plan["remove"][j]
             matches = [x for x in existing if x["filter"] == old]
             if not matches:
@@ -791,7 +810,7 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
             if verbose:
                 print(f"{timestamp_prefix()}[詳細] 削除 [{j+1}/{len(plan['remove'])}] "
                       f"id={matches[0]['id']} {format_filter_summary(old)}", flush=True)
-            verify_partial(client, base, plan, verified_adds, j+1, verbose=verbose)
+            verify_partial(client, base, plan, verified_adds, j+1, verbose=verbose, label_cache=labels)
             print(f"旧ルール削除済み: {j+1}/{len(plan['remove'])}", flush=True)
 
     def create_new(start: int, verified_removes: int):
@@ -832,7 +851,7 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
                 if verbose:
                     print(f"{timestamp_prefix()}[詳細] Gmail API再取得・追加フィルタ照合中: "
                           f"{i+1}/{len(plan['add'])}", flush=True)
-                verify_partial(client, base, plan, i+1, verified_removes, verbose=verbose)
+                verify_partial(client, base, plan, i+1, verified_removes, verbose=verbose, label_cache=labels)
                 print(f"追加済み: {i+1}/{len(plan['add'])}件、Gmail再取得一致", flush=True)
 
     if order == "remove_first":
@@ -854,7 +873,11 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
           "Gmail UI exportも別途取得して照合してください")
 
 
-def verify_partial(client, base: list[dict], plan: dict, add_count: int, remove_count: int, *, verbose=False):
+READBACK_DELAYS_SECONDS = (2, 5)  # Exactly three reads, no writes between reads.
+
+
+def verify_partial(client, base: list[dict], plan: dict, add_count: int, remove_count: int,
+                   *, verbose=False, label_cache: dict[str, str] | None = None):
     expected = counter(base)
     for x in plan["add"][:add_count]:
         expected[json_hash(x)] += 1
@@ -864,10 +887,52 @@ def verify_partial(client, base: list[dict], plan: dict, add_count: int, remove_
         expected[k] -= 1
         if expected[k] == 0:
             del expected[k]
-    current, _ = fetch_for_deploy(client, verbose=verbose)
-    actual = counter([x["filter"] for x in current])
-    demand(expected == actual, f"API読戻しが不一致。expected={sum(expected.values())} / actual={sum(actual.values())}。後続操作を停止")
-    return True
+
+    # A mismatching Gmail list may be transient immediately after a mutation.
+    # Re-read only; never perform another mutation while the state is uncertain.
+    expected_templates = content_by_hash(base + plan["add"])
+    attempts = len(READBACK_DELAYS_SECONDS) + 1
+    for attempt in range(attempts):
+        if label_cache is None:
+            current, _ = fetch_for_deploy(client, verbose=verbose)
+        else:
+            current = filters_with_known_labels(client, label_cache, verbose=verbose)
+        actual = counter([x["filter"] for x in current])
+        if expected == actual:
+            if attempt:
+                print(f"{timestamp_prefix()}API読戻しは再照合{attempt + 1}/{attempts}回目で一致しました。"
+                      "後続処理を再開します。", flush=True)
+            return True
+
+        missing = expected - actual
+        unexpected = actual - expected
+        missing_count = sum(missing.values())
+        unexpected_count = sum(unexpected.values())
+        print(f"{timestamp_prefix()}API読戻し不一致 ({attempt + 1}/{attempts}): "
+              f"expected={sum(expected.values())} / actual={sum(actual.values())} / "
+              f"不足={missing_count} / 予定外={unexpected_count}", flush=True)
+        if verbose:
+            for sha in sorted(missing)[:5]:
+                rule = expected_templates.get(sha)
+                print(f"{timestamp_prefix()}[詳細] 不足 SHA={sha[:16]} "
+                      f"{format_filter_summary(rule) if rule else '(ルール特定不可)'}", flush=True)
+            for sha in sorted(unexpected)[:5]:
+                matching = [row for row in current if json_hash(row["filter"]) == sha]
+                ids = [row.get("id") for row in matching]
+                print(f"{timestamp_prefix()}[詳細] 予定外 SHA={sha[:16]} id={ids} "
+                      f"{format_filter_summary(matching[0]['filter']) if matching else ''}", flush=True)
+        if attempt < len(READBACK_DELAYS_SECONDS):
+            delay = READBACK_DELAYS_SECONDS[attempt]
+            if verbose:
+                print(f"{timestamp_prefix()}[詳細] Gmail実設定の再照合まで{delay}s待機（書込みなし）", flush=True)
+            time.sleep(delay)
+        else:
+            raise DeploymentError(
+                f"API読戻しが不一致（{attempts}回の読み取り後も継続）。"
+                f"expected={sum(expected.values())} / actual={sum(actual.values())} / "
+                f"不足={missing_count} / 予定外={unexpected_count}。"
+                "後続操作を停止。Gmailを変更せず診断してください")
+    raise AssertionError("unreachable readback state")
 
 
 def cmd_validate(args):

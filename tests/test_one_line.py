@@ -221,6 +221,45 @@ class TestOneLine(unittest.TestCase):
         self.assertEqual(sequence.count('create'),2)
         self.assertEqual(sequence,['delete','create','create'])
 
+    def test_ambiguous_deletion_skipped_and_partial_summary(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        original=d.compile_xml(self.base)
+        duplicated=original[1]
+        self.client=FakeClient(original+[duplicated])
+        out=StringIO()
+        with patch.object(d,'get_client',return_value=(self.client,object())), \
+             patch.object(d,'confirm_interactive',return_value=True) as confirm, \
+             redirect_stdout(out):
+            self.assertEqual(d.main(self.argv),0)
+        confirm.assert_called_once()
+        output=out.getvalue()
+        self.assertIn('スキップ予定：2件',output)
+        self.assertIn('duplicate_matches',output)
+        self.assertIn('結果: 一部未適用',output)
+        self.assertIn('スキップ: 2件',output)
+        after=[x['filter'] for x in d.api_fetch(self.client)[0]]
+        self.assertEqual(sum(x==duplicated for x in after),2)
+        self.assertEqual(len(after),7)
+        self.assertFalse((self.local/'run_pending.json').exists())
+
+    def test_ambiguous_deletion_preflight_then_final_declined(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        original=d.compile_xml(self.base)
+        self.client=FakeClient(original+[original[1]])
+        before=d.counter([x['filter'] for x in d.api_fetch(self.client)[0]])
+        out=StringIO()
+        def decline(prompt):
+            self.assertIn('スキップ予定：2件',out.getvalue())
+            return False
+        with patch.object(d,'get_client',return_value=(self.client,object())), \
+             patch.object(d,'confirm_interactive',side_effect=decline), \
+             redirect_stdout(out):
+            self.assertEqual(d.main(self.argv),0)
+        self.assertEqual(before,d.counter([x['filter'] for x in d.api_fetch(self.client)[0]]))
+        self.assertFalse((self.local/'run_pending.json').exists())
+
     def test_run_full_deploy_and_idempotent_second_run(self):
         with patch.object(d,'confirm_interactive',return_value=True) as confirmation:
             self.assertEqual(d.main(self.argv),0)

@@ -177,6 +177,53 @@ class TestDeployer(unittest.TestCase):
         self.assertEqual(sum(d.is_delete(x) for x in subset['remove']),0)
         self.assertEqual(subset['target_size'],len(target))
 
+    def test_ambiguous_deletion_is_preserved_and_other_updates_apply(self):
+        duplicated=self.b[1]
+        snapshot=self.b+[duplicated]
+        client=FakeClient(snapshot)
+        raw,labels=d.api_fetch(client)
+        plan=d.make_plan(None,self.target,[x['filter'] for x in raw],
+                         'test@example.invalid',labels)
+        conflicts=d.deletion_preview(plan,raw)
+        self.assertEqual(len(conflicts),2)
+        self.assertTrue(all(x['reason']=='duplicate_matches' and x['matches']==2
+                            for x in conflicts))
+        selected=d.select_plan_groups(plan,['other'],current=raw)
+        self.assertEqual(len(selected['skipped_deletions']),2)
+        self.assertEqual(len(selected['remove']),0)
+        base,effective=d.planned_states(selected)
+        self.assertEqual(d.counter(base),d.counter(snapshot))
+        self.assertEqual(d.counter(effective),d.counter(self.t+[duplicated,duplicated]))
+        log=Path(self.tmp.name)/'skip-log.json'
+        d.perform(client,selected,'test@example.invalid',
+                  selected['approval_digest'],log,batch_size=1)
+        self.assertEqual(d.counter([x['filter'] for x in d.api_fetch(client)[0]]),
+                         d.counter(effective))
+
+    def test_missing_filter_id_is_excluded_from_approved_deletions(self):
+        client=FakeClient(self.b)
+        original,_=d.api_fetch(client)
+        for item in original:
+            if item['filter']==self.b[1]:
+                item['id']=None
+        plan=d.make_plan(None,self.target,self.b,'test@example.invalid',{})
+        conflicts=d.deletion_preview(plan,original)
+        self.assertEqual(len(conflicts),1)
+        self.assertEqual(conflicts[0]['reason'],'missing_filter_id')
+        subset=d.select_plan_groups(plan,['other'],current=original)
+        self.assertEqual(len(subset['remove']),0)
+        self.assertEqual(d.counter(d.planned_states(subset)[1]),
+                         d.counter(self.t+[self.b[1]]))
+
+    def test_live_drift_during_preflight_is_detected(self):
+        client=FakeClient(self.b)
+        original,_=d.api_fetch(client)
+        plan=d.make_plan(None,self.target,self.b,'test@example.invalid',{})
+        extra={'criteria':{'from':'external@example.invalid'},
+               'action':{'addLabelIds':['label:Type/Promotion'],'removeLabelIds':[]}}
+        with self.assertRaises(d.DeploymentError):
+            d.deletion_preview(plan,original+[{'id':'external','filter':extra}])
+
     def test_plan_and_resume(self):
         labels={v[6:]:'id' for f in self.b for v in f['action']['addLabelIds'] if v.startswith('label:')}
         plan=d.make_plan(self.base,self.target,self.b,'test@example.invalid',labels)

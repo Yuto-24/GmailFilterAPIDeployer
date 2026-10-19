@@ -69,6 +69,35 @@ def file_hash(path: str | Path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def select_master(local_dir: Path, explicit: Path | None = None) -> Path:
+    """Choose latest numbered master by version/date; ignore patch and export files."""
+    if explicit is not None:
+        demand(explicit.is_file(), f"指定されたMaster XMLがありません: {explicit}")
+        return explicit
+    candidates = []
+    for directory in (local_dir, local_dir / "masters"):
+        if not directory.is_dir():
+            continue
+        for path in directory.glob("*.xml"):
+            stem = path.stem.lower()
+            version = re.search(r"(?:^|[_-])v(\d+)\.(\d+)\.(\d+)(?:[_-]|$)", stem)
+            if not version or "master" not in stem:
+                continue
+            if any(word in stem for word in ("patch", "export", "cumulative", "incremental", "baseline", "target")):
+                continue
+            dates = re.findall(r"(?<!\d)(20\d{6})(?!\d)", stem)
+            score = (tuple(int(x) for x in version.groups()), max(dates) if dates else "")
+            candidates.append((score, path))
+    if not candidates:
+        legacy = local_dir / "target.xml"
+        demand(legacy.is_file(), f"Master XMLがありません。{local_dir}/masters/ に mailFilters_vX.Y.Z_*master*.xml を配置してください")
+        return legacy
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    leaders = [path for score, path in candidates if score == candidates[0][0]]
+    demand(len(leaders) == 1, "同一バージョン・同一日付のMaster XMLが複数あります。--targetで指定してください: " + ", ".join(str(x) for x in leaders))
+    return leaders[0]
+
+
 def atom_entries(path: str | Path) -> list[dict[str, str]]:
     try:
         root = ET.parse(path).getroot()
@@ -347,31 +376,39 @@ def compare_base_live(base: list[dict], target: list[dict], live: list[dict]) ->
     return "drift"
 
 
-def make_plan(base_path: Path, target_path: Path, live: list[dict], acct: str, labels: dict, extra_baselines: list[Path] | None = None) -> dict:
+def make_plan(base_path: Path | None, target_path: Path, live: list[dict], acct: str, labels: dict,
+              extra_baselines: list[Path] | None = None) -> dict:
+    """Build a pinned, fully reviewed diff from a live API snapshot by default."""
     target = compile_xml(target_path)
-    baseline_paths = [base_path] + (extra_baselines or [])
-    valid = [(p, compile_xml(p)) for p in baseline_paths]
-    status = next(((p, b) for p, b in valid if counter(live) == counter(b)), None)
-    if counter(live) == counter(target):
-        status = (target_path, target)
-    if status is None:
-        p0, b0 = valid[0]
-        adds, removes = delta(b0, live)
-        raise DeploymentError(f"Gmail実設定が既知の基準XMLと一致しません（Gmailのみ: {len(adds)} / 基準のみ: {len(removes)}）。差分を調査し再ベース化してください。自動上書きしません")
-    source_path, base = status
+    if base_path is None:
+        demand(not extra_baselines, "--also-baselineは--baseとともに指定してください")
+        source_path = None
+        base = list(live)
+    else:
+        baseline_paths = [base_path] + (extra_baselines or [])
+        valid = [(p, compile_xml(p)) for p in baseline_paths]
+        status = next(((p, b) for p, b in valid if counter(live) == counter(b)), None)
+        if counter(live) == counter(target):
+            status = (target_path, target)
+        if status is None:
+            p0, b0 = valid[0]
+            adds, removes = delta(b0, live)
+            raise DeploymentError(f"Gmail実設定が既知の基準XMLと一致しません（Gmailのみ: {len(adds)} / 基準のみ: {len(removes)}）。自動上書きしません")
+        source_path, base = status
     protect(base, target, live)
     adds, removes = delta(base, target)
     demand(not any(is_delete(x) or is_trash(x) for x in adds + removes), "Delete/Trash追加・削除は禁止")
-    demand(len(live) + len(adds) <= FILTER_LIMIT, f"一時的な追加後に{len(live)+len(adds)}件になり上限1000超過。安全な順序を再設計してください")
-    demand(len(adds) <= 200 and len(removes) <= 30, "差分が想定範囲を超えます。コード側の安全上限を変更する前にレビューしてください")
+    demand(len(live) + len(adds) <= FILTER_LIMIT, f"追加先行時に{len(live)+len(adds)}件となり上限1000超過")
+    demand(len(adds) <= 200 and len(removes) <= 30, "差分が安全上限（追加200・削除30）を超えました。中断します")
     existing_labels = set(labels)
     new_labels = sorted(set(x[6:] for t in adds for x in t["action"]["addLabelIds"] if x.startswith("label:")) - existing_labels)
     plan = {
-        "schema": "gmail-filters-deploy-plan/v1",
+        "schema": "gmail-filters-deploy-plan/v2",
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "account": acct,
-        "baseline_path": str(source_path.resolve()),
-        "baseline_sha256": file_hash(source_path),
+        "baseline_path": str(source_path.resolve()) if source_path else None,
+        "baseline_sha256": file_hash(source_path) if source_path else None,
+        "baseline_snapshot": base,
         "target_path": str(target_path.resolve()),
         "target_sha256": file_hash(target_path),
         "baseline_size": len(base),
@@ -389,12 +426,19 @@ def make_plan(base_path: Path, target_path: Path, live: list[dict], acct: str, l
 
 
 def planned_states(plan: dict):
-    """Return valid intermediate stages: all additions first, then exact removals."""
-    base = compile_xml(Path(plan["baseline_path"]))
+    """Pin actual baseline and target to the approved plan, including resume."""
     target = compile_xml(Path(plan["target_path"]))
-    demand(file_hash(plan["baseline_path"]) == plan["baseline_sha256"], "計画作成後に基準XMLが変わりました")
     demand(file_hash(plan["target_path"]) == plan["target_sha256"], "計画作成後にTarget XMLが変わりました")
-    demand(counter(base) + Counter(json_hash(x) for x in plan["add"]) - Counter(json_hash(x) for x in plan["remove"]) == counter(target), "計画ファイルが対象XMLと不一致")
+    source = plan.get("baseline_path")
+    if source:
+        base = compile_xml(Path(source))
+        demand(file_hash(source) == plan["baseline_sha256"], "計画作成後に基準XMLが変わりました")
+    else:
+        demand(plan.get("schema") == "gmail-filters-deploy-plan/v2", "不正なプランスキーマ")
+        base = [canonical_template(x) for x in plan["baseline_snapshot"]]
+    demand(counter(base) == counter(plan["baseline_snapshot"]), "プランの基準スナップショットが変わりました")
+    demand(tokens_digest(base) == plan["live_snapshot_hash"], "基準スナップショットのハッシュが不一致")
+    demand(counter(base) + Counter(json_hash(x) for x in plan["add"]) - Counter(json_hash(x) for x in plan["remove"]) == counter(target), "計画とTarget XMLが不一致")
     protect(base, target)
     return base, target
 
@@ -494,38 +538,43 @@ def verify_partial(client, base: list[dict], plan: dict, add_count: int, remove_
 
 
 def cmd_validate(args):
-    base = compile_xml(args.base)
-    target = compile_xml(args.target)
-    protect(base, target)
-    added, removed = delta(base, target)
-    demand(not any(is_delete(x) or is_trash(x) for x in added+removed), "Action/DeleteまたはTrashの変更が検出されました")
+    target_path = select_master(args.local_dir, args.target)
+    target = compile_xml(target_path)
     report = {
-        "base": str(args.base), "base_sha256": file_hash(args.base),
-        "target": str(args.target), "target_sha256": file_hash(args.target),
-        "base_health": check_xml_rules(atom_entries(args.base)),
-        "target_health": check_xml_rules(atom_entries(args.target)),
+        "target": str(target_path), "target_sha256": file_hash(target_path),
+        "target_health": check_xml_rules(atom_entries(target_path)),
         "api_compatible_compilation": True,
-        "add": len(added), "remove": len(removed),
-        "expected_intermediate_count": len(base)+len(added),
-        "within_1000_limit": len(base)+len(added) <= FILTER_LIMIT,
-        "changes_delete": False,
-        "changes_trash": False,
+        "action_delete_preserved_against_live": "requires plan",
     }
-    demand(report["within_1000_limit"], "追加先行でフィルタ数が1000を超えます")
+    if args.base:
+        base = compile_xml(args.base)
+        protect(base, target)
+        added, removed = delta(base, target)
+        demand(not any(is_delete(x) or is_trash(x) for x in added+removed), "Action/DeleteまたはTrashの変更が検出されました")
+        demand(len(base) + len(added) <= FILTER_LIMIT, "追加先行時にGmail上限1000件を超えます")
+        report.update({"base": str(args.base), "base_sha256": file_hash(args.base),
+                       "base_health": check_xml_rules(atom_entries(args.base)),
+                       "add": len(added), "remove": len(removed),
+                       "expected_intermediate_count": len(base)+len(added),
+                       "changes_delete": False, "changes_trash": False})
     if args.out:
         save_json(args.out, report)
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 
 def cmd_plan(args):
+    target_path = select_master(args.local_dir, args.target)
     client, creds = get_client(args.client_secrets, args.token)
     acct = account_email(creds)
     demand(acct == args.expected_email.lower(), f"Googleアカウント不一致: {acct} != {args.expected_email}")
     current, labels = api_fetch(client)
-    plan = make_plan(args.base, args.target, [x["filter"] for x in current], acct, labels, args.also_baseline or [])
+    plan = make_plan(args.base, target_path, [x["filter"] for x in current], acct, labels, args.also_baseline or [])
     save_json(args.out, plan)
-    print(json.dumps({"account": acct, "current": len(current), "target": plan["target_size"], "add": len(plan["add"]), "remove": len(plan["remove"]), "new_labels": plan["new_label_names"], "approval_digest": plan["approval_digest"], "plan_file": str(args.out)}, ensure_ascii=False, indent=2))
-    print("これはドライランです。Gmailの設定は変更していません")
+    print(json.dumps({"account": acct, "current": len(current), "target": plan["target_size"],
+                      "master": str(target_path), "add": len(plan["add"]), "remove": len(plan["remove"]),
+                      "new_labels": plan["new_label_names"], "approval_digest": plan["approval_digest"],
+                      "plan_file": str(args.out), "requires_allow_removals": bool(plan["remove"])}, ensure_ascii=False, indent=2))
+    print("ドライランのみ。Gmailは変更していません。削除対象はplan.jsonで必ず確認してください")
 
 
 def cmd_apply(args):
@@ -533,6 +582,8 @@ def cmd_apply(args):
     client, creds = get_client(args.client_secrets, args.token, allow_auth=False)
     acct = account_email(creds)
     demand(acct == args.expected_email.lower(), f"認証アカウントが違います: {acct}")
+    demand(not plan["remove"] or args.allow_removals,
+           f"旧フィルタ{len(plan['remove'])}件の削除予定があります。plan.jsonを確認し、承認する場合だけ--allow-removalsを指定してください")
     perform(client, plan, acct, args.approve, args.log, args.batch_size)
 
 
@@ -540,7 +591,7 @@ def cmd_verify(args):
     client, creds = get_client(args.client_secrets, args.token, allow_auth=False)
     acct = account_email(creds)
     demand(acct == args.expected_email.lower(), "認証アカウント不一致")
-    target = compile_xml(args.target)
+    target = compile_xml(select_master(args.local_dir, args.target))
     current, _ = api_fetch(client)
     actual = [x["filter"] for x in current]
     adds, removes = delta(target, actual)
@@ -555,35 +606,38 @@ def main(argv=None):
     root = Path(__file__).resolve().parent
     ap = argparse.ArgumentParser(description="安全なGmail filter XML/API配備ツール（標準は読み取り専用）")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    # Production masters are intentionally never bundled with the public project.
-    default_base = root / "local" / "baseline.xml"
-    default_target = root / "local" / "target.xml"
-    p = sub.add_parser("validate", help="完全オフライン: XMLとDelete保護・API変換を検査")
-    p.add_argument("--base", type=Path, default=default_base)
-    p.add_argument("--target", type=Path, default=default_target)
+    # No renaming: latest versioned master is discovered in local/masters/ or local/.
+    default_local = root / "local"
+    p = sub.add_parser("validate", help="オフライン: 最新Master XMLを検証（--baseは任意）")
+    p.add_argument("--base", type=Path, help="任意の厳格な比較元XML")
+    p.add_argument("--target", type=Path, help="指定しなければ最新のversioned masterを選ぶ")
     p.add_argument("--out", type=Path)
     p.set_defaults(func=cmd_validate)
-    p = sub.add_parser("plan", help="Gmail設定読取・差分計画生成のみ、書込なし")
-    p.add_argument("--base", type=Path, default=default_base)
-    p.add_argument("--also-baseline", type=Path, action="append", help="既知の中間master（例 v0.13）")
-    p.add_argument("--target", type=Path, default=default_target)
-    p.add_argument("--out", type=Path, default=root / "local" / "plan.json")
+    p = sub.add_parser("plan", help="Gmailの実設定から差分計画を生成。読み取り専用")
+    p.add_argument("--base", type=Path, help="任意: 既知MasterとGmail実設定が一致するか厳格照合")
+    p.add_argument("--also-baseline", type=Path, action="append", help="--base指定時のみ追加の既知Master")
+    p.add_argument("--target", type=Path, help="指定しなければ最新版を自動選択")
+    p.add_argument("--out", type=Path, default=default_local / "plan.json")
     p.set_defaults(func=cmd_plan)
-    p = sub.add_parser("apply", help="承認hashが必要。追加・確認後に旧フィルタ削除")
-    p.add_argument("--plan", type=Path, default=root / "local" / "plan.json")
-    p.add_argument("--approve", required=True, help="plan出力のapproval_digestを完全一致で指定")
-    p.add_argument("--log", type=Path, default=root / "local" / "deploy_log.json")
+    p = sub.add_parser("apply", help="承認ハッシュ必須。旧ルール削除には別途--allow-removals")
+    p.add_argument("--plan", type=Path, default=default_local / "plan.json")
+    p.add_argument("--approve", required=True, help="planが表示したapproval_digest")
+    p.add_argument("--allow-removals", action="store_true", help="既存非保護ルールの削除を明示的に承認")
+    p.add_argument("--log", type=Path, default=default_local / "deploy_log.json")
     p.add_argument("--batch-size", type=int, default=20)
     p.set_defaults(func=cmd_apply)
-    p = sub.add_parser("verify", help="現行APIルールとMasterの完全照合（読取専用）")
-    p.add_argument("--target", type=Path, default=default_target)
-    p.add_argument("--out", type=Path, default=root / "local" / "verify.json")
+    p = sub.add_parser("verify", help="Gmail API実設定と最新版Masterの完全照合")
+    p.add_argument("--target", type=Path, help="指定しなければ最新版を自動選択")
+    p.add_argument("--out", type=Path, default=default_local / "verify.json")
     p.set_defaults(func=cmd_verify)
+    for name in ("validate", "plan", "apply", "verify"):
+        sub.choices[name].add_argument("--local-dir", type=Path, default=default_local,
+                                       help="Master XML保存フォルダ。既定はlocal/")
     for name in ("plan", "apply", "verify"):
         p = sub.choices[name]
         p.add_argument("--expected-email", required=True, help="一致が必要なGmailアドレス")
-        p.add_argument("--client-secrets", type=Path, default=root / "local" / "credentials.json")
-        p.add_argument("--token", type=Path, default=root / "local" / "token.json")
+        p.add_argument("--client-secrets", type=Path, default=default_local / "credentials.json")
+        p.add_argument("--token", type=Path, default=default_local / "token.json")
     args = ap.parse_args(argv)
     try:
         args.func(args)

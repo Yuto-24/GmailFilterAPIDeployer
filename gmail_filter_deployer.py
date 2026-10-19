@@ -398,6 +398,11 @@ def api_fetch(client, *, verbose: bool = False) -> tuple[list[dict], dict[str, s
     return normalized, {x["name"]: x["id"] for x in labels if x.get("type") == "user" or x.get("type") == "USER"}
 
 
+def fetch_for_deploy(client, verbose: bool = False):
+    """Preserve the original single-argument call for existing API mocks."""
+    return api_fetch(client, verbose=True) if verbose else api_fetch(client)
+
+
 def compare_base_live(base: list[dict], target: list[dict], live: list[dict]) -> str:
     if counter(live) == counter(target):
         return "target"
@@ -727,7 +732,7 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
     peak = max(len(base), len(target)) if order == "remove_first" else len(base) + len(plan["add"])
     demand(peak <= FILTER_LIMIT,
            f"配備中の最大フィルタ数{peak}件がGmail上限{FILTER_LIMIT}件を超えます")
-    current, labels = api_fetch(client, verbose=verbose)
+    current, labels = fetch_for_deploy(client, verbose=verbose)
     live = [x["filter"] for x in current]
     a_done, r_done = detect_position(base, plan, live)
     print(f"配備開始（{'削除→追加' if order == 'remove_first' else '旧版・追加→削除'}）: "
@@ -748,7 +753,7 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
 
     def remove_old(start: int, verified_adds: int):
         for j in range(start, len(plan["remove"])):
-            existing, _ = api_fetch(client, verbose=verbose)
+            existing, _ = fetch_for_deploy(client, verbose=verbose)
             old = plan["remove"][j]
             matches = [x for x in existing if x["filter"] == old]
             if not matches:
@@ -841,7 +846,7 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
     if verbose:
         print(f"{timestamp_prefix()}[詳細] 最終API照合中（配備後の全フィルタ）", flush=True)
     verify_partial(client, base, plan, len(plan["add"]), len(plan["remove"]), verbose=verbose)
-    demand(counter([x["filter"] for x in api_fetch(client, verbose=verbose)[0]]) == counter(target),
+    demand(counter([x["filter"] for x in fetch_for_deploy(client, verbose=verbose)[0]]) == counter(target),
            "配備後の最終照合が一致しません")
     state["verified"] = True
     save_json(log, state)
@@ -859,7 +864,7 @@ def verify_partial(client, base: list[dict], plan: dict, add_count: int, remove_
         expected[k] -= 1
         if expected[k] == 0:
             del expected[k]
-    current, _ = api_fetch(client, verbose=verbose)
+    current, _ = fetch_for_deploy(client, verbose=verbose)
     actual = counter([x["filter"] for x in current])
     demand(expected == actual, f"API読戻しが不一致。expected={sum(expected.values())} / actual={sum(actual.values())}。後続操作を停止")
     return True

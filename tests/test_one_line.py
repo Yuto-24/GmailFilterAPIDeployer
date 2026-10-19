@@ -253,7 +253,9 @@ class TestOneLine(unittest.TestCase):
         with patch.object(d,'get_client',return_value=(self.client,object())), \
              patch.object(d,'confirm_interactive',side_effect=approval) as confirm,redirect_stdout(out):
             self.assertEqual(d.main(self.argv),0)
-            confirm.assert_called_once()
+            self.assertEqual(confirm.call_count, 2)
+            self.assertIn("Trash", confirm.call_args_list[0].args[0])
+            self.assertIn("その他", confirm.call_args_list[1].args[0])
         current=[x['filter'] for x in d.api_fetch(self.client)[0]]
         self.assertEqual(d.counter(current),d.counter(d.compile_xml(self.xml)))
         self.assertEqual(sum(d.is_trash(x) for x in current),1)
@@ -273,7 +275,9 @@ class TestOneLine(unittest.TestCase):
         with patch.object(d,'get_client',return_value=(self.client,object())), \
              patch.object(d,'confirm_interactive',side_effect=approval) as confirm,redirect_stdout(out):
             self.assertEqual(d.main(self.argv),0)
-            confirm.assert_called_once()
+            self.assertEqual(confirm.call_count, 2)
+            self.assertIn("Trash", confirm.call_args_list[0].args[0])
+            self.assertIn("その他", confirm.call_args_list[1].args[0])
         current=[x['filter'] for x in d.api_fetch(self.client)[0]]
         self.assertEqual(d.counter(current),d.counter(d.compile_xml(self.xml)))
 

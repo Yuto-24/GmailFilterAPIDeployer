@@ -652,6 +652,40 @@ def detect_position(base: list[dict], plan: dict, live: list[dict]) -> tuple[int
     raise AssertionError
 
 
+def validate_before_final_approval(plan: dict, expected_email: str, log: Path,
+                                   batch_size: int, current: list[dict]) -> None:
+    """Check all locally decidable execution invariants before consent."""
+    demand(expected_email.lower() == plan["account"].lower(),
+           "承認対象のGmailアカウントが認証アカウントと異なります")
+    demand(1 <= batch_size <= 25, "batch-sizeは1〜25件で指定してください")
+    demand(plan["approval_digest"] == json_hash({
+        k:v for k,v in plan.items() if k not in {"created_utc", "approval_digest"}}),
+        "承認計画のハッシュが一致しません")
+    base, target = planned_states(plan)
+    order = plan.get("operation_order", "add_first")
+    peak = max(len(base), len(target)) if order == "remove_first" else len(base) + len(plan["add"])
+    demand(peak <= FILTER_LIMIT,
+           f"配備途中の最大件数{peak}件がGmailの上限{FILTER_LIMIT}件を超えます")
+    a_done, r_done = detect_position(base, plan, [x["filter"] for x in current])
+    # Every *remaining* deletion must refer to exactly one current filter ID.
+    for rule in plan["remove"][r_done:]:
+        matching = [x for x in current if x["filter"] == rule]
+        demand(len(matching) == 1 and isinstance(matching[0].get("id"), str)
+               and matching[0]["id"].strip(),
+               f"削除対象が最終承認前に一意でなくなりました: "
+               f"{format_filter_summary(rule)} / 一致{len(matching)}件。"
+               "差分取得から再実行してください")
+    if log.exists():
+        prior = json.loads(log.read_text(encoding="utf-8"))
+        demand(prior.get("plan_digest") == plan["approval_digest"],
+               "配備ログに別の計画が記録されています")
+    # Validate prospective API payloads without calling a mutating endpoint.
+    labels = {name: "pending_" + name for name in plan["new_label_names"]}
+    labels.update({name: name for name in plan["expected_label_names"]})
+    for rule in plan["add"][a_done:]:
+        to_api(rule, labels)
+
+
 def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_size=20, verbose=False):
     demand(expected.lower() == plan["account"].lower(), "対象アカウントが承認計画と不一致")
     demand(digest == plan["approval_digest"], "承認ハッシュが一致しません")
@@ -689,7 +723,28 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
             existing, _ = api_fetch(client)
             old = plan["remove"][j]
             matches = [x for x in existing if x["filter"] == old]
-            demand(len(matches) == 1,
+            if not matches:
+                # The rule may have been removed outside this process between
+                # API reads. Accept ONLY the exact expected next plan state.
+                expected_next = counter(base)
+                for item in plan["add"][:verified_adds]:
+                    expected_next[json_hash(item)] += 1
+                for item in plan["remove"][:j+1]:
+                    key = json_hash(item)
+                    demand(expected_next[key] >= 1, "削除対象の計算結果が不正です")
+                    expected_next[key] -= 1
+                    if not expected_next[key]:
+                        del expected_next[key]
+                demand(counter(x["filter"] for x in existing) == expected_next,
+                       "削除対象が消失しましたが、実Gmailが承認計画の次状態と一致しません。"
+                       "状態を確定できないため処理を中断します")
+                state["events"].append({"kind": "already_absent", "step": j+1,
+                                        "sha256": json_hash(old)})
+                state["completed_remove"] = j+1
+                save_json(log, state)
+                print(f"既に削除済みと確認: {j+1}/{len(plan['remove'])}件", flush=True)
+                continue
+            demand(len(matches) == 1 and matches[0].get("id"),
                    f"削除対象が一意ではありません: {json_hash(old)} ({len(matches)}件)")
             client.users().settings().filters().delete(userId="me", id=matches[0]["id"]).execute()
             state["events"].append({"kind": "delete_filter", "step": j+1,
@@ -1048,13 +1103,17 @@ def cmd_run(args):
                 ", ".join(RULE_GROUP_NAMES[x] for x in RULE_GROUPS if x not in selected) or "なし"), flush=True)
             print(f"実行件数: 追加 {len(plan['add'])}件 / 削除 {len(plan['remove'])}件"
                   f" / スキップ {len(plan['skipped_deletions'])}件", flush=True)
+        # Every deterministic precondition is checked BEFORE final [y/N].
+        latest, _ = api_fetch(client)
+        journal = args.local_dir / 'logs' / (plan['approval_digest'] + '.json')
+        validate_before_final_approval(plan, acct, journal, args.batch_size, latest)
+        print("事前検証: 計画・削除ID・容量・進捗ログ・API payloadを確認済み。", flush=True)
         if not confirm_interactive("上記の内容でGmailのフィルタ設定を変更しますか？ [y/N]: "):
             print("最終承認されなかったため、Gmail設定は変更していません。", flush=True)
             return
         if not pending_file.exists():
             save_json(plan_file, plan)
             save_json(pending_file, plan)  # Save only after final approval, before API mutation.
-        journal = args.local_dir / 'logs' / (plan['approval_digest'] + '.json')
         print("[6/6] Gmailへ配備し、APIの読戻しで検証中...", flush=True)
         perform(client, plan, acct, plan['approval_digest'], journal, args.batch_size, verbose=args.verbose)
         pending_file.unlink()
@@ -1065,7 +1124,11 @@ def cmd_run(args):
         print("\n【配備結果】", flush=True)
         print(f"  削除成功: {len(plan['remove'])}件", flush=True)
         print(f"  追加成功: {len(plan['add'])}件", flush=True)
-        print(f"  スキップ: {len(skipped)}件", flush=True)
+        journal_events = json.loads(journal.read_text(encoding="utf-8")).get("events", [])
+        already_absent = sum(x.get("kind") == "already_absent" for x in journal_events)
+        print(f"  スキップ（未適用）: {len(skipped)}件", flush=True)
+        if already_absent:
+            print(f"  処理不要（既に削除済みと照合）: {already_absent}件", flush=True)
         for i, entry in enumerate(skipped, 1):
             print(f"  ~ [{i}/{len(skipped)}] {entry['reason']} / "
                   f"{format_filter_summary(entry['rule'])}", flush=True)

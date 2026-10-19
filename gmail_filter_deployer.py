@@ -607,7 +607,7 @@ def resolve_expected_email(cli_email: str | None) -> str:
     configured = cli_email if cli_email is not None else os.environ.get("GMAIL_EXPECTED_EMAIL", "")
     email = configured.strip().lower()
     demand(bool(email), "対象メールアドレスが未設定です。.env の GMAIL_EXPECTED_EMAIL を設定するか --expected-email を指定してください")
-    demand(bool(re.fullmatch(r"[^@\\s]+@[^@\\s]+", email)), "--expected-email / GMAIL_EXPECTED_EMAIL の形式が不正です")
+    demand(bool(re.fullmatch(r"[^@\s]+@[^@\s]+", email)), "--expected-email / GMAIL_EXPECTED_EMAIL の形式が不正です")
     return email
 
 

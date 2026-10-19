@@ -50,7 +50,7 @@ class TestOneLine(unittest.TestCase):
 
     def test_resume_partial_deploy(self):
         real_perform=d.perform
-        def interrupt(client,plan,expected,digest,log,batch):
+        def interrupt(client,plan,expected,digest,log,batch,verbose=False):
             live, labels = d.api_fetch(client)
             for name in plan['new_label_names']:
                 if name not in labels:
@@ -86,6 +86,45 @@ class TestOneLine(unittest.TestCase):
         with patch.object(d,'account_email',return_value='wrong@example.invalid'):
             self.assertEqual(d.main(self.argv),2)
         self.assertFalse((self.local/'run_plan.json').exists())
+
+    def test_run_prints_progress_by_default(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        out = StringIO()
+        with patch.object(d,'confirm_interactive',return_value=True), redirect_stdout(out):
+            self.assertEqual(d.main(self.argv), 0)
+        result=out.getvalue()
+        for stage in range(1, 7):
+            self.assertIn(f'[{stage}/6]', result)
+        self.assertIn('追加済み:', result)
+        self.assertIn('旧ルール削除済み:', result)
+        self.assertNotIn('[詳細] 追加 [',result)
+
+    def test_run_verbose_prints_per_filter_actions(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        out=StringIO()
+        with patch.object(d,'confirm_interactive',return_value=True), redirect_stdout(out):
+            self.assertEqual(d.main(self.argv+['-v']),0)
+        result=out.getvalue()
+        self.assertIn('[詳細] 追加 [1/2]',result)
+        self.assertIn('[詳細] 削除 [1/1]',result)
+        self.assertIn('[詳細] 最終API照合中',result)
+        self.assertIn('[詳細] Master SHA-256:',result)
+
+    def test_run_verbose_decline_makes_no_mutations(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        before=d.counter([x['filter'] for x in d.api_fetch(self.client)[0]])
+        with patch.object(d,'confirm_interactive',return_value=False), redirect_stdout(StringIO()):
+            self.assertEqual(d.main(self.argv+['--verbose']),0)
+        self.assertEqual(before,d.counter([x['filter'] for x in d.api_fetch(self.client)[0]]))
+        self.assertFalse((self.local/'run_pending.json').exists())
+
+    def test_apply_verbose_parser(self):
+        with patch.object(d,'cmd_apply') as action:
+            self.assertEqual(d.main(['apply','--expected-email','demo@example.invalid','--approve','digest','-v']),0)
+            self.assertTrue(action.call_args.args[0].verbose)
 
     def test_no_account_pin_fails_closed(self):
         with patch.dict('os.environ',{},clear=True):

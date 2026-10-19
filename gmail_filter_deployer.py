@@ -465,7 +465,7 @@ def detect_position(base: list[dict], plan: dict, live: list[dict]) -> tuple[int
     raise AssertionError
 
 
-def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_size=20):
+def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_size=20, verbose=False):
     demand(expected.lower() == plan["account"].lower(), "対象アカウントが承認計画と不一致")
     demand(digest == plan["approval_digest"], "承認ハッシュが一致しません")
     demand(plan["approval_digest"] == json_hash({k: v for k, v in plan.items() if k not in {"created_utc", "approval_digest"}}), "承認済み計画が改変されています")
@@ -475,6 +475,10 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
     live = [x["filter"] for x in current]
     protect(base, target, live if counter(live) in (counter(base), counter(target)) else None)
     a_done, r_done = detect_position(base, plan, live)
+    print(f"配備開始: 追加 {len(plan['add'])}件（完了 {a_done}件） / 削除 {len(plan['remove'])}件（完了 {r_done}件）", flush=True)
+    if verbose:
+        print(f"[詳細] 既存フィルタ照合: {len(live)}件一致 / 変更対象Master: {plan['target_path']}", flush=True)
+        print(f"[詳細] 進捗記録: {log}", flush=True)
     state = {"account": expected, "plan_digest": digest, "completed_add": a_done, "completed_remove": r_done, "events": []}
     if log.exists():
         previous = json.loads(log.read_text(encoding="utf-8"))
@@ -488,6 +492,8 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
             if name not in labels:
                 created = client.users().labels().create(userId="me", body={"name": name, "labelListVisibility": "labelShow", "messageListVisibility": "show"}).execute()
                 labels[name] = created["id"]
+                if verbose:
+                    print(f"[詳細] ラベル作成: {name}", flush=True)
                 state["events"].append({"kind": "create_label", "name": name, "id": created["id"]})
                 save_json(log, state)
         for i in range(a_done, len(plan["add"])):
@@ -497,10 +503,14 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
             state["events"].append({"kind": "create_filter", "step": i + 1, "id": result["id"], "sha256": json_hash(templ)})
             state["completed_add"] = i + 1
             save_json(log, state)
+            if verbose:
+                print(f"[詳細] 追加 [{i+1}/{len(plan['add'])}] id={result['id']} {format_filter_summary(templ)}", flush=True)
             # Confirm via a fresh live list after each small batch.
             if (i + 1) % batch_size == 0 or (i + 1) == len(plan["add"]):
+                if verbose:
+                    print(f"[詳細] Gmail API再取得・追加フィルタ照合中: {i+1}/{len(plan['add'])}", flush=True)
                 verify_partial(client, base, plan, state["completed_add"], state["completed_remove"])
-                print(f"追加済み: {i+1}/{len(plan['add'])}件、Gmail再取得一致")
+                print(f"追加済み: {i+1}/{len(plan['add'])}件、Gmail再取得一致", flush=True)
     # All additions have been read back before any old filters are deleted.
     for j in range(r_done, len(plan["remove"])):
         current, _ = api_fetch(client)
@@ -512,8 +522,12 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
         state["events"].append({"kind": "delete_filter", "step": j+1, "id": matches[0]["id"], "sha256": json_hash(old)})
         state["completed_remove"] = j+1
         save_json(log, state)
+        if verbose:
+            print(f"[詳細] 削除 [{j+1}/{len(plan['remove'])}] id={matches[0]['id']} {format_filter_summary(old)}", flush=True)
         verify_partial(client, base, plan, len(plan["add"]), j+1)
-        print(f"旧ルール削除済み: {j+1}/{len(plan['remove'])}")
+        print(f"旧ルール削除済み: {j+1}/{len(plan['remove'])}", flush=True)
+    if verbose:
+        print("[詳細] 最終API照合中（配備後の全フィルタ）", flush=True)
     verify_partial(client, base, plan, len(plan["add"]), len(plan["remove"]))
     demand(counter([x["filter"] for x in api_fetch(client)[0]]) == counter(target), "配備後の最終照合が一致しません")
     state["verified"] = True
@@ -584,7 +598,7 @@ def cmd_apply(args):
     demand(acct == args.expected_email.lower(), f"認証アカウントが違います: {acct}")
     demand(not plan["remove"] or args.allow_removals,
            f"旧フィルタ{len(plan['remove'])}件の削除予定があります。plan.jsonを確認し、承認する場合だけ--allow-removalsを指定してください")
-    perform(client, plan, acct, args.approve, args.log, args.batch_size)
+    perform(client, plan, acct, args.approve, args.log, args.batch_size, verbose=args.verbose)
 
 
 def cmd_verify(args):
@@ -672,13 +686,22 @@ def cmd_run(args):
                     pass
 
     with exclusive_lock(args.local_dir / 'run.lock'):
+        print("[1/6] 最新Master XMLを選択・検証中...", flush=True)
         target_path = select_master(args.local_dir, args.target)
         target = compile_xml(target_path)  # Offline preflight before OAuth.
+        print(f"      検証完了: {target_path.name}（{len(target)}件）", flush=True)
+        if args.verbose:
+            print(f"[詳細] Master SHA-256: {file_hash(target_path)}", flush=True)
+        print("[2/6] Google OAuth認証とアカウント照合中...", flush=True)
         client, creds = get_client(args.client_secrets, args.token)
         acct = account_email(creds)
         demand(acct == args.expected_email, f"認証Googleアカウント不一致: {acct} != {args.expected_email}")
+        print(f"      認証済み: {acct}", flush=True)
+        print("[3/6] Gmailの現行ラベル・フィルタを取得中...", flush=True)
         current, labels = api_fetch(client)
         live = [x['filter'] for x in current]
+        print(f"      取得完了: {len(live)}フィルタ / {len(labels)}ラベル", flush=True)
+        print("[4/6] 変更差分と保護ルールを照合中...", flush=True)
         pending_file = args.local_dir / 'run_pending.json'
         plan_file = args.local_dir / 'run_plan.json'
         if pending_file.exists():
@@ -690,27 +713,32 @@ def cmd_run(args):
             demand(counter(target) == counter(old_target), '途中計画のMasterが変更されています')
             a_done, r_done = detect_position(base, plan, live)
             if a_done == len(plan['add']) and r_done == len(plan['remove']):
-                print(f"前回の配備は既に反映済みです。API一致: {len(target)}件")
+                print(f"前回の配備は既に反映済みです。API一致: {len(target)}件", flush=True)
                 pending_file.unlink()
                 return
             print(f"前回の中断計画を検出しました（追加済 {a_done}/{len(plan['add'])}、削除済 {r_done}/{len(plan['remove'])}）。")
         else:
             plan = make_plan(None, target_path, live, acct, labels)
             if not plan['add'] and not plan['remove']:
-                print(f"変更不要：{acct} の{len(target)}フィルタが最新Masterに一致しています。")
+                print(f"変更不要：{acct} の{len(target)}フィルタが最新Masterに一致しています。", flush=True)
                 return
             save_json(plan_file, plan)
+        if args.verbose:
+            print(f"[詳細] 追加 {len(plan['add'])}件 / 削除 {len(plan['remove'])}件 / 新規ラベル {len(plan['new_label_names'])}件", flush=True)
+            print(f"[詳細] 計画SHA-256: {plan['approval_digest']}", flush=True)
         # The full plan is always available before accepting any modification.
         show_run_plan(plan, plan_file if not pending_file.exists() else pending_file)
+        print("[5/6] 承認待ち。Enter・nで配備せず終了します。", flush=True)
         if not confirm_interactive():
             print("承認されなかったためGmailは変更していません。")
             return
         if not pending_file.exists():
             save_json(pending_file, plan)  # Write before any API mutation.
         journal = args.local_dir / 'logs' / (plan['approval_digest'] + '.json')
-        perform(client, plan, acct, plan['approval_digest'], journal, args.batch_size)
+        print("[6/6] Gmailへ配備し、APIの読戻しで検証中...", flush=True)
+        perform(client, plan, acct, plan['approval_digest'], journal, args.batch_size, verbose=args.verbose)
         pending_file.unlink()
-        print("API照合完了。Gmail UIのfresh exportと新着メール分類の確認は別途必要です。")
+        print("API照合完了。Gmail UIのfresh exportと新着メール分類の確認は別途必要です。", flush=True)
 
 
 def resolve_expected_email(cli_email: str | None) -> str:
@@ -731,6 +759,7 @@ def main(argv=None):
     p = sub.add_parser("run", help="検証→差分表示→対話承認→配備→API照合を1コマンドで実行")
     p.add_argument("--target", type=Path, help="任意: デフォルトは最新Masterを自動選択")
     p.add_argument("--batch-size", type=int, default=20, help="API読戻しの間隔。1〜25、既定20")
+    p.add_argument("-v", "--verbose", action="store_true", help="フィルタ単位の処理・API照合の詳細を表示")
     p.set_defaults(func=cmd_run)
     p = sub.add_parser("validate", help="オフライン: 最新Master XMLを検証（--baseは任意）")
     p.add_argument("--base", type=Path, help="任意の厳格な比較元XML")
@@ -749,6 +778,7 @@ def main(argv=None):
     p.add_argument("--allow-removals", action="store_true", help="既存非保護ルールの削除を明示的に承認")
     p.add_argument("--log", type=Path, default=default_local / "deploy_log.json")
     p.add_argument("--batch-size", type=int, default=20)
+    p.add_argument("-v", "--verbose", action="store_true", help="フィルタ単位の配備・API照合詳細を表示")
     p.set_defaults(func=cmd_apply)
     p = sub.add_parser("verify", help="Gmail API実設定と最新版Masterの完全照合")
     p.add_argument("--target", type=Path, help="指定しなければ最新版を自動選択")

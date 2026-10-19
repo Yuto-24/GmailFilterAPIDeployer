@@ -18,9 +18,13 @@ docker compose build
 
 ```bash
 docker compose run --rm --service-ports deployer run
+
+# フィルタごとの処理内容も表示するとき
+# docker compose run --rm --service-ports deployer run -v
 ```
 
-実行内容は **XML検証 → OAuth認証・対象アカウント照合 → 現行フィルタ取得 → 差分計画作成 → 対話確認 `[y/N]` → 承認された場合だけAPI配備 → 読戻し検証** です。変更がなければそのまま終了します。`--approve`や`--allow-removals`は**`run`では不要**です。初回OAuthでは表示URLをブラウザで開いて認証します（ホスト側ローカルポート`127.0.0.1:8765`）。
+実行内容は **XML検証 → OAuth認証・対象アカウント照合 → 現行フィルタ取得 → 差分計画作成 → 対話確認 `[y/N]` → 承認された場合だけAPI配備 → 読戻し検証** です。通常実行では`[1/6]`〜`[6/6]`の工程、対象Master、Gmail現行件数、追加・削除件数、20件ごとの照合結果を表示します。`run -v`ではさらに**ルール単位の追加・削除結果、対象条件・ラベル、再取得チェックポイント、進捗ログ位置**を表示します（OAuthトークン等の認証情報は表示しません）。
+変更がなければそのまま終了します。`--approve`や`--allow-removals`は**`run`では不要**です。初回OAuthでは表示URLをブラウザで開いて認証します（ホスト側ローカルポート`127.0.0.1:8765`）。
 
 プロンプトでは**`y`のみ実行**、Enter・`n`は中止します。TTYを使えない環境（`-T`、CI、パイプ等）では自動承認せず停止します。既存フィルタを削除する変更も、対象の全件を表示してから同じ確認を求めます。メールそのものを削除する機能はありません。
 
@@ -42,6 +46,7 @@ docker compose run --rm --service-ports deployer run
 
 - `--target PATH`：バージョン自動選択を使わず、対象Master XMLを明示。
 - `--batch-size N`：APIを読み戻して途中一致を検証する追加件数。**1〜25、既定20**。UIインポート単位ではありません。
+- `-v`, `--verbose`：フィルタ単位の処理結果や照合状況を詳しく標準出力に表示。実行結果の保存先は従来どおり`local/logs/`です。
 - `--expected-email ADDRESS`：`.env`の`GMAIL_EXPECTED_EMAIL`より優先するアカウント照合先。
 - `--local-dir PATH`：Masterと配備記録の保存フォルダ。既定`/app/local`（Docker内）。
 - `--client-secrets PATH`：OAuth DesktopクライアントJSON。既定`/app/local/credentials.json`。
@@ -71,6 +76,7 @@ docker compose run --rm --service-ports deployer run
 - `--plan PATH`：`plan.json`のパス。既定`/app/local/plan.json`。
 - `--log PATH`：進捗記録。既定`/app/local/deploy_log.json`。
 - `--batch-size N`：API読戻し間隔（1〜25、既定20）。
+- `-v`, `--verbose`：`run`と同じ詳細表示。
 - `--expected-email`、`--local-dir`、`--client-secrets`、`--token`：`run`と同じ。
 
 ### `verify`：配備後の完全比較

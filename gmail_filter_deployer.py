@@ -378,7 +378,7 @@ def compare_base_live(base: list[dict], target: list[dict], live: list[dict]) ->
     return "drift"
 
 
-RULE_GROUPS = ("trash", "delete", "other")
+RULE_GROUPS = ("other", "delete", "trash")
 RULE_GROUP_NAMES = {"trash": "Trash（実際のゴミ箱移動）",
                     "delete": "Action/Delete（ラベル付与）",
                     "other": "その他（Type・Service・Org等）"}
@@ -436,20 +436,22 @@ def select_plan_groups(plan: dict, selected: list[str]) -> dict:
 
 
 def interactive_group_selection(plan: dict) -> list[str]:
-    """Ask per non-empty category, after the entire diff has been displayed."""
+    """Basic changes are included by default; sensitive groups require consent."""
     approved = []
-    for group in RULE_GROUPS:
-        added = sum(filter_group(x) == group for x in plan["add"])
-        removed = sum(filter_group(x) == group for x in plan["remove"])
+    basic_add = sum(filter_group(x) == "other" for x in plan["add"])
+    basic_remove = sum(filter_group(x) == "other" for x in plan["remove"])
+    if basic_add or basic_remove:
+        approved.append("other")
+    for group in ("delete", "trash"):
+        added, removed = show_group_details(plan, group)
         if not (added or removed):
             continue
-        print(f"\n{RULE_GROUP_NAMES[group]}: 追加 {added}件 / 削除 {removed}件", flush=True)
-        prompt = f"このグループの変更を承認しますか？ [y/N] ({RULE_GROUP_NAMES[group]}): "
+        prompt = f"{RULE_GROUP_NAMES[group]}の変更を適用しますか？ [y/N]: "
         if confirm_interactive(prompt):
             approved.append(group)
-            print("  → 承認。", flush=True)
+            print("  → 承認しました。", flush=True)
         else:
-            print("  → 今回は見送り。Gmailの現在の設定を保持します。", flush=True)
+            print("  → 見送りました。Gmail側の現行ルールを維持します。", flush=True)
     return approved
 
 
@@ -730,54 +732,50 @@ def format_filter_summary(row: dict) -> str:
     return f"条件={criteria} / 処理={action}"
 
 
-def show_run_plan(plan: dict, plan_path: Path) -> None:
-    """Preview EVERY change before a single final confirmation."""
+def show_group_details(plan: dict, group: str) -> tuple[int, int]:
+    """Display EVERY affected sensitive rule, with criteria and API actions."""
+    additions = [x for x in plan["add"] if filter_group(x) == group]
+    removals = [x for x in plan["remove"] if filter_group(x) == group]
+    print(f"\n【{RULE_GROUP_NAMES[group]}】", flush=True)
+    print(f"追加 {len(additions)}件 / 削除 {len(removals)}件", flush=True)
+    if group == "trash" and (additions or removals):
+        print("※ TRASHはAction/Deleteラベルとは異なり、条件に合うメールを実際にゴミ箱へ移動します。", flush=True)
+    if not (additions or removals):
+        print("変更なし（承認不要）", flush=True)
+        return 0, 0
+    # A modified condition appears as the removal of the old API filter and
+    # creation of a new one. Display both, rather than guessing pairings.
+    print("削除する既存ルール（全件）:", flush=True)
+    for i, row in enumerate(removals, 1):
+        print(f"  - [{i}/{len(removals)}] {format_filter_summary(row)}", flush=True)
+    print("新たに作成するルール（全件）:", flush=True)
+    for i, row in enumerate(additions, 1):
+        print(f"  + [{i}/{len(additions)}] {format_filter_summary(row)}", flush=True)
+    return len(additions), len(removals)
+
+
+def show_run_plan(plan: dict, plan_path: Path, verbose: bool = False) -> None:
+    """Show the basic summary first; sensitive rule details follow in review."""
     adds, removes = plan["add"], plan["remove"]
-    print(f"\nGmailフィルタ配備計画: {plan['account']}")
-    print(f"Master: {plan['target_path']}")
-    print(f"現行 {plan['baseline_size']}件 → Master {plan['target_size']}件")
-    print(f"追加 {len(adds)}件 / 既存ルール削除 {len(removes)}件 / 新規ラベル {len(plan['new_label_names'])}件")
-    print(f"Action/Delete: 現行 {plan['current_delete_count']}件 → Master {plan['target_delete_count']}件")
-    print(f"Action/Deleteの追加 {sum(is_delete(x) for x in adds)}件 / 削除 {sum(is_delete(x) for x in removes)}件")
-    print(f"実際のゴミ箱移動（TRASH）: 現行 {plan['current_trash_count']}件 → Master {plan['target_trash_count']}件")
-    print(f"TRASHアクションの追加 {plan['trash_add_count']}件 / 削除 {plan['trash_remove_count']}件")
-    if plan['trash_add_count'] or plan['trash_remove_count']:
-        print("\n【重要：ゴミ箱移動アクションの変更があります】")
-        print("  TRASHへの追加は、条件に一致する今後のメールを実際にゴミ箱へ移動させます。")
-        print("  以下の全フィルタの条件と処理を確認してください。")
-    if plan['new_label_names']:
-        print("\n【新規作成するラベル：全件】")
-        for name in plan['new_label_names']:
-            print("  + " + name)
-    # Group unambiguous replacements by identical resulting action/label.
-    # Do not guess when multiple distinct rules share one action.
-    from collections import defaultdict
-    by_action_add = defaultdict(list)
-    by_action_remove = defaultdict(list)
-    for row in adds:
-        by_action_add[json_hash(row["action"])].append(row)
-    for row in removes:
-        by_action_remove[json_hash(row["action"])].append(row)
-    replaced_add, replaced_remove, replacements = set(), set(), []
-    for key in sorted(set(by_action_add) & set(by_action_remove)):
-        old, new = by_action_remove[key], by_action_add[key]
-        if len(old) == len(new) == 1:
-            replaced_remove.add(json_hash(old[0]))
-            replaced_add.add(json_hash(new[0]))
-            replacements.append((old[0], new[0]))
-    print(f"\n【条件変更（旧→新）：{len(replacements)}組】")
-    for i, (old, new) in enumerate(replacements, 1):
-        print(f"  ~ {i}. 旧 {format_filter_summary(old)}")
-        print(f"         新 {format_filter_summary(new)}")
-    print(f"\n【削除する既存フィルタ：{len(removes) - len(replaced_remove)}件】")
-    for i, row in enumerate((x for x in removes if json_hash(x) not in replaced_remove), 1):
-        print(f"  - {i}. {format_filter_summary(row)}")
-    print(f"\n【追加するフィルタ：{len(adds) - len(replaced_add)}件】")
-    for i, row in enumerate((x for x in adds if json_hash(x) not in replaced_add), 1):
-        print(f"  + {i}. {format_filter_summary(row)}")
-    print(f"\n配備計画全文: {plan_path}")
-    print("Master XMLに合わせて上記を追加・削除・置換します。")
-    print("Action/DeleteはGmailラベルの付与であり、メールをゴミ箱には移動しません。")
+    basic_add = [x for x in adds if filter_group(x) == "other"]
+    basic_remove = [x for x in removes if filter_group(x) == "other"]
+    print(f"\nGmailフィルタ配備計画: {plan['account']}", flush=True)
+    print(f"Master: {plan['target_path']}", flush=True)
+    print(f"現行 {plan['baseline_size']}件 → 適用目標 {plan['target_size']}件", flush=True)
+    print(f"全差分: 追加 {len(adds)}件 / 削除 {len(removes)}件", flush=True)
+    print("\n【基本（Type・Service・Org等）】", flush=True)
+    print(f"追加 {len(basic_add)}件 / 削除 {len(basic_remove)}件", flush=True)
+    print("最終承認があれば反映します（独立した承認なし）。", flush=True)
+    if verbose:
+        print("削除する既存ルール:", flush=True)
+        for i, row in enumerate(basic_remove, 1):
+            print(f"  - [{i}/{len(basic_remove)}] {format_filter_summary(row)}", flush=True)
+        print("新たに作成するルール:", flush=True)
+        for i, row in enumerate(basic_add, 1):
+            print(f"  + [{i}/{len(basic_add)}] {format_filter_summary(row)}", flush=True)
+    else:
+        print("基本ルールの全件詳細は -v で表示できます。", flush=True)
+    print(f"\n全件の差分・承認計画: {plan_path}", flush=True)
 
 
 def confirm_interactive(prompt: str = "上記の変更をGmailに反映します。進めていいですか？ [y/N]: ") -> bool:
@@ -887,27 +885,33 @@ def cmd_run(args):
         if args.verbose:
             print(f"[詳細] 追加 {len(plan['add'])}件 / 削除 {len(plan['remove'])}件 / 新規ラベル {len(plan['new_label_names'])}件", flush=True)
             print(f"[詳細] 計画SHA-256: {plan['approval_digest']}", flush=True)
-        # The full plan is always available before accepting any modification.
-        show_run_plan(plan, plan_file if not pending_file.exists() else pending_file)
-        print("[5/6] 事前確認完了。上記の全変更内容を確認してください。", flush=True)
+        print("[5/6] 差分内容の確認と承認...", flush=True)
+        show_run_plan(plan, plan_file if not pending_file.exists() else pending_file,
+                      verbose=args.verbose)
         if pending_file.exists():
-            print("以前に承認した配備の続きです。変更対象を再確認してください。", flush=True)
-            if not confirm_interactive("承認済みの変更を再開しますか？ [y/N]: "):
-                print("今回は再開しません。途中計画は保持しました。")
-                return
+            # Resume a previously approved, pinned set. Never silently include
+            # categories declined during the original review.
+            for group in ("delete", "trash"):
+                show_group_details(plan, group)
+            print("\n以前に承認した配備の続きを再開します。", flush=True)
+            print(f"対象: 追加 {len(plan['add'])}件 / 削除 {len(plan['remove'])}件", flush=True)
         else:
             selected = interactive_group_selection(plan)
             if not selected:
-                print("今回は全グループを見送りました。Gmail設定は変更していません。")
+                print("承認された変更がないため、Gmail設定は変更しません。", flush=True)
                 return
-            approved_plan = select_plan_groups(plan, selected)
-            print("\n今回承認したグループ: " +
-                  ", ".join(RULE_GROUP_NAMES[x] for x in selected), flush=True)
-            print(f"実行対象: 追加 {len(approved_plan['add'])}件 / 削除 {len(approved_plan['remove'])}件", flush=True)
-            print(f"見送りグループ: {', '.join(RULE_GROUP_NAMES[x] for x in RULE_GROUPS if x not in selected) or 'なし'}", flush=True)
-            plan = approved_plan
+            plan = select_plan_groups(plan, selected)
+            print("\n【最終確認】", flush=True)
+            print("反映対象: " + ", ".join(RULE_GROUP_NAMES[x] for x in RULE_GROUPS if x in selected), flush=True)
+            print("見送り対象: " + (
+                ", ".join(RULE_GROUP_NAMES[x] for x in RULE_GROUPS if x not in selected) or "なし"), flush=True)
+            print(f"実行件数: 追加 {len(plan['add'])}件 / 削除 {len(plan['remove'])}件", flush=True)
+        if not confirm_interactive("上記の内容でGmailのフィルタ設定を変更しますか？ [y/N]: "):
+            print("最終承認されなかったため、Gmail設定は変更していません。", flush=True)
+            return
+        if not pending_file.exists():
             save_json(plan_file, plan)
-            save_json(pending_file, plan)  # Write before any API mutation.
+            save_json(pending_file, plan)  # Save only after final approval, before API mutation.
         journal = args.local_dir / 'logs' / (plan['approval_digest'] + '.json')
         print("[6/6] Gmailへ配備し、APIの読戻しで検証中...", flush=True)
         perform(client, plan, acct, plan['approval_digest'], journal, args.batch_size, verbose=args.verbose)

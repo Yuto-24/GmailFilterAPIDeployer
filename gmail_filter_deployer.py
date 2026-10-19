@@ -403,7 +403,46 @@ def selected_master_target(master: list[dict], live_base: list[dict],
             [row for row in live_base if filter_group(row) not in approved])
 
 
-def select_plan_groups(plan: dict, selected: list[str]) -> dict:
+
+def classify_deletion_conflicts(removals: list[dict], base: list[dict],
+                                current: list[dict] | None = None) -> list[dict]:
+    """List removals that cannot be mapped to exactly one live filter ID.
+
+    The caller excludes these from an *approved* plan before any Gmail writes.
+    For purely offline plan unit tests without current API objects, validate
+    multiplicity only; the interactive run always passes current with IDs.
+    """
+    occurrences = Counter(json_hash(x) for x in base)
+    matching_ids: dict[str, list] = {}
+    if current is not None:
+        for item in current:
+            key = json_hash(item["filter"])
+            matching_ids.setdefault(key, []).append(item.get("id"))
+    result = []
+    for rule in removals:
+        key = json_hash(rule)
+        count = occurrences[key] if current is None else len(matching_ids.get(key, []))
+        ids = matching_ids.get(key, [])
+        if count != 1:
+            reason = "not_found" if count == 0 else "duplicate_matches"
+        elif current is not None and (len(ids) != 1 or not isinstance(ids[0], str)
+                                      or not ids[0].strip()):
+            reason = "missing_filter_id"
+        else:
+            continue
+        result.append({"rule": rule, "reason": reason, "matches": count})
+    return result
+
+
+def deletion_preview(plan: dict, current: list[dict]) -> list[dict]:
+    """Inspect every requested deletion before requesting any approvals."""
+    demand(counter(x["filter"] for x in current) == counter(plan["baseline_snapshot"]),
+           "事前検証中にGmailのフィルタ設定が変化しました。差分を再取得してください")
+    return classify_deletion_conflicts(plan["remove"], plan["baseline_snapshot"], current)
+
+
+def select_plan_groups(plan: dict, selected: list[str],
+                       current: list[dict] | None = None) -> dict:
     """Pin a subset of groups to the original live snapshot and XML hash."""
     demand(plan.get("schema") == "gmail-filters-deploy-plan/v3" and
            not plan.get("selected_groups"), "新規の差分計画のみ選択できます")
@@ -411,13 +450,27 @@ def select_plan_groups(plan: dict, selected: list[str]) -> dict:
     demand(file_hash(plan["target_path"]) == plan["target_sha256"],
            "承認前にMaster XMLが変更されました。再計画してください")
     base = [canonical_template(x) for x in plan["baseline_snapshot"]]
-    effective = selected_master_target(master, base, selected)
-    added, removed = delta(base, effective)
+    intended = selected_master_target(master, base, selected)
+    added, candidate_removals = delta(base, intended)
+    skipped = classify_deletion_conflicts(candidate_removals, base, current)
+    skipped_count = Counter(json_hash(row["rule"]) for row in skipped)
+    removed = []
+    for row in candidate_removals:
+        key = json_hash(row)
+        if skipped_count[key] > 0:
+            skipped_count[key] -= 1
+        else:
+            removed.append(row)
+    # Excluded deletions remain in Gmail; the approved effective target
+    # therefore contains those original rule instances.
+    effective = intended + [record["rule"] for record in skipped]
     demand(len(effective) <= FILTER_LIMIT,
-           f"反映後のフィルタ数{len(effective)}件がGmailの上限{FILTER_LIMIT}件を超えます")
+           f"一意性判定で見送るルールを含めると、反映後{len(effective)}件となり"
+           f"Gmailの上限{FILTER_LIMIT}件を超えます。最終承認前に処理を見直してください")
     from copy import deepcopy
     new_plan = deepcopy(plan)
     new_plan["schema"] = "gmail-filters-deploy-plan/v4"
+    new_plan["skipped_deletions"] = skipped
     new_plan["selected_groups"] = sorted(selected)
     new_plan["target_size"] = len(effective)
     new_plan["add"] = added
@@ -532,7 +585,20 @@ def planned_states(plan: dict):
            "配備順序の指定が不正です")
     if plan.get("schema") == "gmail-filters-deploy-plan/v4":
         demand("selected_groups" in plan, "承認グループ情報がありません")
-        target = selected_master_target(master, base, plan["selected_groups"])
+        intended = selected_master_target(master, base, plan["selected_groups"])
+        skips = plan.get("skipped_deletions", [])
+        demand(all(row.get("reason") in ("not_found", "duplicate_matches", "missing_filter_id")
+                   and isinstance(row.get("rule"), dict)
+                   and isinstance(row.get("matches"), int) for row in skips),
+               "スキップ対象の記録が不正です")
+        expected_removals = delta(base, intended)[1]
+        expected_count = counter(expected_removals)
+        for row in skips:
+            key = json_hash(row["rule"])
+            demand(expected_count[key] > 0,
+                   "スキップ対象が元の削除計画に含まれていません")
+            expected_count[key] -= 1
+        target = intended + [row["rule"] for row in skips]
     else:
         target = master
     demand(counter(base) + Counter(json_hash(x) for x in plan["add"]) - Counter(json_hash(x) for x in plan["remove"]) == counter(target),
@@ -807,7 +873,8 @@ def show_group_details(plan: dict, group: str) -> tuple[int, int]:
     return len(additions), len(removals)
 
 
-def show_run_plan(plan: dict, plan_path: Path, verbose: bool = False) -> None:
+def show_run_plan(plan: dict, plan_path: Path, verbose: bool = False,
+                  conflicts: list[dict] | None = None) -> None:
     """Show the basic summary first; sensitive rule details follow in review."""
     adds, removes = plan["add"], plan["remove"]
     basic_add = [x for x in adds if filter_group(x) == "other"]
@@ -828,6 +895,13 @@ def show_run_plan(plan: dict, plan_path: Path, verbose: bool = False) -> None:
             print(f"  + [{i}/{len(basic_add)}] {format_filter_summary(row)}", flush=True)
     else:
         print("基本ルールの全件詳細は -v で表示できます。", flush=True)
+    if conflicts:
+        print(f"\n【削除対象の事前検証：スキップ候補 {len(conflicts)}件】", flush=True)
+        print("対応するGmailフィルタを一意に特定できないため、"
+              "承認対象となったグループでも以下は変更しません。", flush=True)
+        for i, row in enumerate(conflicts, 1):
+            print(f"  ~ [{i}/{len(conflicts)}] 理由={row['reason']} / "
+                  f"一致件数={row['matches']} / {format_filter_summary(row['rule'])}", flush=True)
     print(f"\n全件の差分・承認計画: {plan_path}", flush=True)
 
 
@@ -938,9 +1012,10 @@ def cmd_run(args):
         if args.verbose:
             print(f"[詳細] 追加 {len(plan['add'])}件 / 削除 {len(plan['remove'])}件 / 新規ラベル {len(plan['new_label_names'])}件", flush=True)
             print(f"[詳細] 計画SHA-256: {plan['approval_digest']}", flush=True)
+        conflicts = [] if pending_file.exists() else deletion_preview(plan, current)
         print("[5/6] 差分内容の確認と承認...", flush=True)
         show_run_plan(plan, plan_file if not pending_file.exists() else pending_file,
-                      verbose=args.verbose)
+                      verbose=args.verbose, conflicts=conflicts)
         if pending_file.exists():
             # Resume a previously approved, pinned set. Never silently include
             # categories declined during the original review.
@@ -953,12 +1028,26 @@ def cmd_run(args):
             if not selected:
                 print("承認された変更がないため、Gmail設定は変更しません。", flush=True)
                 return
-            plan = select_plan_groups(plan, selected)
+            plan = select_plan_groups(plan, selected, current=current)
+            # Validate the approved subset, labels, and live snapshot BEFORE
+            # the final question. Keep this check read-only.
+            planned_states(plan)
+            refreshed, _ = api_fetch(client)
+            demand(counter(x["filter"] for x in refreshed) == counter(live),
+                   "承認操作中にGmail側でフィルタ設定が変更されました。再実行して差分を更新してください")
+            skipped = plan["skipped_deletions"]
+            if skipped:
+                print(f"\n【スキップ予定：{len(skipped)}件】", flush=True)
+                for i, row in enumerate(skipped, 1):
+                    print(f"  ~ [{i}/{len(skipped)}] 理由={row['reason']} "
+                          f"一致件数={row['matches']} / {format_filter_summary(row['rule'])}",
+                          flush=True)
             print("\n【最終確認】", flush=True)
             print("反映対象: " + ", ".join(RULE_GROUP_NAMES[x] for x in RULE_GROUPS if x in selected), flush=True)
             print("見送り対象: " + (
                 ", ".join(RULE_GROUP_NAMES[x] for x in RULE_GROUPS if x not in selected) or "なし"), flush=True)
-            print(f"実行件数: 追加 {len(plan['add'])}件 / 削除 {len(plan['remove'])}件", flush=True)
+            print(f"実行件数: 追加 {len(plan['add'])}件 / 削除 {len(plan['remove'])}件"
+                  f" / スキップ {len(plan['skipped_deletions'])}件", flush=True)
         if not confirm_interactive("上記の内容でGmailのフィルタ設定を変更しますか？ [y/N]: "):
             print("最終承認されなかったため、Gmail設定は変更していません。", flush=True)
             return
@@ -969,13 +1058,22 @@ def cmd_run(args):
         print("[6/6] Gmailへ配備し、APIの読戻しで検証中...", flush=True)
         perform(client, plan, acct, plan['approval_digest'], journal, args.batch_size, verbose=args.verbose)
         pending_file.unlink()
-        if plan.get("schema") == "gmail-filters-deploy-plan/v4":
-            master = compile_xml(target_path)
-            if len(plan["selected_groups"]) < len(RULE_GROUPS) and counter(master) != counter(
-                    [x["filter"] for x in api_fetch(client)[0]]):
-                print("承認したグループはAPI照合完了。見送り分は次回のrunで再提案されます。", flush=True)
-            else:
-                print("全MasterルールのAPI照合が完了しました。", flush=True)
+        actual, _ = api_fetch(client)
+        master = compile_xml(target_path)
+        master_only, gmail_only = delta([x["filter"] for x in actual], master)
+        skipped = plan.get("skipped_deletions", [])
+        print("\n【配備結果】", flush=True)
+        print(f"  削除成功: {len(plan['remove'])}件", flush=True)
+        print(f"  追加成功: {len(plan['add'])}件", flush=True)
+        print(f"  スキップ: {len(skipped)}件", flush=True)
+        for i, entry in enumerate(skipped, 1):
+            print(f"  ~ [{i}/{len(skipped)}] {entry['reason']} / "
+                  f"{format_filter_summary(entry['rule'])}", flush=True)
+        if master_only or gmail_only:
+            print(f"結果: 一部未適用（Masterのみ {len(master_only)}件 / "
+                  f"Gmailのみ {len(gmail_only)}件）。次回runで再提案します。", flush=True)
+        else:
+            print("結果: Master XMLと完全一致しました。", flush=True)
         print("Gmail UIのfresh exportと新着メール分類の確認は別途必要です。", flush=True)
 
 

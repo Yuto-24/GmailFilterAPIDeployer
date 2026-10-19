@@ -93,6 +93,13 @@ class ReadbackTests(unittest.TestCase):
         self.assertEqual(d.counter([x["filter"] for x in d.api_fetch(self.client)[0]]),
                          d.counter(d.compile_xml(self.master)))
         self.assertTrue(json.loads(log.read_text())["verified"])
+        snapshots = list((self.local / "diagnostics").glob("readback_*.json"))
+        self.assertEqual(len(snapshots), 1)
+        snapshot = json.loads(snapshots[0].read_text())
+        self.assertEqual(snapshot["expected_count"], len(self.base) - 1)
+        self.assertEqual(snapshot["observed_count"], len(self.base) - 2)
+        self.assertEqual(len(snapshot["missing_filter_ids"]), 1)
+        self.assertEqual(snapshot["unexpected_filter_ids"], [])
 
     def test_unknown_cached_label_id_falls_back_to_full_fetch(self):
         with patch.object(d, "fetch_for_deploy", wraps=d.fetch_for_deploy) as fetch:

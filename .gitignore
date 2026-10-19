@@ -1,0 +1,13 @@
+local/
+.env
+.env.*
+!.env.example
+examples/mailFilters_*.xml
+**/credentials.json
+**/token.json
+**/*secret*.json
+*.zip
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc

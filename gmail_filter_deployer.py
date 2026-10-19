@@ -396,7 +396,18 @@ def filters_with_known_labels(client, labels_by_name: dict[str, str], *, verbose
         "Gmail filters.list", lambda: client.users().settings().filters().list(userId="me").execute(),
         verbose).get("filter", [])
     demand(len(filters) <= FILTER_LIMIT, f"Gmail側フィルタ数が異常: {len(filters)}")
-    return [{"id": x.get("id"), "filter": live_as_template(x, names_by_id)} for x in filters]
+    try:
+        return [{"id": x.get("id"), "filter": live_as_template(x, names_by_id)} for x in filters]
+    except DeploymentError as exc:
+        if "不明なGmailラベルID" not in str(exc):
+            raise
+        # An unfamiliar system label or concurrent label change must never be
+        # silently normalized against stale cache entries.
+        if verbose:
+            print(f"{timestamp_prefix()}[詳細] 未知のラベルIDを検出。"
+                  "Gmailラベル・フィルタ一覧を完全再取得します", flush=True)
+        current, _ = fetch_for_deploy(client, verbose=verbose)
+        return current
 
 
 def api_fetch(client, *, verbose: bool = False) -> tuple[list[dict], dict[str, str]]:
@@ -851,7 +862,7 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
                 if verbose:
                     print(f"{timestamp_prefix()}[詳細] Gmail API再取得・追加フィルタ照合中: "
                           f"{i+1}/{len(plan['add'])}", flush=True)
-                verify_partial(client, base, plan, i+1, verified_removes, verbose=verbose, label_cache=labels)
+                verify_partial(client, base, plan, i+1, verified_removes, verbose=verbose)
                 print(f"追加済み: {i+1}/{len(plan['add'])}件、Gmail再取得一致", flush=True)
 
     if order == "remove_first":

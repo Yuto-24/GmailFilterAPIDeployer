@@ -6,27 +6,35 @@ Gmailの現行フィルタをAPIから取得し、最新のMaster XMLとの**差
 
 ## 使い方（Docker）
 
+初回だけリポジトリ直下に `.env` を作り、配備先のGmailアドレスを設定します。これは誤ったGoogleアカウントへの適用を防ぐ照合先で、OAuth認証そのものを省略する設定ではありません。
+
+```bash
+cp .env.example .env
+```
+
+`.env` を開いて `GMAIL_EXPECTED_EMAIL=your-address@gmail.com` を実際のアドレスに変更してください。`.env` は Git 管理対象外です。Ubuntu/WSLでファイルの所有者が異なる場合は `LOCAL_UID` / `LOCAL_GID` も調整します。
+
 ```bash
 mkdir -p local/masters
 # Google Cloud OAuth Desktop client JSONを local/credentials.json に配置
 # 例: local/masters/mailFilters_v0.14.0_proposed_master_20261019.xml を配置（リネーム不要）
 docker compose build
 
-# 1. 最も新しいMaster XMLを自動選択してオフライン検証
+# 1. 最新Master XMLのローカル検証（Gmailアクセスなし）
 docker compose run --rm deployer validate
 
-# 2. Gmailの現在のフィルタ一覧をAPIから取得し、差分を計画（書き込みなし）
-docker compose run --rm --service-ports deployer plan --expected-email your-address@gmail.com
+# 2. 現在のGmail設定を取得して、配備前の差分計画を作成（変更なし）
+docker compose run --rm --service-ports deployer plan
 
 # 3. local/plan.jsonを読み、追加・削除対象と承認ハッシュを確認
-# 4. 明示的に承認したときだけ配備
-# 削除0件の場合は --allow-removals は省略可
-docker compose run --rm deployer apply --expected-email your-address@gmail.com \
-  --approve PLAN_OUTPUT_DIGEST --allow-removals
+# 4. 承認した場合だけ配備。削除が0件なら --allow-removals は不要
+docker compose run --rm deployer apply --approve PLAN_OUTPUT_DIGEST --allow-removals
 
-# 5. 配備後のGmail API上の全ルールとMaster XMLを照合
-docker compose run --rm deployer verify --expected-email your-address@gmail.com
+# 5. Gmail APIの実設定とMaster XMLを再照合
+docker compose run --rm deployer verify
 ```
+
+`plan`・`apply`・`verify` は `.env` の `GMAIL_EXPECTED_EMAIL` をデフォルトとして使用します。必要な場合は、各コマンドに `--expected-email other@example.com` を明示して上書きできます。環境変数・引数のどちらにも有効なアドレスがなければ**認証や配備を始めず停止**します。実際にログインしたアカウントとの照合も維持しています。
 
 OAuth認証は初回 `plan` 時にブラウザから行います。DockerのOAuthコールバック用に `plan` には `--service-ports` を指定してください。Docker Composeは `127.0.0.1:8765` だけにポートを公開します。資格情報のアクセス権は `gmail.settings.basic`、`gmail.labels`、`openid`、`userinfo.email` です。
 
@@ -61,7 +69,7 @@ OAuth認証は初回 `plan` 時にブラウザから行います。DockerのOAut
 ```bash
 pip install -r requirements.txt
 python gmail_filter_deployer.py validate
-python gmail_filter_deployer.py plan --expected-email your-address@gmail.com
+GMAIL_EXPECTED_EMAIL=your-address@gmail.com python gmail_filter_deployer.py plan
 python -m unittest discover -s tests -v
 ```
 

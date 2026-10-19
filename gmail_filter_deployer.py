@@ -602,6 +602,15 @@ def cmd_verify(args):
     demand(report["match"], "現行フィルタはMasterと一致しません")
 
 
+def resolve_expected_email(cli_email: str | None) -> str:
+    """Require an account pin, preferring the CLI flag over environment."""
+    configured = cli_email if cli_email is not None else os.environ.get("GMAIL_EXPECTED_EMAIL", "")
+    email = configured.strip().lower()
+    demand(bool(email), "対象メールアドレスが未設定です。.env の GMAIL_EXPECTED_EMAIL を設定するか --expected-email を指定してください")
+    demand(bool(re.fullmatch(r"[^@\\s]+@[^@\\s]+", email)), "--expected-email / GMAIL_EXPECTED_EMAIL の形式が不正です")
+    return email
+
+
 def main(argv=None):
     root = Path(__file__).resolve().parent
     ap = argparse.ArgumentParser(description="安全なGmail filter XML/API配備ツール（標準は読み取り専用）")
@@ -635,11 +644,13 @@ def main(argv=None):
                                        help="Master XML保存フォルダ。既定はlocal/")
     for name in ("plan", "apply", "verify"):
         p = sub.choices[name]
-        p.add_argument("--expected-email", required=True, help="一致が必要なGmailアドレス")
+        p.add_argument("--expected-email", help="対象Gmailアドレス。省略時はGMAIL_EXPECTED_EMAILを使用")
         p.add_argument("--client-secrets", type=Path, default=default_local / "credentials.json")
         p.add_argument("--token", type=Path, default=default_local / "token.json")
     args = ap.parse_args(argv)
     try:
+        if args.cmd in ("plan", "apply", "verify"):
+            args.expected_email = resolve_expected_email(args.expected_email)
         args.func(args)
     except DeploymentError as exc:
         print("STOP: " + str(exc), file=sys.stderr)

@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -177,5 +178,55 @@ class TestDeployer(unittest.TestCase):
         d.perform(client,plan,'test@example.invalid',plan['approval_digest'],log,batch_size=1)
         self.assertEqual(d.counter([x['filter'] for x in d.api_fetch(client)[0]]),d.counter(self.t))
         self.assertTrue(json.loads(log.read_text())['verified'])
+
+class TestExpectedEmail(unittest.TestCase):
+    def test_environment_value_is_default(self):
+        with patch.dict('os.environ', {'GMAIL_EXPECTED_EMAIL': ' User@Example.Com '}, clear=True):
+            self.assertEqual(d.resolve_expected_email(None), 'user@example.com')
+
+    def test_cli_flag_overrides_environment(self):
+        with patch.dict('os.environ', {'GMAIL_EXPECTED_EMAIL': 'other@example.com'}, clear=True):
+            self.assertEqual(d.resolve_expected_email(' Selected@Example.com '), 'selected@example.com')
+
+    def test_missing_account_fails_closed(self):
+        with patch.dict('os.environ', {}, clear=True):
+            with self.assertRaisesRegex(d.DeploymentError, 'GMAIL_EXPECTED_EMAIL'):
+                d.resolve_expected_email(None)
+            self.assertEqual(d.main(['plan']), 2)
+
+    def test_invalid_account_fails_closed(self):
+        with patch.dict('os.environ', {'GMAIL_EXPECTED_EMAIL': 'not-an-email'}, clear=True):
+            with self.assertRaises(d.DeploymentError):
+                d.resolve_expected_email(None)
+
+    def test_cli_plan_uses_environment_without_flag(self):
+        with patch.dict('os.environ', {'GMAIL_EXPECTED_EMAIL': 'account@example.com'}, clear=True):
+            with patch.object(d, 'cmd_plan') as fake_plan:
+                self.assertEqual(d.main(['plan']), 0)
+                self.assertEqual(fake_plan.call_args.args[0].expected_email, 'account@example.com')
+
+    def test_cli_flag_overrides_environment_at_dispatch(self):
+        with patch.dict('os.environ', {'GMAIL_EXPECTED_EMAIL': 'wrong@example.com'}, clear=True):
+            for command in ('plan', 'verify', 'apply'):
+                with self.subTest(command=command):
+                    handler={'plan':'cmd_plan','verify':'cmd_verify','apply':'cmd_apply'}[command]
+                    argv=[command, '--expected-email','chosen@example.com']
+                    if command=='apply':
+                        argv.extend(['--approve','digest'])
+                    with patch.object(d, handler) as fake:
+                        self.assertEqual(d.main(argv),0)
+                        self.assertEqual(fake.call_args.args[0].expected_email,'chosen@example.com')
+
+    def test_all_gmail_commands_can_use_environment(self):
+        with patch.dict('os.environ', {'GMAIL_EXPECTED_EMAIL': 'account@example.com'}, clear=True):
+            for command in ('plan', 'apply', 'verify'):
+                with self.subTest(command=command):
+                    handler={'plan':'cmd_plan','apply':'cmd_apply','verify':'cmd_verify'}[command]
+                    argv=[command]
+                    if command=='apply': argv.extend(['--approve','digest'])
+                    with patch.object(d, handler) as fake:
+                        self.assertEqual(d.main(argv),0)
+                        self.assertEqual(fake.call_args.args[0].expected_email,'account@example.com')
+
 
 if __name__=='__main__': unittest.main()

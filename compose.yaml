@@ -6,6 +6,7 @@ services:
     volumes:
       - ./local:/app/local
     environment:
+      GMAIL_EXPECTED_EMAIL: "${GMAIL_EXPECTED_EMAIL:-}"
       GMAIL_OAUTH_HOST: localhost
       GMAIL_OAUTH_BIND_ADDR: 0.0.0.0
       GMAIL_OAUTH_PORT: "8765"

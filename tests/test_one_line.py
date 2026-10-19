@@ -99,7 +99,7 @@ class TestOneLine(unittest.TestCase):
                 self.assertIn('Gmail設定は変更していません',text)
         self.assertFalse((self.local/'run_pending.json').exists())
 
-    def test_delete_mismatch_preserved_with_non_delete_update(self):
+    def test_delete_mismatch_master_is_applied_with_non_delete_update(self):
         baseline = d.compile_xml(self.base)
         gmail_only = next(x for x in baseline if d.is_delete(x))
         # The target XML advertises a different Delete policy, which is deferred.
@@ -112,14 +112,14 @@ class TestOneLine(unittest.TestCase):
             self.assertEqual(d.main(self.argv),0)
         live = [x['filter'] for x in d.api_fetch(self.client)[0]]
         self.assertEqual(len([x for x in live if d.is_delete(x)]),1)
-        self.assertEqual(next(x for x in live if d.is_delete(x))['criteria']['from'], 'legacy@ads.example.invalid')
-        self.assertNotIn(gmail_only,live)
+        self.assertEqual(next(x for x in live if d.is_delete(x))['criteria']['from'], 'ads@example.invalid')
+        self.assertIn(gmail_only,live)
         self.assertFalse((self.local/'run_pending.json').exists())
         with patch.object(d,'get_client',return_value=(self.client,object())), \
              patch.object(d,'confirm_interactive',side_effect=AssertionError('must not prompt')):
             self.assertEqual(d.main(self.argv),0)
 
-    def test_delete_mismatch_preserved_after_interruption_resume(self):
+    def test_delete_mismatch_master_applies_after_interruption_resume(self):
         baseline = d.compile_xml(self.base)
         altered = [x for x in baseline if not d.is_delete(x)]
         self.client = FakeClient(altered)
@@ -134,7 +134,39 @@ class TestOneLine(unittest.TestCase):
              patch.object(d,'perform',actual_perform):
             self.assertEqual(d.main(self.argv),0)
         self.assertFalse((self.local/'run_pending.json').exists())
-        self.assertEqual(sum(1 for x in d.api_fetch(self.client)[0] if d.is_delete(x['filter'])),0)
+        self.assertEqual(sum(1 for x in d.api_fetch(self.client)[0] if d.is_delete(x['filter'])),1)
+
+    def test_preview_has_all_changes_before_single_prompt(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        rows = d.compile_xml(self.base)
+        more = list(rows)
+        for i in range(21):
+            more.append({'criteria':{'from':f'spammer{i}@example.invalid'},
+                         'action':{'addLabelIds':['label:Service/Extra'],'removeLabelIds':[]}})
+        self.client=FakeClient(more)
+        output=StringIO()
+        def confirm_once():
+            content=output.getvalue()
+            self.assertIn('[5/6]',content)
+            self.assertIn('spammer0@example.invalid',content)
+            self.assertIn('spammer20@example.invalid',content)
+            self.assertIn('Action/Delete',content)
+            self.assertIn('【削除する既存フィルタ',content)
+            return False
+        with patch.object(d,'get_client',return_value=(self.client,object())), \
+             patch.object(d,'confirm_interactive',side_effect=confirm_once) as prompt, redirect_stdout(output):
+            self.assertEqual(d.main(self.argv),0)
+            prompt.assert_called_once()
+        self.assertFalse((self.local/'run_pending.json').exists())
+
+    def test_delete_label_only_no_trash_or_mark_read(self):
+        with self.assertRaises(d.DeploymentError):
+            d.check_xml_rules([{'from':'x@example.invalid','label':'Action/Delete','shouldNeverSpam':'true'}])
+        with self.assertRaises(d.DeploymentError):
+            d.check_xml_rules([{'from':'x@example.invalid','label':'Action/Delete','shouldMarkAsRead':'true'}])
+        with self.assertRaises(d.DeploymentError):
+            d.check_xml_rules([{'from':'x@example.invalid','label':'Action/Delete','shouldTrash':'true'}])
 
     def test_trash_mismatch_remains_hard_stop(self):
         baseline = d.compile_xml(self.base)

@@ -109,7 +109,7 @@ class TestDeployer(unittest.TestCase):
         client=FakeClient(self.b)
         live,labels=d.api_fetch(client)
         plan=d.make_plan(None,self.target,[x['filter'] for x in live], 'test@example.invalid', labels)
-        self.assertEqual(plan['schema'],'gmail-filters-deploy-plan/v2')
+        self.assertEqual(plan['schema'],'gmail-filters-deploy-plan/v3')
         self.assertIsNone(plan['baseline_path'])
         self.assertEqual((len(plan['add']),len(plan['remove'])),(2,1))
         self.assertEqual(d.counter(d.planned_states(plan)[0]),d.counter(self.b))
@@ -118,15 +118,14 @@ class TestDeployer(unittest.TestCase):
         d.perform(client,plan,'test@example.invalid',plan['approval_digest'],log,batch_size=1)
         self.assertEqual(d.counter([x['filter'] for x in d.api_fetch(client)[0]]),d.counter(self.t))
 
-    def test_live_baseline_freezes_delete_and_rejects_unknown_state(self):
+    def test_live_baseline_master_updates_delete_and_rejects_unknown_state(self):
         extra=[{'from':'other@example.invalid','label':'Action/Delete'}]
         live=self.b+d.compile_xml(self._write_extra(extra))
-        frozen=d.make_plan(None,self.target,live,'test@example.invalid',{})
-        self.assertEqual(frozen['protected_delete_count'],2)
-        self.assertEqual(len(frozen['deferred_delete']['gmail_only']),1)
-        self.assertEqual(len(frozen['deferred_delete']['master_only']),0)
-        self.assertFalse(any(d.is_delete(x) for x in frozen['add'] + frozen['remove']))
-        plan=d.make_plan(None,self.target,self.b,'test@example.invalid',{})
+        plan=d.make_plan(None,self.target,live,'test@example.invalid',{})
+        self.assertEqual(plan['current_delete_count'],2)
+        self.assertEqual(plan['target_delete_count'],1)
+        self.assertEqual(sum(d.is_delete(x) for x in plan['remove']),1)
+        self.assertEqual(sum(d.is_delete(x) for x in plan['add']),0)
         altered=self.b[1:]+[{'criteria':{'from':'unrelated@example.invalid'},
                               'action':{'addLabelIds':['label:Service/X'],'removeLabelIds':[]}}]
         with self.assertRaises(d.DeploymentError):
@@ -152,7 +151,10 @@ class TestDeployer(unittest.TestCase):
             d.check_xml_rules([{'from':'a@example.invalid','label':'Action/Delete','shouldTrash':'true'}])
         changed=[dict(x) for x in self.b]
         changed[2]['criteria']={'from':'changed@example.invalid'}
-        with self.assertRaises(d.DeploymentError): d.protect(self.b,changed)
+        d.protect(self.b, changed)  # Master may change Action/Delete conditions.
+        with self.assertRaises(d.DeploymentError):
+            d.validate_delete_label_only([{'criteria':{'from':'x'},'action':
+                {'addLabelIds':['label:Action/Delete'],'removeLabelIds':['UNREAD']}}])
 
     def test_unsupported_from(self):
         with self.assertRaises(d.DeploymentError):

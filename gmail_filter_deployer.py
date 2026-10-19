@@ -138,8 +138,10 @@ def check_xml_rules(entries: list[dict[str, str]], allow_spam_exception=True) ->
         label = p.get("label", "")
         if label == "Action/Delete":
             delete_keys.append(xml_semantic_key(p))
-            demand(p.get("shouldTrash") != "true", "Action/DeleteがTrashします")
-            demand(p.get("shouldMarkAsRead") != "true", "Action/Deleteで既読化する仕様は保留")
+            demand(all(p.get(flag) != "true" for flag in (
+                "shouldTrash", "shouldMarkAsRead", "shouldStar",
+                "shouldNeverSpam", "shouldNeverMarkAsImportant",
+                "shouldAlwaysMarkAsImportant")), "Action/Deleteはラベル付与のみ許可されます")
         if not label:
             no_label += 1
             demand(allow_spam_exception and p.get("shouldTrash") == "true" and "in:spam" in p.get("hasTheWord", ""), f"通常メール用processing-onlyフィルタ禁止: {i}")
@@ -297,31 +299,21 @@ def is_trash(t: dict) -> bool:
     return "TRASH" in t["action"]["addLabelIds"]
 
 
-def frozen_delete_target(master: list[dict], live: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
-    """Use the live Action/Delete set unchanged, deferring master-only Delete changes.
-
-    Only non-Delete master rules are eligible for reconciliation. The returned
-    effective target is the *only* target permitted in a deployment plan.
-    """
-    demand(
-        not any(is_delete(x) and is_trash(x) for x in live),
-        "Gmail実設定にAction/DeleteとTrashを併用する危険なフィルタがあります。自動変更せず停止します",
-    )
-    master_delete = [x for x in master if is_delete(x)]
-    live_delete = [x for x in live if is_delete(x)]
-    master_only, gmail_only = delta(live_delete, master_delete)
-    effective = [x for x in master if not is_delete(x)] + live_delete
-    demand(len(effective) == len([x for x in master if not is_delete(x)]) + len(live_delete),
-           "Delete保留対象の計算に失敗しました")
-    return effective, gmail_only, master_only
-
-
 def protect(base: list[dict], target: list[dict], actual: list[dict] | None = None) -> None:
-    demand(counter([x for x in base if is_delete(x)]) == counter([x for x in target if is_delete(x)]), "Deleteルールがbaseとtargetで異なるため停止")
-    demand(counter([x for x in base if is_trash(x)]) == counter([x for x in target if is_trash(x)]), "Trashルールに変化があるため停止")
+    """Master is authoritative for Delete labels; Trash remains an exception."""
+    demand(counter([x for x in base if is_trash(x)]) == counter([x for x in target if is_trash(x)]),
+           "Trashルールは誤削除防止のため自動変更しません")
     if actual is not None:
-        demand(counter([x for x in base if is_delete(x)]) == counter([x for x in actual if is_delete(x)]), "Gmail実設定のDeleteがbaseと不一致")
-        demand(counter([x for x in base if is_trash(x)]) == counter([x for x in actual if is_trash(x)]), "Gmail実設定のTrashがbaseと不一致")
+        demand(counter([x for x in base if is_trash(x)]) == counter([x for x in actual if is_trash(x)]),
+               "Gmail実設定のTrash保護ルールが基準と不一致")
+
+
+def validate_delete_label_only(target: list[dict]) -> None:
+    for row in target:
+        if is_delete(row):
+            demand(row["action"]["addLabelIds"] == ["label:Action/Delete"]
+                   and not row["action"]["removeLabelIds"],
+                   "Action/Deleteはラベル付与のみ許可されます（Trash・既読化等は禁止）")
 
 
 def get_client(client_secrets: Path, token_path: Path, allow_auth=True):
@@ -398,7 +390,8 @@ def compare_base_live(base: list[dict], target: list[dict], live: list[dict]) ->
 def make_plan(base_path: Path | None, target_path: Path, live: list[dict], acct: str, labels: dict,
               extra_baselines: list[Path] | None = None) -> dict:
     """Build a pinned, fully reviewed diff from a live API snapshot by default."""
-    raw_target = compile_xml(target_path)
+    target = compile_xml(target_path)
+    validate_delete_label_only(target)
     if base_path is None:
         demand(not extra_baselines, "--also-baselineは--baseとともに指定してください")
         source_path = None
@@ -407,23 +400,25 @@ def make_plan(base_path: Path | None, target_path: Path, live: list[dict], acct:
         baseline_paths = [base_path] + (extra_baselines or [])
         valid = [(p, compile_xml(p)) for p in baseline_paths]
         status = next(((p, b) for p, b in valid if counter(live) == counter(b)), None)
-        if counter(live) == counter(raw_target):
-            status = (target_path, raw_target)
+        if counter(live) == counter(target):
+            status = (target_path, target)
         if status is None:
             p0, b0 = valid[0]
             adds, removes = delta(b0, live)
             raise DeploymentError(f"Gmail実設定が既知の基準XMLと一致しません（Gmailのみ: {len(adds)} / 基準のみ: {len(removes)}）。自動上書きしません")
         source_path, base = status
-    target, gmail_only_delete, master_only_delete = frozen_delete_target(raw_target, live)
     protect(base, target, live)
     adds, removes = delta(base, target)
-    demand(not any(is_delete(x) or is_trash(x) for x in adds + removes), "Delete/Trash追加・削除は禁止")
+    demand(not any(is_trash(x) for x in adds + removes), "Trash保護ルールは変更禁止")
+    demand(all(x["action"]["addLabelIds"] == ["label:Action/Delete"] and
+               not x["action"]["removeLabelIds"] for x in adds if is_delete(x)),
+           "追加対象のAction/Deleteにラベル以外の処理が含まれています")
     demand(len(live) + len(adds) <= FILTER_LIMIT, f"追加先行時に{len(live)+len(adds)}件となり上限1000超過")
     demand(len(adds) <= 200 and len(removes) <= 30, "差分が安全上限（追加200・削除30）を超えました。中断します")
     existing_labels = set(labels)
     new_labels = sorted(set(x[6:] for t in adds for x in t["action"]["addLabelIds"] if x.startswith("label:")) - existing_labels)
     plan = {
-        "schema": "gmail-filters-deploy-plan/v2",
+        "schema": "gmail-filters-deploy-plan/v3",
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "account": acct,
         "baseline_path": str(source_path.resolve()) if source_path else None,
@@ -431,9 +426,6 @@ def make_plan(base_path: Path | None, target_path: Path, live: list[dict], acct:
         "baseline_snapshot": base,
         "target_path": str(target_path.resolve()),
         "target_sha256": file_hash(target_path),
-        "effective_target": target,
-        "master_total": len(raw_target),
-        "deferred_delete": {"gmail_only": gmail_only_delete, "master_only": master_only_delete},
         "baseline_size": len(base),
         "target_size": len(target),
         "live_snapshot_hash": tokens_digest(live),
@@ -441,7 +433,8 @@ def make_plan(base_path: Path | None, target_path: Path, live: list[dict], acct:
         "new_label_names": new_labels,
         "add": adds,
         "remove": removes,
-        "protected_delete_count": len([x for x in base if is_delete(x)]),
+        "current_delete_count": len([x for x in base if is_delete(x)]),
+        "target_delete_count": len([x for x in target if is_delete(x)]),
         "protected_trash_count": len([x for x in base if is_trash(x)]),
     }
     plan["approval_digest"] = json_hash({k: v for k, v in plan.items() if k not in {"created_utc", "approval_digest"}})
@@ -450,25 +443,24 @@ def make_plan(base_path: Path | None, target_path: Path, live: list[dict], acct:
 
 def planned_states(plan: dict):
     """Pin actual baseline and target to the approved plan, including resume."""
-    raw_target = compile_xml(Path(plan["target_path"]))
+    target = compile_xml(Path(plan["target_path"]))
+    validate_delete_label_only(target)
     demand(file_hash(plan["target_path"]) == plan["target_sha256"], "計画作成後にTarget XMLが変わりました")
     source = plan.get("baseline_path")
     if source:
         base = compile_xml(Path(source))
         demand(file_hash(source) == plan["baseline_sha256"], "計画作成後に基準XMLが変わりました")
     else:
-        demand(plan.get("schema") == "gmail-filters-deploy-plan/v2", "不正なプランスキーマ")
+        demand(plan.get("schema") == "gmail-filters-deploy-plan/v3", "旧版の配備計画は実行できません。実Gmailの状態を確認し、新しいrunで計画を作り直してください")
         base = [canonical_template(x) for x in plan["baseline_snapshot"]]
     demand(counter(base) == counter(plan["baseline_snapshot"]), "プランの基準スナップショットが変わりました")
     demand(tokens_digest(base) == plan["live_snapshot_hash"], "基準スナップショットのハッシュが不一致")
-    if "effective_target" in plan:
-        target, gmail_only, master_only = frozen_delete_target(raw_target, base)
-        demand(counter(target) == counter(plan["effective_target"]), "保留中Delete条件を含む配備計画が改変されました")
-        demand(counter(gmail_only) == counter(plan["deferred_delete"]["gmail_only"]) and
-               counter(master_only) == counter(plan["deferred_delete"]["master_only"]), "Delete差分の記録が改変されました")
-    else:
-        target = raw_target  # Previously approved plans created by older versions.
-    demand(counter(base) + Counter(json_hash(x) for x in plan["add"]) - Counter(json_hash(x) for x in plan["remove"]) == counter(target), "計画と有効Targetの差分が不一致")
+    demand(plan.get("schema") == "gmail-filters-deploy-plan/v3",
+           "旧形式の配備計画は適用できません。途中状態を手動照合してください")
+    demand(counter(base) + Counter(json_hash(x) for x in plan["add"]) - Counter(json_hash(x) for x in plan["remove"]) == counter(target),
+           "計画とMasterの差分が不一致")
+    demand(plan["current_delete_count"] == sum(is_delete(x) for x in base)
+           and plan["target_delete_count"] == sum(is_delete(x) for x in target), "Delete件数の記録が改変されました")
     protect(base, target)
     return base, target
 
@@ -547,7 +539,7 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
         old = plan["remove"][j]
         matches = [x for x in current if x["filter"] == old]
         demand(len(matches) == 1, f"削除対象が一意ではありません: {json_hash(old)} ({len(matches)}件)")
-        demand(not is_delete(old) and not is_trash(old), "保護されたフィルタは削除できません")
+        demand(not is_trash(old), "Trash保護フィルタは削除できません")
         client.users().settings().filters().delete(userId="me", id=matches[0]["id"]).execute()
         state["events"].append({"kind": "delete_filter", "step": j+1, "id": matches[0]["id"], "sha256": json_hash(old)})
         state["completed_remove"] = j+1
@@ -588,19 +580,21 @@ def cmd_validate(args):
         "target": str(target_path), "target_sha256": file_hash(target_path),
         "target_health": check_xml_rules(atom_entries(target_path)),
         "api_compatible_compilation": True,
-        "action_delete_preserved_against_live": "requires plan",
+        "action_delete_label_only": True,
     }
     if args.base:
         base = compile_xml(args.base)
         protect(base, target)
         added, removed = delta(base, target)
-        demand(not any(is_delete(x) or is_trash(x) for x in added+removed), "Action/DeleteまたはTrashの変更が検出されました")
+        demand(not any(is_trash(x) for x in added+removed), "Trash保護ルールの変更を検出しました")
         demand(len(base) + len(added) <= FILTER_LIMIT, "追加先行時にGmail上限1000件を超えます")
         report.update({"base": str(args.base), "base_sha256": file_hash(args.base),
                        "base_health": check_xml_rules(atom_entries(args.base)),
                        "add": len(added), "remove": len(removed),
                        "expected_intermediate_count": len(base)+len(added),
-                       "changes_delete": False, "changes_trash": False})
+                       "delete_add": sum(is_delete(x) for x in added),
+                       "delete_remove": sum(is_delete(x) for x in removed),
+                       "changes_trash": False})
     if args.out:
         save_json(args.out, report)
     print(json.dumps(report, ensure_ascii=False, indent=2))
@@ -618,8 +612,8 @@ def cmd_plan(args):
                       "master": str(target_path), "add": len(plan["add"]), "remove": len(plan["remove"]),
                       "new_labels": plan["new_label_names"], "approval_digest": plan["approval_digest"],
                       "plan_file": str(args.out), "requires_allow_removals": bool(plan["remove"]),
-                      "deferred_delete_gmail_only": len(plan["deferred_delete"]["gmail_only"]),
-                      "deferred_delete_master_only": len(plan["deferred_delete"]["master_only"])}, ensure_ascii=False, indent=2))
+                      "delete_add": sum(is_delete(x) for x in plan["add"]),
+                      "delete_remove": sum(is_delete(x) for x in plan["remove"])}, ensure_ascii=False, indent=2))
     print("ドライランのみ。Gmailは変更していません。削除対象はplan.jsonで必ず確認してください")
 
 
@@ -637,17 +631,14 @@ def cmd_verify(args):
     client, creds = get_client(args.client_secrets, args.token, allow_auth=False)
     acct = account_email(creds)
     demand(acct == args.expected_email.lower(), "認証アカウント不一致")
-    master = compile_xml(select_master(args.local_dir, args.target))
+    target = compile_xml(select_master(args.local_dir, args.target))
     current, _ = api_fetch(client)
     actual = [x["filter"] for x in current]
-    target, gmail_only_delete, master_only_delete = frozen_delete_target(master, actual)
-    protect(actual, target)
     adds, removes = delta(target, actual)
-    report = {"account": acct, "master_total": len(master), "effective_target": len(target), "live": len(actual),
+    report = {"account": acct, "target": len(target), "live": len(actual),
               "live_only": len(adds), "master_only": len(removes), "match": not adds and not removes,
-              "master_full_match": counter(master) == counter(actual),
-              "deferred_delete_gmail_only": len(gmail_only_delete),
-              "deferred_delete_master_only": len(master_only_delete)}
+              "delete_live": sum(is_delete(x) for x in actual),
+              "delete_master": sum(is_delete(x) for x in target)}
     if args.out:
         save_json(args.out, report)
     print(json.dumps(report, ensure_ascii=False, indent=2))
@@ -661,40 +652,51 @@ def format_filter_summary(row: dict) -> str:
 
 
 def show_run_plan(plan: dict, plan_path: Path) -> None:
+    """Preview EVERY change before a single final confirmation."""
+    adds, removes = plan["add"], plan["remove"]
     print(f"\nGmailフィルタ配備計画: {plan['account']}")
     print(f"Master: {plan['target_path']}")
-    print(f"現行 {plan['baseline_size']}件 → 有効目標 {plan['target_size']}件（Master {plan.get('master_total', plan['target_size'])}件）")
-    print(f"追加 {len(plan['add'])}件 / 既存ルール削除 {len(plan['remove'])}件 / 新規ラベル {len(plan['new_label_names'])}件")
-    print(f"Action/Delete保護 {plan['protected_delete_count']}件 / Trash例外保護 {plan['protected_trash_count']}件")
-    deferred = plan.get("deferred_delete", {})
-    if deferred:
-        gmail_only = deferred.get("gmail_only", [])
-        master_only = deferred.get("master_only", [])
-        if gmail_only or master_only:
-            print(f"【Action/Delete保留】Gmail側のみ {len(gmail_only)}件 / Master側のみ {len(master_only)}件。変更せず維持します。")
-            print("Gmail側Delete（保持）:")
-            for item in gmail_only:
-                print("  = " + format_filter_summary(item))
-            print("Master側Delete（追加保留）:")
-            for item in master_only:
-                print("  ~ " + format_filter_summary(item))
+    print(f"現行 {plan['baseline_size']}件 → Master {plan['target_size']}件")
+    print(f"追加 {len(adds)}件 / 既存ルール削除 {len(removes)}件 / 新規ラベル {len(plan['new_label_names'])}件")
+    print(f"Action/Delete: 現行 {plan['current_delete_count']}件 → Master {plan['target_delete_count']}件")
+    print(f"Action/Deleteの追加 {sum(is_delete(x) for x in adds)}件 / 削除 {sum(is_delete(x) for x in removes)}件")
+    print(f"Trash保護例外 {plan['protected_trash_count']}件（変更禁止）")
     if plan['new_label_names']:
-        print("作成予定ラベル: " + ", ".join(plan['new_label_names']))
-    if plan['remove']:
-        print("\n【削除予定の既存フィルタ：全件】")
-        for i, row in enumerate(plan['remove'], 1):
-            print(f"  - {i}. {format_filter_summary(row)}")
-    if plan['add']:
-        print("\n【追加予定フィルタ：冒頭12件】")
-        for i, row in enumerate(plan['add'][:12], 1):
-            print(f"  + {i}. {format_filter_summary(row)}")
-        if len(plan['add']) > 12:
-            print(f"  ...残り{len(plan['add']) - 12}件は計画ファイルを確認")
-    print(f"\n全ルールの差分・承認対象: {plan_path}")
-    print("新規ラベル・フィルタ作成と、表示した旧フィルタの削除を行います。メール自体は削除しません。")
+        print("\n【新規作成するラベル：全件】")
+        for name in plan['new_label_names']:
+            print("  + " + name)
+    # Group unambiguous replacements by identical resulting action/label.
+    # Do not guess when multiple distinct rules share one action.
+    from collections import defaultdict
+    by_action_add = defaultdict(list)
+    by_action_remove = defaultdict(list)
+    for row in adds:
+        by_action_add[json_hash(row["action"])].append(row)
+    for row in removes:
+        by_action_remove[json_hash(row["action"])].append(row)
+    replaced_add, replaced_remove, replacements = set(), set(), []
+    for key in sorted(set(by_action_add) & set(by_action_remove)):
+        old, new = by_action_remove[key], by_action_add[key]
+        if len(old) == len(new) == 1:
+            replaced_remove.add(json_hash(old[0]))
+            replaced_add.add(json_hash(new[0]))
+            replacements.append((old[0], new[0]))
+    print(f"\n【条件変更（旧→新）：{len(replacements)}組】")
+    for i, (old, new) in enumerate(replacements, 1):
+        print(f"  ~ {i}. 旧 {format_filter_summary(old)}")
+        print(f"         新 {format_filter_summary(new)}")
+    print(f"\n【削除する既存フィルタ：{len(removes) - len(replaced_remove)}件】")
+    for i, row in enumerate((x for x in removes if json_hash(x) not in replaced_remove), 1):
+        print(f"  - {i}. {format_filter_summary(row)}")
+    print(f"\n【追加するフィルタ：{len(adds) - len(replaced_add)}件】")
+    for i, row in enumerate((x for x in adds if json_hash(x) not in replaced_add), 1):
+        print(f"  + {i}. {format_filter_summary(row)}")
+    print(f"\n配備計画全文: {plan_path}")
+    print("Master XMLに合わせて上記を追加・削除・置換します。")
+    print("Action/DeleteはGmailラベルの付与であり、メールをゴミ箱には移動しません。")
 
 
-def confirm_interactive(prompt: str = "Gmailのフィルタ設定を変更しますか？ [y/N]: ") -> bool:
+def confirm_interactive(prompt: str = "上記の変更をGmailに反映します。進めていいですか？ [y/N]: ") -> bool:
     # No implicit approval through piped input or background/scheduled runs.
     demand(sys.stdin.isatty(), "対話端末が必要です。docker compose run（-Tなし）で実行してください")
     try:
@@ -780,25 +782,21 @@ def cmd_run(args):
         plan_file = args.local_dir / 'run_plan.json'
         if pending_file.exists():
             plan = json.loads(pending_file.read_text(encoding='utf-8'))
-            demand(plan.get('schema') == 'gmail-filters-deploy-plan/v2', '途中計画の形式が不正です')
+            demand(plan.get('schema') == 'gmail-filters-deploy-plan/v3', '旧版の配備計画が残っています。以前の配備状態を確認してから手動で整理してください')
             demand(plan['account'] == acct, '途中計画のアカウントが一致しません')
             demand(plan['target_path'] == str(target_path.resolve()), '途中計画の対象Masterと現行Masterが異なります。再開を停止しました')
             base, old_target = planned_states(plan)
             demand(file_hash(target_path) == plan["target_sha256"], '途中計画のMasterが変更されています')
             a_done, r_done = detect_position(base, plan, live)
             if a_done == len(plan['add']) and r_done == len(plan['remove']):
-                print(f"前回の配備は既に反映済みです。Deleteは保留してAPI一致: {len(old_target)}件", flush=True)
+                print(f"前回の配備は既に反映済みです。MasterとAPI一致: {len(old_target)}件", flush=True)
                 pending_file.unlink()
                 return
             print(f"前回の中断計画を検出しました（追加済 {a_done}/{len(plan['add'])}、削除済 {r_done}/{len(plan['remove'])}）。")
         else:
             plan = make_plan(None, target_path, live, acct, labels)
             if not plan['add'] and not plan['remove']:
-                pending_delete = plan["deferred_delete"]
-                if pending_delete["gmail_only"] or pending_delete["master_only"]:
-                    print(f"Type/Service等は配備済み。Delete差分のみ保留：Gmail側 {len(pending_delete['gmail_only'])}件 / Master側 {len(pending_delete['master_only'])}件。", flush=True)
-                else:
-                    print(f"変更不要：{acct} の{len(target)}フィルタが最新Masterに一致しています。", flush=True)
+                print(f"変更不要：{acct} の{len(target)}フィルタが最新Masterに一致しています。", flush=True)
                 return
             save_json(plan_file, plan)
         if args.verbose:
@@ -806,7 +804,7 @@ def cmd_run(args):
             print(f"[詳細] 計画SHA-256: {plan['approval_digest']}", flush=True)
         # The full plan is always available before accepting any modification.
         show_run_plan(plan, plan_file if not pending_file.exists() else pending_file)
-        print("[5/6] 承認待ち。Enter・nで配備せず終了します。", flush=True)
+        print("[5/6] 事前確認完了。上記の全変更内容を確認してください。", flush=True)
         if not confirm_interactive():
             print("承認されなかったためGmailは変更していません。")
             return

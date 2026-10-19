@@ -57,7 +57,7 @@ Action/DeleteとTrashはそれぞれ`[y/N]`で承認または見送れます。�
 
 - `--target PATH`：バージョン自動選択を使わず、対象Master XMLを明示。
 - `--batch-size N`：APIを読み戻して途中一致を検証する追加件数。**1〜25、既定20**。UIインポート単位ではありません。
-- `-v`, `--verbose`：フィルタ単位の処理結果や照合状況を詳しく標準出力に表示。実行結果の保存先は従来どおり`local/logs/`です。
+- `-v`, `--verbose`：フィルタ単位の処理結果や照合状況に加え、API読取・削除・追加の開始/終了時刻（UTCオフセット付きISO 8601）と所要秒数を標準出力に表示。エラー発生時にも失敗した処理と経過時間を表示します。承認待ちを含む`run`全体と配備処理のみの所要時間も分けて表示します。実行結果の保存先は従来どおり`local/logs/`です。Docker内タイムゾーンがUTCなら`+00:00`になるため、ホスト端末のJSTと時刻を比較する際はオフセットを考慮してください。
 - `--expected-email ADDRESS`：`.env`の`GMAIL_EXPECTED_EMAIL`より優先するアカウント照合先。
 - `--local-dir PATH`：Masterと配備記録の保存フォルダ。既定`/app/local`（Docker内）。
 - `--client-secrets PATH`：OAuth DesktopクライアントJSON。既定`/app/local/credentials.json`。

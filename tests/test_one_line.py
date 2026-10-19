@@ -260,6 +260,35 @@ class TestOneLine(unittest.TestCase):
         self.assertEqual(before,d.counter([x['filter'] for x in d.api_fetch(self.client)[0]]))
         self.assertFalse((self.local/'run_pending.json').exists())
 
+    def test_verbose_run_reports_operation_timestamps_and_durations(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        output = StringIO()
+        with patch.object(d, 'confirm_interactive', return_value=True), redirect_stdout(output):
+            self.assertEqual(d.main(self.argv + ['-v']), 0)
+        log = output.getvalue()
+        self.assertIn('[処理開始] Gmail labels.list', log)
+        self.assertIn('[処理完了] Gmail filters.list', log)
+        self.assertIn('[処理開始] Gmail filters.delete', log)
+        self.assertIn('[処理完了] Gmail filters.create', log)
+        self.assertIn('[処理完了] 承認済み計画の配備', log)
+        self.assertIn('[計測] run全体（対話確認を含む）:', log)
+        self.assertRegex(
+            log,
+            r'\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}\] '
+            r'\[処理完了\] Gmail filters.delete \[1/1\] \(\d+\.\d{2}s\)')
+
+    def test_operation_timer_reports_failure_without_swallowing_exception(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        out = StringIO()
+        def fail():
+            raise RuntimeError('simulated')
+        with redirect_stdout(out):
+            with self.assertRaisesRegex(RuntimeError, 'simulated'):
+                d.timed_operation('Gmail filters.delete', fail, verbose=True)
+        self.assertIn('[処理失敗] Gmail filters.delete', out.getvalue())
+
     def test_run_full_deploy_and_idempotent_second_run(self):
         with patch.object(d,'confirm_interactive',return_value=True) as confirmation:
             self.assertEqual(d.main(self.argv),0)

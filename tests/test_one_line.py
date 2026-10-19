@@ -237,7 +237,7 @@ class TestOneLine(unittest.TestCase):
         self.assertIn('スキップ予定：2件',output)
         self.assertIn('duplicate_matches',output)
         self.assertIn('結果: 一部未適用',output)
-        self.assertIn('スキップ: 2件',output)
+        self.assertIn('スキップ（未適用）: 2件',output)
         after=[x['filter'] for x in d.api_fetch(self.client)[0]]
         self.assertEqual(sum(x==duplicated for x in after),2)
         self.assertEqual(len(after),7)

@@ -115,7 +115,8 @@ class TestOneLine(unittest.TestCase):
         self.assertEqual(next(x for x in live if d.is_delete(x))['criteria']['from'], 'legacy@ads.example.invalid')
         self.assertNotIn(gmail_only,live)
         self.assertFalse((self.local/'run_pending.json').exists())
-        with patch.object(d,'confirm_interactive',side_effect=AssertionError('must not prompt')):
+        with patch.object(d,'get_client',return_value=(self.client,object())), \
+             patch.object(d,'confirm_interactive',side_effect=AssertionError('must not prompt')):
             self.assertEqual(d.main(self.argv),0)
 
     def test_delete_mismatch_preserved_after_interruption_resume(self):

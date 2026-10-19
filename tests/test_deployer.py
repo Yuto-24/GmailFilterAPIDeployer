@@ -118,11 +118,14 @@ class TestDeployer(unittest.TestCase):
         d.perform(client,plan,'test@example.invalid',plan['approval_digest'],log,batch_size=1)
         self.assertEqual(d.counter([x['filter'] for x in d.api_fetch(client)[0]]),d.counter(self.t))
 
-    def test_live_baseline_rejects_delete_change_and_unknown_state(self):
+    def test_live_baseline_freezes_delete_and_rejects_unknown_state(self):
         extra=[{'from':'other@example.invalid','label':'Action/Delete'}]
         live=self.b+d.compile_xml(self._write_extra(extra))
-        with self.assertRaises(d.DeploymentError):
-            d.make_plan(None,self.target,live,'test@example.invalid',{})
+        frozen=d.make_plan(None,self.target,live,'test@example.invalid',{})
+        self.assertEqual(frozen['protected_delete_count'],2)
+        self.assertEqual(len(frozen['deferred_delete']['gmail_only']),1)
+        self.assertEqual(len(frozen['deferred_delete']['master_only']),0)
+        self.assertFalse(any(d.is_delete(x) for x in frozen['add'] + frozen['remove']))
         plan=d.make_plan(None,self.target,self.b,'test@example.invalid',{})
         altered=self.b[1:]+[{'criteria':{'from':'unrelated@example.invalid'},
                               'action':{'addLabelIds':['label:Service/X'],'removeLabelIds':[]}}]

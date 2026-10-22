@@ -86,7 +86,7 @@ class ReadbackTests(unittest.TestCase):
         with patch.object(FakeFilters, "list", new=read_with_one_glitch), \
              patch.object(d.time, "sleep") as sleeper, redirect_stdout(out):
             d.perform(self.client, self.plan, "test@example.invalid",
-                      self.plan["approval_digest"], log, batch_size=20)
+                      self.plan["approval_digest"], log, batch_size=1)
         self.assertTrue(did_glitch[0])
         sleeper.assert_called_once_with(2)
         self.assertIn("再照合2/3回目で一致", out.getvalue())
@@ -127,7 +127,7 @@ class ReadbackTests(unittest.TestCase):
             return original_list(fake, userId)
         with patch.object(FakeLabels, "list", new=count_labels):
             d.perform(client, plan, "test@example.invalid",
-                      plan["approval_digest"], self.local / "fast.json")
+                      plan["approval_digest"], self.local / "fast.json", batch_size=1)
         # One complete pre-delete read per deletion, not two; plus initial and final reads.
         self.assertLess(label_calls[0], 2 * len(plan["remove"]))
         self.assertEqual(d.counter(x["filter"] for x in d.api_fetch(client)[0]),

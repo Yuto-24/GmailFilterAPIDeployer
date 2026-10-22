@@ -44,6 +44,7 @@ class RecoveryTests(unittest.TestCase):
         return patcher.start()
 
     def deploy(self, **kwargs):
+        kwargs.setdefault("batch_size", 1)  # Legacy single-operation recovery contract.
         d.perform(self.client, self.plan, "test@example.invalid",
                   self.plan["approval_digest"], self.log, **kwargs)
 
@@ -125,7 +126,7 @@ class RecoveryTests(unittest.TestCase):
         self.start_patch(patch.object(FakeFilters, "list", new=listing))
         self.deploy()
         self.assertEqual(len(calls), len(self.plan["add"]))
-        self.assertEqual(len(reads_after_error), 2)
+        self.assertEqual(len(reads_after_error), 3)  # Two recovery reads plus batch-size=1 verification.
         self.sleeper.assert_called_once_with(1.25)
         self.assert_complete()
 
@@ -291,7 +292,7 @@ class RecoveryTests(unittest.TestCase):
              patch.object(FakeFilters, "delete", side_effect=AssertionError("must not repeat delete")), \
              redirect_stderr(self.output):
             self.assertEqual(d.main(["run", "--local-dir", str(self.local), "--expected-email",
-                                     "test@example.invalid"]), 0)
+                                     "test@example.invalid", "--batch-size", "1"]), 0)
         approval.assert_called_once()
         self.assertFalse(pending.exists())
         self.assertTrue(json.loads(journal.read_text())["verified"])
@@ -306,7 +307,7 @@ class RecoveryTests(unittest.TestCase):
             def execute():
                 raise ApiError()
             return Req(execute)
-        argv = ["run", "--local-dir", str(self.local), "--expected-email", "test@example.invalid"]
+        argv = ["run", "--local-dir", str(self.local), "--expected-email", "test@example.invalid", "--batch-size", "1"]
         with patch.object(d, "get_client", return_value=(self.client, object())), \
              patch.object(d, "account_email", return_value="test@example.invalid"), \
              patch.object(d, "confirm_interactive", return_value=True), \

@@ -161,11 +161,18 @@ def recover_mutation(label: str, call, reconcile, record, *, verbose=False):
     raise AssertionError("unreachable mutation retry")
 
 
-def filter_id_map(rows: list[dict]) -> dict[str, dict]:
-    ids = [row.get("id") for row in rows]
-    demand(all(isinstance(fid, str) and fid.strip() for fid in ids)
-           and len(set(ids)) == len(ids), "フィルタIDが欠落または重複しています")
-    return {row["id"]: row["filter"] for row in rows}
+def filter_snapshot(rows: list[dict]) -> tuple[dict[str, dict], Counter]:
+    """Keep ID-less skipped rules immutable without blocking other approved work."""
+    identified = {}
+    unidentified = []
+    for row in rows:
+        fid = row.get("id")
+        if isinstance(fid, str) and fid.strip():
+            demand(fid not in identified, "フィルタIDが重複しています")
+            identified[fid] = row["filter"]
+        else:
+            unidentified.append(row["filter"])
+    return identified, counter(unidentified)
 
 
 def prefix_counts(base: list[dict], plan: dict, adds: int, removes: int) -> Counter:
@@ -978,13 +985,13 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
             demand(counter(x["filter"] for x in existing)
                    == prefix_counts(base, plan, verified_adds, j),
                    "削除直前の実設定が承認計画と不一致です。" + RECOVERY_STOP)
-            before = filter_id_map(existing)
+            before = filter_snapshot(existing)
             delete_id = matches[0]["id"]
-            after = {fid: rule for fid, rule in before.items() if fid != delete_id}
+            after = ({fid: rule for fid, rule in before[0].items() if fid != delete_id}, before[1])
 
             def reconcile_delete():
                 rows, now_labels = api_fetch(client, verbose=verbose, retry_reads=False)
-                actual = filter_id_map(rows)
+                actual = filter_snapshot(rows)
                 demand(now_labels == labels, "再照合中にラベル設定が変更されました")
                 if actual == after:
                     return True, {}
@@ -1018,13 +1025,13 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
         demand(counter(x["filter"] for x in existing)
                == prefix_counts(base, plan, start, verified_removes),
                "追加直前の実設定が承認計画と不一致です。" + RECOVERY_STOP)
-        known_filters = filter_id_map(existing)
+        known_filters, unidentified_filters = filter_snapshot(existing)
         # Labels are part of the recovery snapshot too: do not accept renamed IDs.
         for name in plan["new_label_names"]:
             if name not in labels:
                 def reconcile_label():
                     rows, now_labels = api_fetch(client, verbose=verbose, retry_reads=False)
-                    demand(filter_id_map(rows) == known_filters,
+                    demand(filter_snapshot(rows) == (known_filters, unidentified_filters),
                            "ラベル作成中にフィルタ設定が変更されました")
                     if name in now_labels:
                         demand({k: v for k, v in now_labels.items() if k != name} == labels
@@ -1051,12 +1058,13 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
                 save_json(log, state)
         for i in range(start, len(plan["add"])):
             templ = plan["add"][i]
-            demand(json_hash(templ) not in counter(known_filters.values()),
+            demand(json_hash(templ) not in counter(known_filters.values()) + unidentified_filters,
                    "追加対象が既に存在します。" + RECOVERY_STOP)
 
             def reconcile_create():
                 rows, now_labels = api_fetch(client, verbose=verbose, retry_reads=False)
-                actual = filter_id_map(rows)
+                actual, unidentified = filter_snapshot(rows)
+                demand(unidentified == unidentified_filters, "ID不明フィルタの内容・件数が変わりました")
                 demand(now_labels == labels, "再照合中にラベル設定が変更されました")
                 if actual == known_filters:
                     return False, None

@@ -317,6 +317,79 @@ class RecoveryTests(unittest.TestCase):
             self.assertEqual(d.main(argv), 0)
         self.assertFalse(pending.exists())
 
+    def prepare_missing_id_skip(self):
+        extra = {"criteria": {"from": "obsolete@example.invalid"},
+                 "action": {"addLabelIds": ["label:Service/Example"], "removeLabelIds": []}}
+        self.base = d.compile_xml(self.local / "baseline.xml") + [extra]
+        self.client = FakeClient(self.base)
+        rows, labels = d.api_fetch(self.client)
+        skipped = d.canonical_template(d.build_template(BASE[1]))
+        fid = next(x["id"] for x in rows if x["filter"] == skipped)
+        self.client.filters[fid].pop("id")
+        rows, labels = d.api_fetch(self.client)
+        plan = d.make_plan(None, self.master, self.base, "test@example.invalid", labels)
+        self.plan = d.select_plan_groups(plan, ["other"], current=rows)
+        self.assertEqual(self.plan["skipped_deletions"][0]["reason"], "missing_filter_id")
+        self.assertEqual(len(self.plan["remove"]), 1)
+        self.log.unlink(missing_ok=True)
+        return fid
+
+    def test_missing_id_skip_preserves_rule_and_deploys_other_changes(self):
+        fid = self.prepare_missing_id_skip()
+        old = deepcopy(self.client.filters[fid])
+        self.deploy()
+        self.assertEqual(self.client.filters[fid], old)
+        self.assertEqual(d.counter(x["filter"] for x in d.api_fetch(self.client)[0]),
+                         d.counter(d.planned_states(self.plan)[1]))
+        self.assertTrue(json.loads(self.log.read_text())["verified"])
+
+    def test_missing_id_skip_is_preserved_during_all_write_recovery_paths(self):
+        for resource, method in ((FakeFilters, "delete"), (FakeFilters, "create"), (FakeLabels, "create")):
+            for applied in (False, True):
+                with self.subTest(resource=resource.__name__, method=method, applied=applied):
+                    fid = self.prepare_missing_id_skip()
+                    old = deepcopy(self.client.filters[fid])
+                    original = getattr(resource, method)
+                    calls = []
+                    def request(fake, **kwargs):
+                        req = original(fake, **kwargs)
+                        def execute():
+                            calls.append(kwargs)
+                            if len(calls) == 1:
+                                if applied:
+                                    req.execute()
+                                raise ApiError()
+                            return req.execute()
+                        return Req(execute)
+                    with patch.object(resource, method, new=request):
+                        self.deploy()
+                    expected = len(self.plan["remove"] if method == "delete" else
+                                   self.plan["new_label_names"] if resource is FakeLabels else self.plan["add"])
+                    self.assertEqual(len(calls), expected + (0 if applied else 1))
+                    self.assertEqual(self.client.filters[fid], old)
+                    self.assertEqual(d.counter(x["filter"] for x in d.api_fetch(self.client)[0]),
+                                     d.counter(d.planned_states(self.plan)[1]))
+                    self.assertTrue(json.loads(self.log.read_text())["verified"])
+
+    def test_changed_idless_rule_stops_recovery(self):
+        fid = self.prepare_missing_id_skip()
+        def drift(fake):
+            fake.p.filters[fid]["criteria"] = {"from": "changed@example.invalid"}
+        calls = self.fail_first(FakeFilters, "create", side_effect=drift)
+        with self.assertRaisesRegex(d.DeploymentError, "変更結果が不明"):
+            self.deploy()
+        self.assertEqual(len(calls), 1)
+        self.sleeper.assert_not_called()
+
+    def test_duplicate_known_ids_still_stop_before_mutation(self):
+        self.prepare_missing_id_skip()
+        identified = [x for x in self.client.filters.values() if x.get("id")]
+        identified[0]["id"] = identified[-1]["id"]
+        with patch.object(FakeFilters, "delete", side_effect=AssertionError("must not delete")):
+            with self.assertRaisesRegex(d.DeploymentError, "フィルタIDが重複"):
+                self.deploy()
+
+
 
 class ReadRetryTests(unittest.TestCase):
     def test_transient_read_statuses_retry_with_bounded_backoff(self):

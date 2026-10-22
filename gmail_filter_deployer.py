@@ -1198,12 +1198,22 @@ def perform_batched(client, plan, base, target, current, labels, log, batch_size
     print(f"配備完了: {len(target)}件、API読戻し一致。Gmail UI exportも別途取得して照合してください")
 
 
+def validate_batch_limit(log, batch_size, max_batches):
+    prior = json.loads(log.read_text(encoding="utf-8")) if log.exists() else {}
+    demand(max_batches is None or max_batches > 0, "max-batchesは1以上で指定してください")
+    demand(max_batches is None or batch_size > 1 or prior.get("batch_checkpoint") is not None,
+           "max-batchesは複数件バッチまたは既存バッチ計画の再開専用です。"
+           "新規の1件逐次処理では指定を外してください")
+    return prior
+
+
 def validate_before_final_approval(plan: dict, expected_email: str, log: Path,
-                                   batch_size: int, current: list[dict]) -> None:
+                                   batch_size: int, current: list[dict], max_batches=None) -> None:
     """Check all locally decidable execution invariants before consent."""
     demand(expected_email.lower() == plan["account"].lower(),
            "承認対象のGmailアカウントが認証アカウントと異なります")
     demand(1 <= batch_size <= 25, "batch-sizeは1〜25件で指定してください")
+    validate_batch_limit(log, batch_size, max_batches)
     demand(plan["approval_digest"] == json_hash({
         k:v for k,v in plan.items() if k not in {"created_utc", "approval_digest"}}),
         "承認計画のハッシュが一致しません")
@@ -1243,7 +1253,7 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
         {k: v for k, v in plan.items() if k not in {"created_utc", "approval_digest"}}),
         "承認済み計画が改変されています")
     demand(1 <= batch_size <= 25, "batch-sizeは1〜25件で指定してください")
-    demand(max_batches is None or max_batches > 0, "max-batchesは1以上で指定してください")
+    prior = validate_batch_limit(log, batch_size, max_batches)
     base, target = planned_states(plan)
     order = plan.get("operation_order", "add_first")
     demand(order in ("remove_first", "add_first"), "配備順序が不正です")
@@ -1251,8 +1261,7 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
     demand(peak <= FILTER_LIMIT,
            f"配備中の最大フィルタ数{peak}件がGmail上限{FILTER_LIMIT}件を超えます")
     current, labels = fetch_for_deploy(client, verbose=verbose)
-    prior = json.loads(log.read_text(encoding="utf-8")) if log.exists() else {}
-    if batch_size > 1 or prior.get("batch_checkpoint") is not None or max_batches is not None:
+    if batch_size > 1 or prior.get("batch_checkpoint") is not None:
         return perform_batched(client, plan, base, target, current, labels, log, batch_size, verbose, max_batches)
     live = [x["filter"] for x in current]
     a_done, r_done = detect_position(base, plan, live)
@@ -1818,7 +1827,8 @@ def cmd_run(args):
         # Every deterministic precondition is checked BEFORE final [y/N].
         latest, _ = api_fetch(client, verbose=args.verbose)
         journal = args.local_dir / 'logs' / (plan['approval_digest'] + '.json')
-        validate_before_final_approval(plan, acct, journal, args.batch_size, latest)
+        validate_before_final_approval(plan, acct, journal, args.batch_size, latest,
+                                       max_batches=getattr(args, "max_batches", None))
         print("事前検証: 計画・削除ID・容量・進捗ログ・API payloadを確認済み。", flush=True)
         if not confirm_interactive("上記の内容でGmailのフィルタ設定を変更しますか？ [y/N]: "):
             print("最終承認されなかったため、Gmail設定は変更していません。", flush=True)

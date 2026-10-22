@@ -132,10 +132,31 @@ class BatchTests(unittest.TestCase):
             self.assertEqual(pending.read_bytes(), original)
             self.assertEqual(self.client.batches, [['0', '1']])
             self.assertFalse(self.state()['verified'])
+            single = argv.copy()
+            single[single.index('--batch-size') + 1] = '1'
+            self.assertEqual(d.main(single), 0, self.output.getvalue())
+            self.assertEqual(pending.read_bytes(), original)
+            self.assertEqual(self.client.batches[1], ['2'])
             self.assertEqual(d.main(argv[:-2]), 0, self.output.getvalue())
         self.assertFalse(pending.exists())
-        self.assertEqual(self.client.batches[1], ['2', '3'])
+        self.assertEqual(self.client.batches[2], ['3', '4'])
         self.complete()
+
+    def test_limit_does_not_switch_a_fresh_serial_plan_to_batch_transport(self):
+        with patch.object(d, 'fetch_for_deploy', side_effect=AssertionError('must not access API')):
+            with self.assertRaisesRegex(d.DeploymentError, '新規の1件逐次処理'):
+                d.perform(self.client, self.plan, self.plan['account'], self.plan['approval_digest'],
+                          self.log, batch_size=1, max_batches=1)
+        self.plan = d.select_plan_groups(self.plan, ['other'])
+        d.save_json(self.local / 'run_pending.json', self.plan)
+        with patch.object(d, 'get_client', return_value=(self.client, object())), \
+             patch.object(d, 'account_email', return_value=self.plan['account']), \
+             patch.object(d, 'confirm_interactive', side_effect=AssertionError('must fail before approval')) as approval, \
+             redirect_stderr(self.output):
+            self.assertEqual(d.main(['run', '--local-dir', str(self.local), '--expected-email', self.plan['account'],
+                                     '--batch-size', '1', '--max-batches', '1']), 2)
+            approval.assert_not_called()
+        self.assertEqual(self.client.batches, [])
 
     def test_limit_at_phase_boundary_does_not_create_labels(self):
         write_xml(self.master, self.common + [{'from': 'new@example.invalid', 'label': 'Service/New'}])

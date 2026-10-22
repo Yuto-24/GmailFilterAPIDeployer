@@ -11,10 +11,12 @@ import argparse
 from collections import Counter
 from datetime import datetime, timezone
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
 import re
+import random
 import sys
 import tempfile
 import time
@@ -63,6 +65,126 @@ def timed_operation(label: str, call, verbose: bool = False):
         print(f"{timestamp_prefix()}[処理完了] {label} "
               f"({time.perf_counter() - started:.2f}s)", flush=True)
     return result
+
+
+# Three total attempts. SDK-level retries remain disabled: writes must reconcile first.
+API_RETRY_DELAYS_SECONDS = (1, 2)
+RECOVERY_STOP = ("保留計画・進捗ログを保持して停止しました。Gmail実設定を確認し、"
+                 "同じMasterで run を再実行して再開してください。planの作り直しは不要です。")
+
+
+def transient_api_error(exc: Exception) -> bool:
+    status = getattr(getattr(exc, "resp", None), "status", None)
+    if isinstance(status, int):
+        if status in (500, 502, 503, 504, 429):
+            return True
+        if status == 403:
+            try:
+                errors = json.loads(exc.content)["error"]["errors"]
+                reasons = {entry["reason"] for entry in errors}
+                return bool(reasons) and reasons <= {"rateLimitExceeded", "userRateLimitExceeded"}
+            except (AttributeError, KeyError, TypeError, ValueError):
+                return False
+        return False
+    # Do not classify arbitrary OSError/programming/auth errors as transient.
+    if isinstance(exc, (TimeoutError, ConnectionError, http.client.IncompleteRead,
+                        http.client.RemoteDisconnected)):
+        return True
+    try:
+        from httplib2 import ServerNotFoundError
+    except ImportError:
+        return False
+    return isinstance(exc, ServerNotFoundError)
+
+
+def api_error_code(exc: Exception) -> str:
+    status = getattr(getattr(exc, "resp", None), "status", None)
+    return f"HTTP {status}" if isinstance(status, int) else type(exc).__name__
+
+
+def retry_wait(label: str, attempt: int, exc: Exception, verbose: bool) -> None:
+    delay = API_RETRY_DELAYS_SECONDS[attempt] + random.uniform(0, 1)
+    if verbose:
+        print(f"{timestamp_prefix()}[再試行] {label}: {api_error_code(exc)} / "
+              f"{delay:.2f}s待機 / 次の試行 {attempt + 2}/{len(API_RETRY_DELAYS_SECONDS) + 1}",
+              flush=True)
+    time.sleep(delay)
+
+
+def read_operation(label: str, call, verbose=False, *, retry=True):
+    for attempt in range(len(API_RETRY_DELAYS_SECONDS) + 1):
+        try:
+            return timed_operation(label, call, verbose)
+        except Exception as exc:
+            if not retry or not transient_api_error(exc):
+                raise
+            if attempt == len(API_RETRY_DELAYS_SECONDS):
+                raise DeploymentError(f"{label}: 一時障害（{api_error_code(exc)}）が継続。"
+                                      + RECOVERY_STOP) from exc
+            retry_wait(label, attempt, exc, verbose)
+
+
+def recover_mutation(label: str, call, reconcile, record, *, verbose=False):
+    """On an ambiguous write, reconcile before AND after waiting, never retry blindly.
+
+    reconcile returns (applied, result). It must reject any state except the exact
+    before/after snapshots. Recovery reads themselves are single-shot/fail-closed.
+    """
+    for attempt in range(len(API_RETRY_DELAYS_SECONDS) + 1):
+        try:
+            return timed_operation(label, call, verbose)
+        except Exception as exc:
+            if not transient_api_error(exc):
+                raise
+            details = {"attempt": attempt + 1, "error": api_error_code(exc)}
+            record({"kind": "api_error", **details})
+            for after_wait in (False, True):
+                if after_wait:
+                    if attempt == len(API_RETRY_DELAYS_SECONDS):
+                        raise DeploymentError(f"{label}: 一時障害の再試行上限に到達。"
+                                              + RECOVERY_STOP) from exc
+                    retry_wait(label, attempt, exc, verbose)
+                try:
+                    applied, result = reconcile()
+                except Exception as read_exc:
+                    record({"kind": "reconciliation_failed", **details,
+                            "read_error": api_error_code(read_exc)})
+                    raise DeploymentError(f"{label}: 変更結果が不明、または外部変更を検出。"
+                                          + RECOVERY_STOP) from read_exc
+                if applied:
+                    record({"kind": "reconciled_after_error", **details})
+                    print(f"{timestamp_prefix()}{label}: エラー後の実設定照合で反映済みと確認。"
+                          "同じ変更を再送せず進捗を確定します。", flush=True)
+                    return result
+                record({"kind": "reconciled_before_retry", **details,
+                        "after_wait": after_wait})
+    raise AssertionError("unreachable mutation retry")
+
+
+def filter_snapshot(rows: list[dict]) -> tuple[dict[str, dict], Counter]:
+    """Keep ID-less skipped rules immutable without blocking other approved work."""
+    identified = {}
+    unidentified = []
+    for row in rows:
+        fid = row.get("id")
+        if isinstance(fid, str) and fid.strip():
+            demand(fid not in identified, "フィルタIDが重複しています")
+            identified[fid] = row["filter"]
+        else:
+            unidentified.append(row["filter"])
+    return identified, counter(unidentified)
+
+
+def prefix_counts(base: list[dict], plan: dict, adds: int, removes: int) -> Counter:
+    expected = counter(base)
+    expected.update(counter(plan["add"][:adds]))
+    for row in plan["remove"][:removes]:
+        key = json_hash(row)
+        demand(expected[key] > 0, "内部削除カウンタ異常")
+        expected[key] -= 1
+        if not expected[key]:
+            del expected[key]
+    return expected
 
 
 def demand(ok: bool, message: str) -> None:
@@ -331,6 +453,43 @@ def validate_delete_label_only(target: list[dict]) -> None:
                    "Action/Deleteはラベル付与のみ許可されます（Trash・既読化等は禁止）")
 
 
+class SingleAttemptHttp:
+    """googleapiclient transport with no hidden write replay on disconnect/401/redirect.
+
+    httplib2 can replay BadStatusLine even when HttpRequest.num_retries is zero.
+    AuthorizedSession supplies the same Google credentials over requests instead.
+    """
+    def __init__(self, credentials):
+        from google.auth.transport.requests import AuthorizedSession
+        from requests.adapters import HTTPAdapter
+        self.session = AuthorizedSession(credentials, max_refresh_attempts=0)
+        self.session.mount("https://", HTTPAdapter(max_retries=0))
+        self.session.mount("http://", HTTPAdapter(max_retries=0))
+
+    def request(self, uri, method="GET", body=None, headers=None, **kwargs):
+        import httplib2
+        import requests
+        try:
+            response = self.session.request(method, uri, data=body, headers=headers,
+                                            timeout=60, allow_redirects=False)
+        except requests.exceptions.SSLError:
+            raise  # Certificate failures must not be classified as retryable disconnects.
+        except requests.exceptions.Timeout as exc:
+            raise TimeoutError("Gmail HTTP request timed out") from exc
+        except (requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError) as exc:
+            raise ConnectionError("Gmail HTTP response was interrupted") from exc
+        # requests has already decompressed the body; expose the httplib2 response
+        # contract expected by googleapiclient without stale compression headers.
+        response_headers = {k.lower(): v for k, v in response.headers.items()
+                            if k.lower() not in {"content-encoding", "content-length"}}
+        response_headers.update(status=str(response.status_code),
+                                **{"content-length": str(len(response.content))})
+        return httplib2.Response(response_headers), response.content
+
+    def close(self):
+        self.session.close()
+
+
 def get_client(client_secrets: Path, token_path: Path, allow_auth=True):
     try:
         from google.auth.transport.requests import Request
@@ -367,7 +526,8 @@ def get_client(client_secrets: Path, token_path: Path, allow_auth=True):
             token_path.chmod(0o600)
         except OSError:
             pass
-    return build("gmail", "v1", credentials=creds, cache_discovery=False), creds
+    return build("gmail", "v1", http=SingleAttemptHttp(creds),
+                 cache_discovery=False, static_discovery=True), creds
 
 
 def account_email(creds) -> str:
@@ -392,8 +552,8 @@ def filters_with_known_labels(client, labels_by_name: dict[str, str], *, verbose
     This cache never skips a live filters.list and never authorizes mutations.
     """
     names_by_id = {lid: name for name, lid in labels_by_name.items()}
-    filters = timed_operation(
-        "Gmail filters.list", lambda: client.users().settings().filters().list(userId="me").execute(),
+    filters = read_operation(
+        "Gmail filters.list", lambda: client.users().settings().filters().list(userId="me").execute(num_retries=0),
         verbose).get("filter", [])
     demand(len(filters) <= FILTER_LIMIT, f"Gmail側フィルタ数が異常: {len(filters)}")
     try:
@@ -410,17 +570,22 @@ def filters_with_known_labels(client, labels_by_name: dict[str, str], *, verbose
         return current
 
 
-def api_fetch(client, *, verbose: bool = False) -> tuple[list[dict], dict[str, str]]:
-    labels = timed_operation(
-        "Gmail labels.list", lambda: client.users().labels().list(userId="me").execute(),
-        verbose).get("labels", [])
+def api_fetch(client, *, verbose: bool = False, retry_reads: bool = True) -> tuple[list[dict], dict[str, str]]:
+    labels = read_operation(
+        "Gmail labels.list", lambda: client.users().labels().list(userId="me").execute(num_retries=0),
+        verbose, retry=retry_reads).get("labels", [])
     # Include system and user labels for normalization; only user labels may be
     # created or referenced as names in new filter payloads.
     label_names = {x["name"]: x["id"] for x in labels if x.get("type") in ("user", "USER")}
+    user_labels = [x for x in labels if x.get("type") in ("user", "USER")]
+    demand(len(label_names) == len(user_labels)
+           and len(set(label_names.values())) == len(user_labels)
+           and all(isinstance(v, str) and v.strip() for v in label_names.values()),
+           "ユーザーラベルの名前・IDが欠落または重複しています")
     names_by_id = {x["id"]: x["name"] for x in labels}
-    filters = timed_operation(
-        "Gmail filters.list", lambda: client.users().settings().filters().list(userId="me").execute(),
-        verbose).get("filter", [])
+    filters = read_operation(
+        "Gmail filters.list", lambda: client.users().settings().filters().list(userId="me").execute(num_retries=0),
+        verbose, retry=retry_reads).get("filter", [])
     demand(len(filters) <= FILTER_LIMIT, f"Gmail側フィルタ数が異常: {len(filters)}")
     normalized = [{"id": x.get("id"), "filter": live_as_template(x, names_by_id)} for x in filters]
     return normalized, label_names
@@ -779,6 +944,14 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
         state["events"] = previous.get("events", [])
     save_json(log, state)
 
+    def recovery_recorder(operation, step=None, name=None):
+        def record(event):
+            state["events"].append({**event, "operation": operation, "step": step,
+                                    "name": name,
+                                    "timestamp_utc": datetime.now(timezone.utc).isoformat()})
+            save_json(log, state)
+        return record
+
     def remove_old(start: int, verified_adds: int):
         nonlocal labels
         for j in range(start, len(plan["remove"])):
@@ -809,11 +982,27 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
                 continue
             demand(len(matches) == 1 and matches[0].get("id"),
                    f"削除対象が一意ではありません: {json_hash(old)} ({len(matches)}件)")
-            timed_operation(
+            demand(counter(x["filter"] for x in existing)
+                   == prefix_counts(base, plan, verified_adds, j),
+                   "削除直前の実設定が承認計画と不一致です。" + RECOVERY_STOP)
+            before = filter_snapshot(existing)
+            delete_id = matches[0]["id"]
+            after = ({fid: rule for fid, rule in before[0].items() if fid != delete_id}, before[1])
+
+            def reconcile_delete():
+                rows, now_labels = api_fetch(client, verbose=verbose, retry_reads=False)
+                actual = filter_snapshot(rows)
+                demand(now_labels == labels, "再照合中にラベル設定が変更されました")
+                if actual == after:
+                    return True, {}
+                demand(actual == before, "削除の直前・次状態のどちらとも一致しません")
+                return False, None
+
+            recover_mutation(
                 f"Gmail filters.delete [{j+1}/{len(plan['remove'])}]",
                 lambda: client.users().settings().filters().delete(
-                    userId="me", id=matches[0]["id"]).execute(),
-                verbose)
+                    userId="me", id=delete_id).execute(num_retries=0),
+                reconcile_delete, recovery_recorder("delete_filter", j+1), verbose=verbose)
             state["events"].append({"kind": "delete_filter", "step": j+1,
                                     "id": matches[0]["id"], "sha256": json_hash(old)})
             state["completed_remove"] = j+1
@@ -829,18 +1018,38 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
             print(f"旧ルール削除済み: {j+1}/{len(plan['remove'])}", flush=True)
 
     def create_new(start: int, verified_removes: int):
+        nonlocal labels
         if start >= len(plan["add"]):
             return
-        # Create needed labels only after confirmation and before their filters.
+        existing, labels = fetch_for_deploy(client, verbose=verbose)
+        demand(counter(x["filter"] for x in existing)
+               == prefix_counts(base, plan, start, verified_removes),
+               "追加直前の実設定が承認計画と不一致です。" + RECOVERY_STOP)
+        known_filters, unidentified_filters = filter_snapshot(existing)
+        # Labels are part of the recovery snapshot too: do not accept renamed IDs.
         for name in plan["new_label_names"]:
             if name not in labels:
-                created = timed_operation(
+                def reconcile_label():
+                    rows, now_labels = api_fetch(client, verbose=verbose, retry_reads=False)
+                    demand(filter_snapshot(rows) == (known_filters, unidentified_filters),
+                           "ラベル作成中にフィルタ設定が変更されました")
+                    if name in now_labels:
+                        demand({k: v for k, v in now_labels.items() if k != name} == labels
+                               and now_labels[name] not in labels.values(),
+                               "ラベル作成後の実設定が次状態と一致しません")
+                        return True, {"id": now_labels[name]}
+                    demand(now_labels == labels, "ラベル作成前の実設定と一致しません")
+                    return False, None
+
+                created = recover_mutation(
                     f"Gmail labels.create {name}",
                     lambda: client.users().labels().create(
                         userId="me", body={"name": name,
                                             "labelListVisibility": "labelShow",
-                                            "messageListVisibility": "show"}).execute(),
-                    verbose)
+                                            "messageListVisibility": "show"}).execute(num_retries=0),
+                    reconcile_label, recovery_recorder("create_label", name=name), verbose=verbose)
+                demand(isinstance(created.get("id"), str) and created["id"].strip()
+                       and created["id"] not in labels.values(), "作成ラベルのIDが不正です")
                 labels[name] = created["id"]
                 if verbose:
                     print(f"{timestamp_prefix()}[詳細] ラベル作成: {name}", flush=True)
@@ -849,12 +1058,33 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
                 save_json(log, state)
         for i in range(start, len(plan["add"])):
             templ = plan["add"][i]
-            result = timed_operation(
+            demand(json_hash(templ) not in counter(known_filters.values()) + unidentified_filters,
+                   "追加対象が既に存在します。" + RECOVERY_STOP)
+
+            def reconcile_create():
+                rows, now_labels = api_fetch(client, verbose=verbose, retry_reads=False)
+                actual, unidentified = filter_snapshot(rows)
+                demand(unidentified == unidentified_filters, "ID不明フィルタの内容・件数が変わりました")
+                demand(now_labels == labels, "再照合中にラベル設定が変更されました")
+                if actual == known_filters:
+                    return False, None
+                new_ids = set(actual) - set(known_filters)
+                demand(len(new_ids) == 1, "追加結果のIDを一意に特定できません")
+                new_id = next(iter(new_ids))
+                demand(actual[new_id] == templ
+                       and {fid: rule for fid, rule in actual.items() if fid != new_id} == known_filters,
+                       "追加の直前・次状態のどちらとも一致しません")
+                return True, {"id": new_id}
+
+            result = recover_mutation(
                 f"Gmail filters.create [{i+1}/{len(plan['add'])}]",
                 lambda: client.users().settings().filters().create(
-                    userId="me", body=to_api(templ, labels)).execute(),
-                verbose)
-            demand(result.get("id"), "フィルタ作成APIからIDが返りませんでした。停止します")
+                    userId="me", body=to_api(templ, labels)).execute(num_retries=0),
+                reconcile_create, recovery_recorder("create_filter", i+1), verbose=verbose)
+            demand(isinstance(result.get("id"), str) and result["id"].strip()
+                   and result["id"] not in known_filters,
+                   "フィルタ作成APIから一意なIDが返りませんでした。停止します")
+            known_filters[result["id"]] = templ
             state["events"].append({"kind": "create_filter", "step": i+1,
                                     "id": result["id"], "sha256": json_hash(templ)})
             state["completed_add"] = i+1
@@ -898,15 +1128,7 @@ def verify_partial(client, base: list[dict], plan: dict, add_count: int, remove_
                    *, verbose=False, label_cache: dict[str, str] | None = None,
                    expected_filter_ids: set[str] | None = None,
                    diagnostic_dir: Path | None = None):
-    expected = counter(base)
-    for x in plan["add"][:add_count]:
-        expected[json_hash(x)] += 1
-    for x in plan["remove"][:remove_count]:
-        k = json_hash(x)
-        demand(expected[k] > 0, "内部削除カウンタ異常")
-        expected[k] -= 1
-        if expected[k] == 0:
-            del expected[k]
+    expected = prefix_counts(base, plan, add_count, remove_count)
 
     # A mismatching Gmail list may be transient immediately after a mutation.
     # Re-read only; never perform another mutation while the state is uncertain.

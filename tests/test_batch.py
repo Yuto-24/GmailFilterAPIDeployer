@@ -403,6 +403,7 @@ class SdkBatchTests(unittest.TestCase):
                 def send(request, **kwargs):
                     from email.parser import Parser
                     calls.append(request)
+                    self.assertEqual(kwargs['timeout'], (60, 180))
                     self.assertEqual(request.url, 'https://gmail.googleapis.com/batch')
                     body = request.body.decode() if isinstance(request.body, bytes) else request.body
                     parts = Parser().parsestr('Content-Type: ' + request.headers['Content-Type'] + '\r\n\r\n' + body)

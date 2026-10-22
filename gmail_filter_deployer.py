@@ -473,7 +473,7 @@ class SingleAttemptHttp:
         import requests
         try:
             response = self.session.request(method, uri, data=body, headers=headers,
-                                            timeout=60, allow_redirects=False)
+                                            timeout=kwargs.get("timeout", 60), allow_redirects=False)
         except requests.exceptions.SSLError:
             raise  # Certificate failures must not be classified as retryable disconnects.
         except requests.exceptions.Timeout as exc:
@@ -986,6 +986,9 @@ def execute_filter_batch(client, requests, callback):
         def request(self, *args, **kwargs):
             demand(not self.sent, "バッチの暗黙の再送を拒否しました")
             self.sent = True
+            # Gmail does not promise parallel execution inside a batch. Keep
+            # the old per-operation read budget, with a fixed connect timeout.
+            kwargs["timeout"] = (60, 60 * len(requests))
             return client._http.request(*args, **kwargs)
 
     batch = client.new_batch_http_request(callback=callback)

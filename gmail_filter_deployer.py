@@ -200,6 +200,8 @@ def save_json(path: Path, obj) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(obj, f, ensure_ascii=False, indent=2, sort_keys=True)
             f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(name, path)
     finally:
         if os.path.exists(name):
@@ -878,6 +880,279 @@ def detect_position(base: list[dict], plan: dict, live: list[dict]) -> tuple[int
     raise AssertionError
 
 
+def batch_progress(base, plan, current, log, labels=None):
+    """Recognize only a journaled batch subset, including out-of-order success.
+
+    The checkpoint is saved before sending any writes. Counts alone never
+    authorize resuming a batch: unchanged IDs, contents and labels must match.
+    """
+    prior = json.loads(log.read_text(encoding="utf-8")) if log.exists() else {}
+    if prior:
+        demand(prior.get("plan_digest") == plan["approval_digest"],
+               "配備ログに別の計画が記録されています")
+    checkpoint = prior.get("batch_checkpoint")
+    if checkpoint is None:
+        a, r = detect_position(base, plan, [row["filter"] for row in current])
+        return set(range(a)), set(range(r))
+    demand(checkpoint.get("schema") == 1, "バッチ進捗の形式が不正です")
+    done = {}
+    for kind in ("add", "remove"):
+        steps = checkpoint[kind]
+        demand(isinstance(steps, list) and all(type(i) is int and 0 <= i < len(plan[kind]) for i in steps)
+               and len(set(steps)) == len(steps), "バッチ進捗の操作番号が不正です")
+        done[kind] = set(steps)
+    first, second = (("remove", "add") if plan.get("operation_order", "add_first") == "remove_first"
+                     else ("add", "remove"))
+    demand(not done[second] or len(done[first]) == len(plan[first]), "バッチ進捗の実行順序が不正です")
+    expected = counter(base)
+    expected.update(counter(plan["add"][i] for i in done["add"]))
+    for i in done["remove"]:
+        key = json_hash(plan["remove"][i])
+        demand(expected[key] > 0, "バッチ進捗の削除記録が不正です")
+        expected[key] -= 1
+    expected = +expected
+    before, unidentified = filter_snapshot(checkpoint["rows"])
+    demand(counter(row["filter"] for row in checkpoint["rows"]) == expected,
+           "バッチ進捗と承認計画が一致しません")
+    actual, unknown = filter_snapshot(current)
+    demand(unknown == unidentified, "ID不明フィルタの内容・件数が変わりました")
+    if labels is not None:
+        expected_labels = checkpoint["labels"]
+        name = checkpoint.get("pending_label")
+        if name is not None:
+            demand(name in plan["new_label_names"] and name not in expected_labels
+                   and not checkpoint.get("pending"), "作成中ラベルの記録が不正です")
+            if name in labels:
+                demand(labels[name] not in expected_labels.values(), "作成ラベルIDが重複しています")
+                expected_labels = {**expected_labels, name: labels[name]}
+        demand(labels == expected_labels, "バッチ照合中にラベル設定が変わりました")
+    pending = checkpoint.get("pending")
+    if pending is None:
+        demand(actual == before, "バッチ進捗と実GmailのID・内容が一致しません")
+        return done["add"], done["remove"]
+    kind, steps = pending["kind"], pending["steps"]
+    demand(kind in (first, second) and isinstance(steps, list) and 1 <= len(steps) <= 25,
+           "送信中バッチの形式が不正です")
+    remaining = [i for i in range(len(plan[kind])) if i not in done[kind]]
+    demand(steps == remaining[:len(steps)] and
+           (kind == first or len(done[first]) == len(plan[first])), "送信中バッチの順序が不正です")
+    successes = pending.get("successes", {})
+    demand(set(successes) <= {str(i) for i in steps}, "バッチ応答の操作番号が不正です")
+    applied = set()
+    if kind == "remove":
+        ids = pending["ids"]
+        demand(set(ids) == {str(i) for i in steps} and len(set(ids.values())) == len(steps),
+               "バッチ削除IDが不正です")
+        for i in steps:
+            fid = ids[str(i)]
+            demand(before.get(fid) == plan[kind][i] and
+                   sum(rule == plan[kind][i] for rule in before.values()) == 1,
+                   "バッチ削除対象が一意ではありません")
+            if fid not in actual:
+                applied.add(i)
+        retained = {fid: rule for fid, rule in before.items()
+                    if fid not in {ids[str(i)] for i in applied}}
+        demand(actual == retained, "バッチ削除以外のフィルタ変更を検出しました")
+        demand(all(int(i) in applied and fid == ids[i] for i, fid in successes.items()),
+               "成功応答の削除が読戻しに反映されていません")
+    else:
+        demand(all(actual.get(fid) == rule for fid, rule in before.items()),
+               "バッチ追加中に既存フィルタのID・内容が変わりました")
+        candidates = {json_hash(plan[kind][i]): i for i in steps}
+        demand(len(candidates) == len(steps) and not (set(candidates) & set(expected)),
+               "バッチ追加対象が重複しています")
+        created = {}
+        for fid in set(actual) - set(before):
+            i = candidates.get(json_hash(actual[fid]))
+            demand(i is not None and i not in applied, "予定外・重複したフィルタ追加を検出しました")
+            applied.add(i)
+            created[str(i)] = fid
+        demand(all(created.get(i) == fid for i, fid in successes.items()),
+               "成功応答の追加IDが読戻しと一致しません")
+    done[kind].update(applied)
+    return done["add"], done["remove"]
+
+
+def execute_filter_batch(client, requests, callback):
+    """Use the SDK multipart codec, but permit exactly one HTTP transmission.
+
+    BatchHttpRequest.execute can replay inner 401 responses, even though the
+    ordinary HttpRequest retry count is zero. This transport refuses a second
+    send; recovery always happens through our persisted journal and readback.
+    """
+    class OneSend:
+        sent = False
+
+        def request(self, *args, **kwargs):
+            demand(not self.sent, "バッチの暗黙の再送を拒否しました")
+            self.sent = True
+            return client._http.request(*args, **kwargs)
+
+    batch = client.new_batch_http_request(callback=callback)
+    for step, request in requests:
+        batch.add(request, request_id=str(step))
+    batch.execute(http=OneSend())
+
+
+def perform_batched(client, plan, base, target, current, labels, log, batch_size, verbose):
+    """Execute bounded batches; stop on partial failure and resume from live IDs."""
+    adds, removes = batch_progress(base, plan, current, log, labels)
+    state = json.loads(log.read_text(encoding="utf-8")) if log.exists() else {
+        "account": plan["account"], "plan_digest": plan["approval_digest"], "events": []}
+
+    def checkpoint(rows, now_labels, a, r):
+        state["batch_checkpoint"] = {"schema": 1, "rows": rows, "labels": dict(now_labels),
+                                     "add": sorted(a), "remove": sorted(r), "pending": None}
+        state.update(completed_add=len(a), completed_remove=len(r), verified=False)
+        save_json(log, state)
+
+    checkpoint(current, labels, adds, removes)
+    order = ("remove", "add") if plan.get("operation_order", "add_first") == "remove_first" else ("add", "remove")
+    print(f"バッチ配備開始（最大{batch_size}件/HTTP）: "
+          f"削除済 {len(removes)}/{len(plan['remove'])} / 追加済 {len(adds)}/{len(plan['add'])}", flush=True)
+    if order[0] == "remove" and len(removes) < len(plan["remove"]):
+        print("旧ルールを先に削除するため、新ルール追加まで一部の振り分け条件が一時的に無効になります。", flush=True)
+
+    for kind in order:
+        completed = adds if kind == "add" else removes
+        remaining = [i for i in range(len(plan[kind])) if i not in completed]
+        if not remaining:
+            continue
+        # Labels must exist before filter batches. Label creation remains serial
+        # with the original read-before-retry protection.
+        if kind == "add":
+            for name in plan["new_label_names"]:
+                if name in labels:
+                    continue
+                before_labels = dict(labels)
+
+                def reconcile_label():
+                    rows, now = api_fetch(client, verbose=verbose, retry_reads=False)
+                    demand(filter_snapshot(rows) == filter_snapshot(current),
+                           "ラベル作成中にフィルタ設定が変更されました")
+                    if name in now:
+                        demand({k: v for k, v in now.items() if k != name} == before_labels
+                               and now[name] not in before_labels.values(), "ラベル作成後の設定が不一致です")
+                        return True, {"id": now[name]}
+                    demand(now == before_labels, "ラベル作成前の設定が不一致です")
+                    return False, None
+
+                # Persist intent so a crash after label creation can be reconciled.
+                state["batch_checkpoint"]["pending_label"] = name
+                save_json(log, state)
+
+                def record(event):
+                    state["events"].append({**event, "operation": "create_label", "name": name})
+                    save_json(log, state)
+
+                result = recover_mutation(
+                    f"Gmail labels.create {name}",
+                    lambda: client.users().labels().create(userId="me", body={
+                        "name": name, "labelListVisibility": "labelShow", "messageListVisibility": "show"
+                    }).execute(num_retries=0), reconcile_label, record, verbose=verbose)
+                demand(isinstance(result.get("id"), str) and result["id"].strip()
+                       and result["id"] not in labels.values(), "作成ラベルIDが不正です")
+                labels[name] = result["id"]
+                state["events"].append({"kind": "create_label", "name": name, "id": result["id"]})
+                checkpoint(current, labels, adds, removes)
+
+        for offset in range(0, len(remaining), batch_size):
+            steps = remaining[offset:offset + batch_size]
+            # A fresh pre-batch snapshot also checks for changes between batches.
+            current, labels = api_fetch(client, verbose=verbose)
+            batch_progress(base, plan, current, log, labels)
+            ids = {}
+            requests = []
+            for i in steps:
+                rule = plan[kind][i]
+                if kind == "remove":
+                    matches = [row for row in current if row["filter"] == rule]
+                    demand(len(matches) == 1 and isinstance(matches[0].get("id"), str)
+                           and matches[0]["id"].strip(), "バッチ削除対象が一意ではありません")
+                    ids[str(i)] = matches[0]["id"]
+                    request = client.users().settings().filters().delete(userId="me", id=ids[str(i)])
+                else:
+                    demand(not any(row["filter"] == rule for row in current), "追加対象が既に存在します")
+                    request = client.users().settings().filters().create(userId="me", body=to_api(rule, labels))
+                requests.append((i, request))
+            pending = {"kind": kind, "steps": steps, "ids": ids, "successes": {}, "errors": {}}
+            state["batch_checkpoint"]["pending"] = pending
+            save_json(log, state)  # Durable intent BEFORE any HTTP write.
+
+            def callback(request_id, response, exception):
+                demand(request_id in {str(i) for i in steps} and
+                       request_id not in pending["successes"] and request_id not in pending["errors"],
+                       "バッチ応答IDが不正です")
+                if exception is not None:
+                    pending["errors"][request_id] = api_error_code(exception)
+                else:
+                    fid = ids[request_id] if kind == "remove" else (response or {}).get("id")
+                    demand(isinstance(fid, str) and fid.strip(), "バッチ追加の応答IDが不正です")
+                    pending["successes"][request_id] = fid
+                save_json(log, state)
+                if verbose:
+                    outcome = pending["errors"].get(request_id, "成功")
+                    print(f"{timestamp_prefix()}[詳細] バッチ {kind} [{int(request_id)+1}/{len(plan[kind])}] "
+                          f"{outcome} / {format_filter_summary(plan[kind][int(request_id)])}", flush=True)
+
+            failed = False
+            try:
+                timed_operation(f"Gmail filters.batch {kind} [{steps[0]+1}–{steps[-1]+1}/{len(plan[kind])}]",
+                                lambda: execute_filter_batch(client, requests, callback), verbose)
+            except Exception as exc:
+                pending["transport_error"] = api_error_code(exc)
+                save_json(log, state)
+                failed = True
+            failed = failed or bool(pending["errors"]) or len(pending["successes"]) != len(steps)
+            # On uncertain/partial results, keep the original intent for restart.
+            # Never resend an entire batch or advance into the following batch.
+            for attempt in range(len(READBACK_DELAYS_SECONDS) + 1):
+                rows, now_labels = api_fetch(client, verbose=verbose, retry_reads=False)
+                try:
+                    a, r = batch_progress(base, plan, rows, log, now_labels)
+                except DeploymentError as exc:
+                    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+                    save_json(log.parent / "diagnostics" / f"batch_{stamp}.json", {
+                        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                        "before_filters": state["batch_checkpoint"]["rows"],
+                        "observed_filters": rows, "labels": now_labels, "pending": pending})
+                    print(f"{timestamp_prefix()}バッチ読戻し不一致 ({attempt+1}/3): {exc}", flush=True)
+                    if attempt == len(READBACK_DELAYS_SECONDS):
+                        raise
+                else:
+                    observed, _ = filter_snapshot(rows)
+                    applied = (a - adds) if kind == "add" else (r - removes)
+                    for i in applied:
+                        pending["successes"][str(i)] = (ids[str(i)] if kind == "remove" else
+                            next(fid for fid, rule in observed.items() if rule == plan[kind][i]))
+                    save_json(log, state)
+                    if not failed or attempt == len(READBACK_DELAYS_SECONDS):
+                        break
+                time.sleep(READBACK_DELAYS_SECONDS[attempt])
+            state.update(completed_add=len(a), completed_remove=len(r))
+            state["events"].append({"kind": "filter_batch", "operation": kind, "steps": steps,
+                                    "successes": dict(pending["successes"]), "errors": dict(pending["errors"]),
+                                    "completed_add": len(a), "completed_remove": len(r),
+                                    "timestamp_utc": datetime.now(timezone.utc).isoformat()})
+            save_json(log, state)
+            if failed:
+                raise DeploymentError(f"バッチが一部失敗または応答不明です。実設定を読戻しました。"
+                                      f"削除済 {len(r)}/{len(plan['remove'])} / 追加済 {len(a)}/{len(plan['add'])}。"
+                                      + RECOVERY_STOP)
+            adds, removes, current, labels = a, r, rows, now_labels
+            checkpoint(current, labels, adds, removes)
+            print(f"バッチ照合済み: 削除 {len(removes)}/{len(plan['remove'])} / "
+                  f"追加 {len(adds)}/{len(plan['add'])}", flush=True)
+
+    current, labels = api_fetch(client, verbose=verbose)
+    adds, removes = batch_progress(base, plan, current, log, labels)
+    demand(len(adds) == len(plan["add"]) and len(removes) == len(plan["remove"])
+           and counter(row["filter"] for row in current) == counter(target), "配備後の最終照合が一致しません")
+    state["verified"] = True
+    save_json(log, state)
+    print(f"配備完了: {len(target)}件、API読戻し一致。Gmail UI exportも別途取得して照合してください")
+
+
 def validate_before_final_approval(plan: dict, expected_email: str, log: Path,
                                    batch_size: int, current: list[dict]) -> None:
     """Check all locally decidable execution invariants before consent."""
@@ -892,9 +1167,11 @@ def validate_before_final_approval(plan: dict, expected_email: str, log: Path,
     peak = max(len(base), len(target)) if order == "remove_first" else len(base) + len(plan["add"])
     demand(peak <= FILTER_LIMIT,
            f"配備途中の最大件数{peak}件がGmailの上限{FILTER_LIMIT}件を超えます")
-    a_done, r_done = detect_position(base, plan, [x["filter"] for x in current])
+    added, removed = batch_progress(base, plan, current, log)
     # Every *remaining* deletion must refer to exactly one current filter ID.
-    for rule in plan["remove"][r_done:]:
+    for i, rule in enumerate(plan["remove"]):
+        if i in removed:
+            continue
         matching = [x for x in current if x["filter"] == rule]
         demand(len(matching) == 1 and isinstance(matching[0].get("id"), str)
                and matching[0]["id"].strip(),
@@ -908,8 +1185,9 @@ def validate_before_final_approval(plan: dict, expected_email: str, log: Path,
     # Validate prospective API payloads without calling a mutating endpoint.
     labels = {name: "pending_" + name for name in plan["new_label_names"]}
     labels.update({name: name for name in plan["expected_label_names"]})
-    for rule in plan["add"][a_done:]:
-        to_api(rule, labels)
+    for i, rule in enumerate(plan["add"]):
+        if i not in added:
+            to_api(rule, labels)
 
 
 def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_size=20, verbose=False):
@@ -926,6 +1204,9 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
     demand(peak <= FILTER_LIMIT,
            f"配備中の最大フィルタ数{peak}件がGmail上限{FILTER_LIMIT}件を超えます")
     current, labels = fetch_for_deploy(client, verbose=verbose)
+    prior = json.loads(log.read_text(encoding="utf-8")) if log.exists() else {}
+    if batch_size > 1 or prior.get("batch_checkpoint") is not None:
+        return perform_batched(client, plan, base, target, current, labels, log, batch_size, verbose)
     live = [x["filter"] for x in current]
     a_done, r_done = detect_position(base, plan, live)
     print(f"配備開始（{'削除→追加' if order == 'remove_first' else '旧版・追加→削除'}）: "
@@ -1431,7 +1712,9 @@ def cmd_run(args):
             demand(plan['target_path'] == str(target_path.resolve()), '途中計画の対象Masterと現行Masterが異なります。再開を停止しました')
             base, old_target = planned_states(plan)
             demand(file_hash(target_path) == plan["target_sha256"], '途中計画のMasterが変更されています')
-            a_done, r_done = detect_position(base, plan, live)
+            journal = args.local_dir / 'logs' / (plan['approval_digest'] + '.json')
+            added, removed = batch_progress(base, plan, current, journal, labels)
+            a_done, r_done = len(added), len(removed)
             if a_done == len(plan['add']) and r_done == len(plan['remove']):
                 print(f"前回の配備は既に反映済みです。MasterとAPI一致: {len(old_target)}件", flush=True)
                 pending_file.unlink()
@@ -1542,7 +1825,7 @@ def main(argv=None):
     default_local = root / "local"
     p = sub.add_parser("run", help="検証→差分表示→対話承認→配備→API照合を1コマンドで実行")
     p.add_argument("--target", type=Path, help="任意: デフォルトは最新Masterを自動選択")
-    p.add_argument("--batch-size", type=int, default=20, help="API読戻しの間隔。1〜25、既定20")
+    p.add_argument("--batch-size", type=int, default=20, help="削除・追加のHTTPバッチ件数。1〜25、既定20。1は逐次処理")
     p.add_argument("-v", "--verbose", action="store_true", help="フィルタ単位の処理・API照合の詳細を表示")
     p.set_defaults(func=cmd_run)
     p = sub.add_parser("validate", help="オフライン: 最新Master XMLを検証（--baseは任意）")
@@ -1561,7 +1844,7 @@ def main(argv=None):
     p.add_argument("--approve", required=True, help="planが表示したapproval_digest")
     p.add_argument("--allow-removals", action="store_true", help="既存非保護ルールの削除を明示的に承認")
     p.add_argument("--log", type=Path, default=default_local / "deploy_log.json")
-    p.add_argument("--batch-size", type=int, default=20)
+    p.add_argument("--batch-size", type=int, default=20, help="削除・追加のHTTPバッチ件数。1〜25、既定20")
     p.add_argument("-v", "--verbose", action="store_true", help="フィルタ単位の配備・API照合詳細を表示")
     p.set_defaults(func=cmd_apply)
     p = sub.add_parser("verify", help="Gmail API実設定と最新版Masterの完全照合")

@@ -36,7 +36,9 @@ TARGET=[
 
 class Req:
     def __init__(self, fn): self.fn=fn
-    def execute(self): return self.fn()
+    def execute(self, num_retries=0):
+        assert num_retries == 0
+        return self.fn()
 
 class FakeLabels:
     def __init__(self,parent): self.p=parent

@@ -48,6 +48,24 @@ class BatchClient(FakeClient):
 
 
 class BatchTests(unittest.TestCase):
+    def test_error_details_preserve_backend_reason_without_request_headers(self):
+        error = ApiError(503, 'backendError')
+        error.content = json.dumps({'error': {'code': 503, 'status': 'UNAVAILABLE',
+            'message': 'Backend Error', 'errors': [{'reason': 'backendError', 'domain': 'global'}]},
+            'request': {'Authorization': 'secret'}}).encode()
+        details = d.api_error_details(error)
+        self.assertEqual(details['google_status'], 'UNAVAILABLE')
+        self.assertEqual(details['errors'], [{'reason': 'backendError', 'domain': 'global'}])
+        self.assertNotIn('secret', json.dumps(details))
+        self.assertEqual(d.api_error_details(TimeoutError()),
+                         {'code': 'TimeoutError', 'exception_type': 'TimeoutError'})
+
+    def test_error_details_tolerate_malformed_response(self):
+        for content in (b'invalid', b'[]', b'{"error":null}', b'{"error":{"errors":"invalid"}}'):
+            error = ApiError()
+            error.content = content
+            self.assertEqual(d.api_error_details(error)['code'], 'HTTP 500')
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -92,10 +110,64 @@ class BatchTests(unittest.TestCase):
         self.assertIn('Gmail filters.batch remove', self.output.getvalue())
         self.complete()
 
-    def test_default_20_uses_two_batches_for_twelve_operations(self):
+    def test_default_1_sends_operations_serially(self):
         d.perform(self.client, self.plan, self.plan['account'], self.plan['approval_digest'], self.log)
-        self.assertEqual([len(x) for x in self.client.batches], [7, 5])
+        self.assertEqual(self.client.batches, [])
         self.complete()
+
+    def test_bounded_run_retains_plan_then_resumes_without_duplicate_writes(self):
+        self.plan = d.select_plan_groups(self.plan, ['other'])
+        self.log = self.local / 'logs' / (self.plan['approval_digest'] + '.json')
+        self.client.log = self.log
+        pending = self.local / 'run_pending.json'
+        d.save_json(pending, self.plan)
+        original = pending.read_bytes()
+        argv = ['run', '--local-dir', str(self.local), '--expected-email', self.plan['account'],
+                '--batch-size', '2', '--max-batches', '1']
+        with patch.object(d, 'get_client', return_value=(self.client, object())), \
+             patch.object(d, 'account_email', return_value=self.plan['account']), \
+             patch.object(d, 'make_plan', side_effect=AssertionError('must not replan')), \
+             patch.object(d, 'confirm_interactive', return_value=True), redirect_stderr(self.output):
+            self.assertEqual(d.main(argv), 0, self.output.getvalue())
+            self.assertEqual(pending.read_bytes(), original)
+            self.assertEqual(self.client.batches, [['0', '1']])
+            self.assertFalse(self.state()['verified'])
+            self.assertEqual(d.main(argv[:-2]), 0, self.output.getvalue())
+        self.assertFalse(pending.exists())
+        self.assertEqual(self.client.batches[1], ['2', '3'])
+        self.complete()
+
+    def test_limit_at_phase_boundary_does_not_create_labels(self):
+        write_xml(self.master, self.common + [{'from': 'new@example.invalid', 'label': 'Service/New'}])
+        _, labels = d.api_fetch(self.client)
+        self.plan = d.make_plan(None, self.master, self.base, 'test@example.invalid', labels)
+        result = d.perform(self.client, self.plan, self.plan['account'], self.plan['approval_digest'],
+                           self.log, batch_size=7, max_batches=1)
+        self.assertIs(result, False)
+        self.assertEqual(len(self.client.batches), 1)
+        self.assertNotIn('Service/New', self.client.id_to_label.values())
+
+    def test_invalid_limit_rejected_before_api_access(self):
+        with patch.object(d, 'get_client', side_effect=AssertionError('must not access API')), \
+             redirect_stderr(self.output):
+            self.assertEqual(d.main(['run', '--max-batches', '0']), 2)
+
+    def test_google_error_reason_is_saved_with_partial_progress(self):
+        def partial(batch):
+            batch.apply(0)
+            error = ApiError(503)
+            error.content = b'{"error":{"status":"UNAVAILABLE","errors":[{"reason":"backendError"}]}}'
+            batch.callback(batch.requests[1][0], None, error)
+        self.client.executor = partial
+        with self.assertRaises(d.DeploymentError):
+            self.deploy(size=2)
+        state = self.state()
+        details = state['batch_checkpoint']['pending']['error_details']['1']
+        self.assertEqual(details['google_status'], 'UNAVAILABLE')
+        self.assertEqual(details['errors'][0]['reason'], 'backendError')
+        self.assertEqual(state['events'][-1]['error_details']['1'], details)
+        self.assertEqual(state['completed_remove'], 1)
+        self.assertEqual(len(self.client.batches), 1)
 
     def test_partial_delete_stops_then_resumes_only_missing_steps(self):
         def partial(batch):

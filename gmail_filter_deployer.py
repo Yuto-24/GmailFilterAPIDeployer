@@ -998,6 +998,16 @@ def batch_progress(base, plan, current, log, labels=None):
     return done["add"], done["remove"]
 
 
+def execute_filter_single(step, request, callback):
+    """Send one ordinary request with no replay; retain the journal callback."""
+    try:
+        response = request.execute(num_retries=0)
+    except Exception as exc:
+        callback(str(step), None, exc)
+    else:
+        callback(str(step), response, None)
+
+
 def execute_filter_batch(client, requests, callback):
     """Use the SDK multipart codec, but permit exactly one HTTP transmission.
 
@@ -1116,7 +1126,7 @@ def perform_batched(client, plan, base, target, current, labels, log, batch_size
                     request = client.users().settings().filters().create(userId="me", body=to_api(rule, labels))
                 requests.append((i, request))
             pending = {"kind": kind, "steps": steps, "ids": ids, "successes": {}, "errors": {},
-                       "error_details": {}}
+                       "error_details": {}, "transport": "single" if batch_size == 1 else "batch"}
             state["batch_checkpoint"]["pending"] = pending
             save_json(log, state)  # Durable intent BEFORE any HTTP write.
 
@@ -1139,8 +1149,10 @@ def perform_batched(client, plan, base, target, current, labels, log, batch_size
 
             failed = False
             try:
-                timed_operation(f"Gmail filters.batch {kind} [{steps[0]+1}–{steps[-1]+1}/{len(plan[kind])}]",
-                                lambda: execute_filter_batch(client, requests, callback), verbose)
+                timed_operation(f"Gmail filters.{pending['transport']} {kind} "
+                                f"[{steps[0]+1}–{steps[-1]+1}/{len(plan[kind])}]",
+                                lambda: (execute_filter_single(*requests[0], callback) if batch_size == 1 else
+                                         execute_filter_batch(client, requests, callback)), verbose)
             except Exception as exc:
                 pending["transport_error"] = api_error_code(exc)
                 pending["transport_error_details"] = api_error_details(exc)
@@ -1174,6 +1186,7 @@ def perform_batched(client, plan, base, target, current, labels, log, batch_size
                 time.sleep(READBACK_DELAYS_SECONDS[attempt])
             state.update(completed_add=len(a), completed_remove=len(r))
             state["events"].append({"kind": "filter_batch", "operation": kind, "steps": steps,
+                                    "transport": pending["transport"],
                                     "successes": dict(pending["successes"]), "errors": dict(pending["errors"]),
                                     "error_details": dict(pending["error_details"]),
                                     "completed_add": len(a), "completed_remove": len(r),

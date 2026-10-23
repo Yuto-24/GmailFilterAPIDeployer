@@ -136,10 +136,11 @@ class BatchTests(unittest.TestCase):
             single[single.index('--batch-size') + 1] = '1'
             self.assertEqual(d.main(single), 0, self.output.getvalue())
             self.assertEqual(pending.read_bytes(), original)
-            self.assertEqual(self.client.batches[1], ['2'])
+            self.assertEqual(len(self.client.batches), 1)
+            self.assertEqual(self.state()['events'][-1]['transport'], 'single')
             self.assertEqual(d.main(argv[:-2]), 0, self.output.getvalue())
         self.assertFalse(pending.exists())
-        self.assertEqual(self.client.batches[2], ['3', '4'])
+        self.assertEqual(self.client.batches[1], ['3', '4'])
         self.complete()
 
     def test_limit_does_not_switch_a_fresh_serial_plan_to_batch_transport(self):
@@ -237,7 +238,8 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(self.state()['batch_checkpoint']['pending']['successes'], {})
         self.client.executor = None
         self.deploy(size=1)  # A batch journal stays resumable even with changed size.
-        self.assertEqual(self.client.batches[1], ['0'])
+        self.assertEqual(len(self.client.batches), 1)
+        self.assertEqual(self.state()['events'][-1]['transport'], 'single')
         self.complete()
 
     def test_lost_response_after_all_success_keeps_intent_until_resume(self):
@@ -386,8 +388,58 @@ class BatchTests(unittest.TestCase):
             approval.return_value = True
             self.assertEqual(d.main(argv), 0, self.output.getvalue())
         self.assertFalse(pending.exists())
-        self.assertNotIn('2', self.client.batches[1])
+        self.assertEqual(len(self.client.batches), 1)
+        resumed = [event for event in self.state()['events'] if event.get('transport') == 'single'
+                   and event['operation'] == 'remove']
+        self.assertNotIn(2, [step for event in resumed for step in event['steps']])
         self.complete()
+
+    def test_direct_delete_failure_keeps_intent_and_does_not_retry(self):
+        d.perform(self.client, self.plan, self.plan['account'], self.plan['approval_digest'],
+                  self.log, batch_size=2, max_batches=1)
+        calls = []
+        def fail(fake, **kwargs):
+            def execute():
+                pending = self.state()['batch_checkpoint']['pending']
+                self.assertEqual(pending['transport'], 'single')
+                self.assertIn(kwargs['id'], pending['ids'].values())
+                calls.append(kwargs['id'])
+                error = ApiError(400)
+                error.content = b'{"error":{"errors":[{"reason":"failedPrecondition"}]}}'
+                raise error
+            return Req(execute)
+        with patch.object(FakeFilters, 'delete', new=fail):
+            with self.assertRaises(d.DeploymentError):
+                self.deploy(size=1)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.state()['completed_remove'], 2)
+        self.assertEqual(self.state()['batch_checkpoint']['pending']['error_details']['2']['errors'][0]['reason'],
+                         'failedPrecondition')
+        self.deploy(size=1)
+        self.complete()
+        self.assertEqual(len(self.client.batches), 1)
+
+    def test_direct_create_lost_response_is_read_back_and_not_duplicated_on_resume(self):
+        d.perform(self.client, self.plan, self.plan['account'], self.plan['approval_digest'],
+                  self.log, batch_size=7, max_batches=1)
+        original = FakeFilters.create
+        calls = []
+        def lost(fake, **kwargs):
+            request = original(fake, **kwargs)
+            def execute():
+                self.assertEqual(self.state()['batch_checkpoint']['pending']['transport'], 'single')
+                calls.append(True)
+                request.execute()
+                raise TimeoutError()
+            return Req(execute)
+        with patch.object(FakeFilters, 'create', new=lost):
+            with self.assertRaises(d.DeploymentError):
+                self.deploy(size=1)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.state()['completed_add'], 1)
+        self.deploy(size=1)
+        self.complete()
+        self.assertEqual(self.client.n, len(self.base) + 5)
 
     def test_failed_recovery_read_does_not_retry_or_send_next_batch(self):
         def lost(batch):
@@ -488,6 +540,28 @@ class SdkBatchTests(unittest.TestCase):
         self.http = d.SingleAttemptHttp(AnonymousCredentials())
         self.addCleanup(self.http.close)
         self.client = build('gmail', 'v1', http=self.http, cache_discovery=False, static_discovery=True)
+
+    def test_direct_resume_uses_normal_endpoint_and_never_replays(self):
+        for status in (204, 400, 401, 500, 'timeout'):
+            with self.subTest(status=status):
+                callbacks = []
+                def send(request, **kwargs):
+                    self.assertEqual(request.method, 'DELETE')
+                    self.assertEqual(request.url, 'https://gmail.googleapis.com/gmail/v1/users/me/settings/filters/test')
+                    if status == 'timeout':
+                        raise requests.exceptions.Timeout()
+                    response = requests.Response()
+                    response.status_code = status
+                    response.headers['Content-Type'] = 'application/json'
+                    response._content = b'' if status == 204 else b'{"error":{"message":"test"}}'
+                    return response
+                request = self.client.users().settings().filters().delete(userId='me', id='test')
+                with patch.object(self.http.session, 'send', side_effect=send) as transport:
+                    d.execute_filter_single(5, request, lambda *args: callbacks.append(args))
+                transport.assert_called_once()
+                self.assertEqual(len(callbacks), 1)
+                self.assertEqual(callbacks[0][0], '5')
+                self.assertEqual(callbacks[0][2] is None, status == 204)
 
     def test_real_multipart_and_inner_errors_send_http_once(self):
         for status in (204, 401, 429, 500):

@@ -108,6 +108,7 @@ class TestDeployer(unittest.TestCase):
             d.select_master(Path(self.tmp.name))
 
     def test_live_baseline_plan_requires_no_legacy_file(self):
+        """Plan from live state without a baseline XML and verify idempotent deployment."""
         client=FakeClient(self.b)
         live,labels=d.api_fetch(client)
         plan=d.make_plan(None,self.target,[x['filter'] for x in live], 'test@example.invalid', labels)

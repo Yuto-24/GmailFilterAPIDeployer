@@ -17,6 +17,7 @@ BRACES = "{from:a@example.invalid from:b@example.invalid}"
 
 
 def rule(criteria, label="Type/Test"):
+    """Build a synthetic template with one user label and the supplied criteria."""
     return {"criteria": criteria, "action": {"addLabelIds": ["label:" + label], "removeLabelIds": []}}
 
 
@@ -34,6 +35,7 @@ def raw_client(templates, log):
 
 class CriteriaTests(unittest.TestCase):
     def normalize(self, criteria):
+        """Normalize criteria while asserting input preservation and idempotence."""
         original = deepcopy(criteria)
         normalized, reasons = d.normalize_criteria(criteria, normalization="query-v1")
         self.assertEqual(criteria, original)
@@ -41,6 +43,7 @@ class CriteriaTests(unittest.TestCase):
         return normalized, reasons
 
     def test_whole_sender_or_and_wrappers(self):
+        """Recognize only a complete sender disjunction, including whole-expression wrappers."""
         for query in (OR, BRACES, "(" + OR + ")", "((" + OR + "))", "((" + BRACES + "))"):
             with self.subTest(query=query):
                 normalized, reasons = self.normalize({"query": query, "hasAttachment": True})
@@ -48,6 +51,7 @@ class CriteriaTests(unittest.TestCase):
                 self.assertEqual(reasons, [] if query == BRACES else ["query_sender_or"])
 
     def test_address_subset_keeps_case_order_and_duplicates(self):
+        """Preserve address spelling, repeated terms, and semantically unproven ordering differences."""
         query = "from:Ab.cd+tag-2@Mail-1.Example.invalid OR from:a@example.invalid OR from:a@example.invalid"
         result, _ = self.normalize({"query": query})
         self.assertEqual(result["query"], "{" + query.replace(" OR ", " ") + "}")
@@ -56,6 +60,7 @@ class CriteriaTests(unittest.TestCase):
         self.assertEqual(tuple(map(len, d.delta([forward], [reverse]))), (1, 1))
 
     def test_unknown_query_is_preserved_whole(self):
+        """Leave unsupported syntax, addresses, whitespace, and malformed wrappers untouched."""
         queries = [
             '"' + OR + '"', OR + " subject:x", OR + " AND has:attachment", "-" + OR,
             "from:(a@example.invalid OR b@example.invalid)", "(" + OR + ") (subject:x)",
@@ -73,6 +78,7 @@ class CriteriaTests(unittest.TestCase):
                 self.assertEqual(self.normalize({"query": query}), ({"query": query}, []))
 
     def test_native_subject_only_ascii_spaces(self):
+        """Collapse native subject ASCII spaces without rewriting other fields or Unicode whitespace."""
         criteria = {"subject": '日本語  "monthly   notice"\t\t続き\n\n次\u3000\u3000文\xa0\xa0末',
                     "query": 'subject:"日本語  通知"', "negatedQuery": OR,
                     "from": "a@example.invalid OR b@example.invalid", "to": "a@example.invalid"}
@@ -80,11 +86,13 @@ class CriteriaTests(unittest.TestCase):
         self.assertEqual(self.normalize(criteria), (expected, ["subject_ascii_spaces"]))
 
     def test_legacy_never_adds_new_transform(self):
+        """Keep sender queries and repeated subject spaces unchanged in legacy mode."""
         original = {"query": "((" + OR + "))", "subject": "monthly  notice"}
         self.assertEqual(d.normalize_criteria(original, normalization="legacy"), (original, []))
         self.assertEqual(d.canonical_template(rule(original), normalization="legacy"), rule(original))
 
     def test_actions_and_field_boundaries_remain_different(self):
+        """Retain action changes and unsupported cross-field or search-expression differences."""
         examples = [
             (rule({"query": OR}), rule({"query": BRACES}, "Type/Other")),
             (rule({"from": "a@example.invalid OR b@example.invalid"}), rule({"query": BRACES})),
@@ -102,6 +110,7 @@ class CriteriaTests(unittest.TestCase):
 
 class NormalizedPlanTests(unittest.TestCase):
     def setUp(self):
+        """Create an isolated synthetic workspace and capture command output."""
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.local = Path(tmp.name)
@@ -113,11 +122,13 @@ class NormalizedPlanTests(unittest.TestCase):
         self.addCleanup(out.stop)
 
     def plan(self, client):
+        """Build a current-mode plan from API rows carrying raw normalization provenance."""
         rows, labels = d.api_fetch(client)
         return d.make_plan(None, self.master, [x["filter"] for x in rows], "test@example.invalid",
                            labels, live_rows=rows), rows
 
     def test_xml_api_payload_audit_and_noop(self):
+        """Match normalized XML to live settings while separating audit data from API payloads."""
         write_xml(self.master, [{"hasTheWord": "((" + OR + "))", "subject": "meeting  reminder", "label": "Type/Test"}])
         client = raw_client([rule({"query": BRACES, "subject": "meeting reminder"})], self.log)
         plan, rows = self.plan(client)
@@ -130,6 +141,7 @@ class NormalizedPlanTests(unittest.TestCase):
         self.assertEqual(set(d.to_api(rows[0]["filter"], {"Type/Test": "Label_1"})), {"criteria", "action"})
 
     def test_api_only_variation_counts_once_and_retains_raw_source(self):
+        """Count API spelling changes once, preserve raw criteria, and reject inconsistent provenance."""
         write_xml(self.master, [{"hasTheWord": BRACES, "subject": "meeting reminder", "label": "Type/Test"}])
         client = raw_client([rule({"query": OR, "subject": "meeting  reminder"})], self.log)
         # Real API raw text may include outer whitespace too.
@@ -145,6 +157,7 @@ class NormalizedPlanTests(unittest.TestCase):
             d.make_plan(None, self.master, [x["filter"] for x in rows], plan["account"], {}, live_rows=rows)
 
     def test_counter_gain_does_not_count_duplicates_or_action_mismatches(self):
+        """Count only newly matched target slots and retain duplicate-ID deletion protection."""
         write_xml(self.master, [{"hasTheWord": BRACES, "label": "Type/Test"}])
         client = raw_client([rule({"query": OR}), rule({"query": "(" + BRACES + ")"})], self.log)
         plan, rows = self.plan(client)
@@ -160,6 +173,7 @@ class NormalizedPlanTests(unittest.TestCase):
         self.assertEqual((len(plan["add"]), len(plan["remove"])), (1, 1))
 
     def test_normalized_master_duplicates_stop_before_authentication(self):
+        """Reject Master rules that become duplicates before any authentication attempt."""
         write_xml(self.master, [{"hasTheWord": x, "label": "Type/Test"} for x in (OR, BRACES)])
         self.assertEqual(len(d.compile_xml(self.master, normalization="legacy")), 2)
         with patch.object(d, "get_client") as auth, redirect_stderr(StringIO()):
@@ -168,6 +182,7 @@ class NormalizedPlanTests(unittest.TestCase):
         auth.assert_not_called()
 
     def test_new_run_noop_has_no_approval_or_mutation_and_saves_audit(self):
+        """Complete a notation-only run without consent or writes while preserving IDs and audit."""
         write_xml(self.master, [{"hasTheWord": BRACES, "label": "Type/Test"}])
         client = raw_client([rule({"query": OR})], self.log)
         with patch.object(d, "get_client", return_value=(client, object())), \
@@ -185,6 +200,7 @@ class NormalizedPlanTests(unittest.TestCase):
         self.assertEqual(list(client.filters), ["filter_1"])
 
     def test_unknown_remaining_differences_are_reported_without_pairing(self):
+        """Show unsupported equivalence as unresolved additions and removals."""
         write_xml(self.master, [{"hasTheWord": BRACES, "label": "Type/Test"}])
         client = raw_client([rule({"from": "a@example.invalid OR b@example.invalid"})], self.log)
         plan, _ = self.plan(client)
@@ -194,6 +210,7 @@ class NormalizedPlanTests(unittest.TestCase):
         self.assertEqual(plan["normalization_matched"], 0)
 
     def test_selected_plan_payload_readback_and_normalized_external_drift(self):
+        """Keep selected-plan payloads and readback consistent, accepting notation but rejecting real drift."""
         write_xml(self.master, [{"hasTheWord": OR, "subject": "meeting  reminder", "label": "Type/Test"}])
         client = raw_client([rule({"from": "old@example.invalid"})], self.log)
         plan, rows = self.plan(client)
@@ -202,6 +219,7 @@ class NormalizedPlanTests(unittest.TestCase):
         payloads = []
         create = FakeFilters.create
         def capture(filters, userId, body):
+            """Record each prospective create payload before delegating to the in-memory transport."""
             payloads.append(deepcopy(body))
             return create(filters, userId, body)
         with patch.object(FakeFilters, "create", capture):
@@ -217,6 +235,7 @@ class NormalizedPlanTests(unittest.TestCase):
             d.perform(client, plan, plan["account"], plan["approval_digest"], self.log, batch_size=2)
 
     def test_audit_is_digest_protected_before_reads(self):
+        """Reject edited normalization provenance before fetching deployment state."""
         write_xml(self.master, [{"hasTheWord": OR, "label": "Type/Test"}])
         client = raw_client([], self.log)
         plan, _ = self.plan(client)
@@ -226,6 +245,7 @@ class NormalizedPlanTests(unittest.TestCase):
         fetch.assert_not_called()
 
     def test_unknown_plan_modes_reject_before_compile_auth_and_consent(self):
+        """Reject unknown or missing plan interpretations before processing either entrypoint."""
         unknown = [{"schema": "gmail-filters-deploy-plan/v99"},
                    {"schema": "gmail-filters-deploy-plan/v5"},
                    {"schema": "gmail-filters-deploy-plan/v5", "normalization_version": "query-v2"},
@@ -247,6 +267,7 @@ class NormalizedPlanTests(unittest.TestCase):
 
 class LegacyResumeTests(unittest.TestCase):
     def test_frozen_v3_v4_apply_and_pending_run_preserve_approved_meaning(self):
+        """Resume frozen legacy plans without changing digests, payload meaning, IDs, or prior events."""
         fixture = json.loads((Path(__file__).parent / "fixtures/condition-equivalence-legacy.json").read_text())
         for version, frozen in fixture["cases"].items():
             for command in ("apply", "run"):
@@ -271,9 +292,11 @@ class LegacyResumeTests(unittest.TestCase):
                     compile_xml, file_hash = d.compile_xml, d.file_hash
                     modes = []
                     def compile_mapped(path, **kwargs):
+                        """Compile the temporary fixture XML without editing the approved plan path or mode."""
                         modes.append(kwargs.get("normalization"))
                         return compile_xml(master if str(path) == plan["target_path"] else path, **kwargs)
                     def hash_mapped(path):
+                        """Hash the temporary XML for the frozen plan path without re-signing the plan."""
                         return file_hash(master if str(path) == plan["target_path"] else path)
                     stack.enter_context(patch.object(d, "compile_xml", side_effect=compile_mapped))
                     stack.enter_context(patch.object(d, "file_hash", side_effect=hash_mapped))
@@ -287,6 +310,7 @@ class LegacyResumeTests(unittest.TestCase):
                     payloads = []
                     create = FakeFilters.create
                     def capture(filters, userId, body):
+                        """Record resumed create payloads for comparison with the frozen legacy output."""
                         payloads.append(deepcopy(body))
                         return create(filters, userId, body)
                     stack.enter_context(patch.object(FakeFilters, "create", capture))

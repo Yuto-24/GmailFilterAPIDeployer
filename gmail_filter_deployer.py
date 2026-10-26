@@ -1304,6 +1304,7 @@ def perform_batched(client, plan, base, target, current, labels, log, batch_size
     sent_batches = 0
 
     def checkpoint(rows, now_labels, a, r, *, confirmed=False):
+        """Persist expected rows and distinguish acknowledged from readback-confirmed progress."""
         state["batch_checkpoint"] = {"schema": 1, "rows": rows, "labels": dict(now_labels),
                                      "add": sorted(a), "remove": sorted(r), "pending": None,
                                      "readback_confirmed": confirmed}
@@ -1353,6 +1354,7 @@ def perform_batched(client, plan, base, target, current, labels, log, batch_size
         raise AssertionError("unreachable readback")
 
     def confirm_checkpoint():
+        """Refresh deployment state and persist it as fully readback-confirmed."""
         nonlocal current, labels, adds, removes, since_readback
         current, labels, adds, removes = readback()
         checkpoint(current, labels, adds, removes, confirmed=True)
@@ -1361,6 +1363,7 @@ def perform_batched(client, plan, base, target, current, labels, log, batch_size
               f"追加済み: {len(adds)}/{len(plan['add'])}（全件照合済み）", flush=True)
 
     def budget_exhausted():
+        """Confirm outstanding writes before stopping at the requested batch limit."""
         if max_batches is not None and sent_batches >= max_batches:
             if since_readback:
                 confirm_checkpoint()
@@ -1390,6 +1393,7 @@ def perform_batched(client, plan, base, target, current, labels, log, batch_size
                 label_recovery_attempted = False
 
                 def reconcile_label():
+                    """Resolve a label creation outcome while rejecting unrelated filter or label changes."""
                     nonlocal label_recovery_attempted
                     label_recovery_attempted = True
                     rows, now = api_fetch(client, verbose=verbose, retry_reads=False, normalization=normalization)
@@ -1406,10 +1410,12 @@ def perform_batched(client, plan, base, target, current, labels, log, batch_size
                 save_json(log, state)
 
                 def record(event):
+                    """Persist a recovery event with the label creation context."""
                     state["events"].append({**event, "operation": "create_label", "name": name})
                     save_json(log, state)
 
                 def send_label():
+                    """Attempt label creation once and reset the recovery-read marker."""
                     nonlocal label_recovery_attempted
                     label_recovery_attempted = False
                     return client.users().labels().create(userId="me", body={
@@ -1461,6 +1467,7 @@ def perform_batched(client, plan, base, target, current, labels, log, batch_size
             save_json(log, state)
 
             def callback(request_id, response, exception):
+                """Validate a batch response ID and persist its success or failure before continuing."""
                 demand(request_id in {str(i) for i in steps} and
                        request_id not in pending["successes"] and request_id not in pending["errors"],
                        "バッチ応答IDが不正です")
@@ -1489,6 +1496,7 @@ def perform_batched(client, plan, base, target, current, labels, log, batch_size
                 recovery_attempted = False
 
                 def reconcile_single():
+                    """Resolve the current serial mutation against a fresh snapshot in the pinned mode."""
                     nonlocal recovery_attempted, since_readback
                     recovery_attempted = True
                     rows, now = api_fetch(client, verbose=verbose, retry_reads=False, normalization=normalization)
@@ -1504,11 +1512,13 @@ def perform_batched(client, plan, base, target, current, labels, log, batch_size
                     return True, {"id": fid}
 
                 def record_single(event):
+                    """Persist a recovery event with its filter operation and step."""
                     state["events"].append({**event, "operation": "delete_filter" if kind == "remove" else "create_filter",
                                             "step": i + 1})
                     save_json(log, state)
 
                 def send_single():
+                    """Execute the serial request once without SDK retries."""
                     nonlocal recovery_attempted
                     recovery_attempted = False
                     return request.execute(num_retries=0)
@@ -1632,6 +1642,7 @@ def validate_before_final_approval(plan: dict, expected_email: str, log: Path,
 
 def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_size=1, verbose=False,
             max_batches=None, readback_interval=50):
+    """Validate the approved plan and resume deployment using its pinned interpretation."""
     normalization = normalization_for_plan(plan)
     demand(expected.lower() == plan["account"].lower(), "対象アカウントが承認計画と不一致")
     demand(digest == plan["approval_digest"], "承認ハッシュが一致しません")
@@ -1659,6 +1670,7 @@ def verify_partial(client, base: list[dict], plan: dict, add_count: int, remove_
                    *, verbose=False, label_cache: dict[str, str] | None = None,
                    expected_filter_ids: set[str] | None = None,
                    diagnostic_dir: Path | None = None):
+    """Read back the expected progress in the plan mode without issuing mutations."""
     normalization = normalization_for_plan(plan)
     expected = prefix_counts(base, plan, add_count, remove_count)
 
@@ -1737,6 +1749,7 @@ def verify_partial(client, base: list[dict], plan: dict, add_count: int, remove_
 
 
 def cmd_validate(args):
+    """Validate XML offline under the current normalization and report optional baseline differences."""
     target_path = select_master(args.local_dir, args.target)
     target = compile_xml(target_path, normalization=CURRENT_NORMALIZATION)
     report = {
@@ -1763,6 +1776,7 @@ def cmd_validate(args):
 
 
 def cmd_plan(args):
+    """Save a read-only live-to-Master plan with the current normalization and audit."""
     target_path = select_master(args.local_dir, args.target)
     client, creds = get_client(args.client_secrets, args.token)
     acct = account_email(creds)
@@ -1802,6 +1816,7 @@ def cmd_apply(args):
 
 
 def cmd_verify(args):
+    """Compare live settings with Master under the current normalization and reject differences."""
     client, creds = get_client(args.client_secrets, args.token, allow_auth=False)
     acct = account_email(creds)
     demand(acct == args.expected_email.lower(), "認証アカウント不一致")
@@ -1955,6 +1970,7 @@ def cmd_run(args):
     """
     @contextmanager
     def exclusive_lock(path: Path):
+        """Prevent concurrent run commands while the local plan and journal are in use."""
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open('a+b') as lockfile:
             try:

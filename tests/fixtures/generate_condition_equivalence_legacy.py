@@ -23,10 +23,12 @@ from test_batch import BatchClient
 class FrozenDatetime(datetime):
     @classmethod
     def now(cls, tz=None):
+        """Return a fixed instant in the requested zone for reproducible plan and journal timestamps."""
         return datetime(2026, 10, 26, 0, 0, tzinfo=timezone.utc).astimezone(tz)
 
 
 def generate():
+    """Use the old implementation to freeze synthetic v3/v4 plans after one confirmed batch."""
     with tempfile.TemporaryDirectory() as name, redirect_stdout(StringIO()):
         root = Path(name)
         source = root / "legacy.py"

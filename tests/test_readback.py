@@ -69,6 +69,7 @@ class ReadbackTests(unittest.TestCase):
         self.assertIn("id=['unplanned-filter']", out.getvalue())
 
     def test_readback_glitch_after_delete_recovers_before_any_create(self):
+        """Keep the missing ID and full rule data from a transient post-delete mismatch."""
         original_list = FakeFilters.list
         did_glitch = [False]
         base_size = len(self.base)
@@ -100,6 +101,18 @@ class ReadbackTests(unittest.TestCase):
         self.assertEqual(snapshot["observed_count"], len(self.base) - 2)
         self.assertEqual(len(snapshot["missing_filter_ids"]), 1)
         self.assertEqual(snapshot["unexpected_filter_ids"], [])
+        before = {row['id']: row['filter'] for row in snapshot['before_filters']}
+        observed = {row['id']: row['filter'] for row in snapshot['observed_filters']}
+        initial = {row['id']: row['filter'] for row in self.initial}
+        missing_id = snapshot['missing_filter_ids'][0]
+        self.assertEqual(before[missing_id], initial[missing_id])
+        self.assertIn('criteria', before[missing_id])
+        self.assertIn('action', before[missing_id])
+        self.assertEqual(observed, {fid: rule for fid, rule in before.items() if fid != missing_id})
+        self.assertEqual(snapshot['labels'], self.labels)
+        self.assertIsNone(snapshot['pending'])  # Responses already acknowledged; boundary readback failed.
+        from datetime import datetime
+        self.assertIsNotNone(datetime.fromisoformat(snapshot['timestamp_utc']).tzinfo)
 
     def test_unknown_cached_label_id_falls_back_to_full_fetch(self):
         with patch.object(d, "fetch_for_deploy", wraps=d.fetch_for_deploy) as fetch:

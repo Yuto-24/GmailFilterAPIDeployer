@@ -54,7 +54,10 @@ OBSERVATION = ContextVar("deployment_observation", default=None)
 
 
 class Observation:
+    """Keep overlapping timing views and API counters for one command invocation."""
+
     def __init__(self, command, verbose=False):
+        """Start an isolated measurement with no previous command's counters."""
         self.command = command
         self.verbose = verbose
         self.started = time.perf_counter()
@@ -66,6 +69,7 @@ class Observation:
         self.outcome = "完了"
 
     def finish_phase(self, status="完了"):
+        """Close the active phase once and retain its deployment duration if applicable."""
         if self.phase is None:
             return
         label, started, deployment = self.phase
@@ -77,12 +81,14 @@ class Observation:
         self.phase = None
 
     def start_phase(self, label, *, deployment=False):
+        """Finish the previous phase before opening the next monotonic interval."""
         self.finish_phase()
         self.phase = (label, time.perf_counter(), deployment)
         if self.verbose:
             print(f"{timestamp_prefix()}[フェーズ開始] {label}", flush=True)
 
     def record_api(self, kind, seconds, succeeded):
+        """Aggregate one API attempt under a fixed key, never a private operation label."""
         if kind not in API_KINDS:
             return
         row = self.apis.setdefault(kind, {"attempts": 0, "success": 0, "failure": 0,
@@ -93,6 +99,7 @@ class Observation:
         row["max_seconds"] = max(row["max_seconds"], seconds)
 
     def report(self):
+        """Print command totals and optional overlapping API and batch-response details."""
         total = time.perf_counter() - self.started
         title = "run全体（対話確認を含む）" if self.command == "run" else "apply全体"
         print(f"{timestamp_prefix()}[計測] {title}: {total:.2f}s / "
@@ -120,6 +127,7 @@ class Observation:
 
 @contextmanager
 def observe_command(command, verbose=False):
+    """Report every exit path and restore the prior context even after interruption."""
     observation = Observation(command, verbose)
     token = OBSERVATION.set(observation)
     try:
@@ -137,12 +145,14 @@ def observe_command(command, verbose=False):
 
 
 def start_phase(label, *, deployment=False):
+    """Advance the current command's phase without creating global measurement state."""
     observation = OBSERVATION.get()
     if observation is not None:
         observation.start_phase(label, deployment=deployment)
 
 
 def observation_outcome(outcome):
+    """Record a nonexceptional terminal reason such as decline or bounded completion."""
     observation = OBSERVATION.get()
     if observation is not None:
         observation.outcome = outcome
@@ -1135,6 +1145,7 @@ def execute_filter_batch(client, requests, callback, *, api_kind=None):
     request_ids = {str(step) for step, _ in requests}
 
     def observed_callback(request_id, response, exception):
+        """Count each known response before passing it to the journal callback."""
         # Observe the response before the journal callback: a disk failure must
         # not turn a successful HTTP response into a failed API request.
         if items is not None and request_id in request_ids and request_id not in seen:
@@ -1147,6 +1158,7 @@ def execute_filter_batch(client, requests, callback, *, api_kind=None):
         sent = False
 
         def request(self, *args, **kwargs):
+            """Measure one outer HTTP send and reject any SDK replay before transmission."""
             nonlocal items
             demand(not self.sent, "バッチの暗黙の再送を拒否しました")
             self.sent = True
@@ -1662,6 +1674,7 @@ def cmd_plan(args):
 
 
 def cmd_apply(args):
+    """Apply a pinned approved plan with authentication and deployment timing phases."""
     start_phase("[1/3] 承認計画の読込み")
     plan = json.loads(args.plan.read_text(encoding="utf-8"))
     start_phase("[2/3] Google OAuth認証とアカウント照合")
@@ -1756,6 +1769,7 @@ def show_run_plan(plan: dict, plan_path: Path, verbose: bool = False,
 
 
 def confirm_interactive(prompt: str = "上記の変更をGmailに反映します。進めていいですか？ [y/N]: ") -> bool:
+    """Read explicit terminal consent while counting only time spent waiting for input."""
     # No implicit approval through piped input or background/scheduled runs.
     demand(sys.stdin.isatty(), "対話端末が必要です。docker compose run（-Tなし）で実行してください")
     try:
@@ -1982,6 +1996,7 @@ def resolve_expected_email(cli_email: str | None) -> str:
 
 
 def main(argv=None):
+    """Dispatch CLI commands, summarize run/apply measurements, and classify failures."""
     root = Path(__file__).resolve().parent
     ap = argparse.ArgumentParser(description="安全なGmail filter XML/API配備ツール（標準は読み取り専用）")
     sub = ap.add_subparsers(dest="cmd", required=True)

@@ -107,6 +107,24 @@ class CadenceTests(unittest.TestCase):
             totals.append((len(self.writes), 2 * len(self.reads)))
         self.assertEqual(totals, [(88, 178), (88, 6)])
 
+    def test_controlled_clock_comparison_preserves_mutations_and_target(self):
+        """Measure both reconciliation intervals under identical synthetic API delays."""
+        from scripts.benchmark_readback_cadence import compare
+        comparison = compare()
+        old, new = comparison['trials']
+        self.assertTrue(comparison['same_mutations'])
+        self.assertTrue(comparison['same_final_state'])
+        self.assertTrue(old['target_matches'] and new['target_matches'])
+        self.assertEqual((old['write_requests'], new['write_requests']), (88, 88))
+        self.assertEqual((old['read_requests'], new['read_requests']), (178, 6))
+        self.assertEqual((old['total_requests'], new['total_requests']), (266, 94))
+        self.assertEqual((old['controlled_deployment_seconds'], new['controlled_deployment_seconds']),
+                         (266.0, 94.0))
+        self.assertEqual(old['api_attempts'], {
+            'labels.list': 89, 'filters.list': 89, 'filters.delete': 45, 'filters.create': 43})
+        self.assertEqual(new['api_attempts'], {
+            'labels.list': 3, 'filters.list': 3, 'filters.delete': 45, 'filters.create': 43})
+
     def test_crash_before_50th_send_keeps_49_acknowledged_and_zero_confirmed(self):
         self.configure(adds=51)
         save = d.save_json

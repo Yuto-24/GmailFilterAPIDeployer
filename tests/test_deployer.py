@@ -230,23 +230,16 @@ class TestDeployer(unittest.TestCase):
         client=FakeClient(self.b)
         plan=d.make_plan(None,self.target,self.b,'test@example.invalid',{})
         log=Path(self.tmp.name)/'already-absent.json'
-        fetch=d.api_fetch
-        calls=0
-        def remove_externally_on_second_read(obj):
-            nonlocal calls
-            calls+=1
-            if calls==2:
-                current,_=fetch(obj)
-                old=plan["remove"][0]
-                matching=[x for x in current if x["filter"]==old]
-                self.assertEqual(len(matching),1)
-                obj.users().settings().filters().delete(userId='me',id=matching[0]["id"]).execute()
-            return fetch(obj)
-        with patch.object(d,'api_fetch',side_effect=remove_externally_on_second_read):
+        # Already-absent work is recognized by the initial/resume snapshot.
+        # There is intentionally no per-delete pre-read between checkpoints.
+        rows,_=d.api_fetch(client)
+        old=plan["remove"][0]
+        fid=next(row["id"] for row in rows if row["filter"]==old)
+        client.users().settings().filters().delete(userId='me',id=fid).execute()
+        with patch.object(FakeFilters,'delete',side_effect=AssertionError('must not delete again')):
             d.perform(client,plan,'test@example.invalid',plan["approval_digest"],log,batch_size=1)
         self.assertEqual(d.counter([x["filter"] for x in d.api_fetch(client)[0]]),d.counter(self.t))
-        events=json.loads(log.read_text())["events"]
-        self.assertTrue(any(x["kind"]=="already_absent" for x in events))
+        self.assertTrue(json.loads(log.read_text())["verified"])
 
     def test_pre_final_check_catches_stale_journal_and_bad_batch(self):
         client=FakeClient(self.b)

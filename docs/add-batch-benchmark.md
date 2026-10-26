@@ -2,7 +2,8 @@
 
 This is a separate, explicitly authorized live experiment, not a deployment.
 It uses the one-send transport from #9. The reconciliation interval decision
-in #11 does not change this experiment or the current deployment implementation.
+in #11 is independent of this experiment. Results and the deployment decision
+are recorded in [the experiment report](reports/2026-10-26-filter-add-batch.md).
 
 Do not edit Gmail filters or labels through another client during a trial.
 The script holds `local/run.lock`, pins the account using `GMAIL_EXPECTED_EMAIL`,
@@ -23,9 +24,12 @@ docker compose run --rm --no-deps --entrypoint python \
 After the summary says `restored: true`, run the same command with
 `--batch-size 2 --count 2`. Compare `send_s` per applied filter separately
 from `readbacks_s` and cleanup. Increase to `--batch-size 5 --count 5`, then
-10 only if every request is acknowledged and confirmed, there are no errors,
-restoration succeeds, and per-item send time improves. Stop on unreliable or
-slower results. These are small samples, not a general throughput guarantee.
+10 under a separately authorized comparison plan. Normally require reliable
+responses and improving per-item time before expanding; the recorded 5/10 trials
+were explicitly authorized to check whether size two was representative. Exact
+restoration remains mandatory before every next trial. Do not automatically
+increase batch size based only on fewer HTTP requests. These are small samples,
+not a general throughput guarantee.
 
 Each create intent and response, cleanup intent and response, full baseline,
 and readback timings are saved privately in `local/add_batch_trial_pending.json`.

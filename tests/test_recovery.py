@@ -189,6 +189,31 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(self.events("reconciled_after_error")[0]["attempt"], 3)
         self.assert_complete()
 
+    def test_rate_limit_exhaustion_stops_then_resumes_the_approved_plan(self):
+        """HTTP 429 preserves progress after three attempts and resumes without duplicates."""
+        calls = []
+
+        def limited(fake, **kwargs):
+            """Reject every delete without changing the synthetic Gmail state."""
+            def execute():
+                """Record the exact requested ID before returning a rate-limit error."""
+                calls.append(kwargs)
+                raise ApiError(429)
+            return Req(execute)
+
+        with patch.object(FakeFilters, 'delete', limited), self.assertRaisesRegex(d.DeploymentError, '再試行上限'):
+            self.deploy()
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(len({row['id'] for row in calls}), 1)
+        state = json.loads(self.log.read_text())
+        self.assertEqual(state['plan_digest'], self.plan['approval_digest'])
+        self.assertEqual((state['completed_add'], state['completed_remove']), (0, 0))
+        self.assertEqual(len(self.client.filters), len(self.base))
+        self.assertTrue(all(event['error'] == 'HTTP 429' for event in self.events('api_error')))
+        self.deploy()
+        self.assert_complete()
+        self.assertEqual(self.client.n, len(self.base) + len(self.plan['add']))
+
     def test_reconciliation_read_failure_stops_without_nested_retry_or_next_write(self):
         calls = self.fail_first(FakeFilters, "delete", applied=True)
         original = FakeLabels.list

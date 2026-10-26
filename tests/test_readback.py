@@ -93,7 +93,7 @@ class ReadbackTests(unittest.TestCase):
         self.assertEqual(d.counter([x["filter"] for x in d.api_fetch(self.client)[0]]),
                          d.counter(d.compile_xml(self.master)))
         self.assertTrue(json.loads(log.read_text())["verified"])
-        snapshots = list((self.local / "diagnostics").glob("readback_*.json"))
+        snapshots = list((self.local / "diagnostics").glob("*.json"))
         self.assertEqual(len(snapshots), 1)
         snapshot = json.loads(snapshots[0].read_text())
         self.assertEqual(snapshot["expected_count"], len(self.base) - 1)

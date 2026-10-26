@@ -102,11 +102,11 @@ class BatchTests(unittest.TestCase):
         rows, _ = d.api_fetch(self.client)
         self.assertEqual(d.counter(row['filter'] for row in rows), d.counter(d.compile_xml(self.master)))
 
-    def test_reverse_order_batches_and_constant_reads_per_batch(self):
+    def test_reverse_order_batches_read_only_at_phase_boundaries(self):
         with patch.object(d, 'api_fetch', wraps=d.api_fetch) as fetch:
             self.deploy()
         self.assertEqual([len(x) for x in self.client.batches], [3, 3, 1, 3, 2])
-        self.assertEqual(fetch.call_count, 2 + 2 * 5)
+        self.assertEqual(fetch.call_count, 3)  # Start, after removals, after additions.
         self.assertIn('Gmail filters.batch remove', self.output.getvalue())
         self.complete()
 
@@ -289,7 +289,8 @@ class BatchTests(unittest.TestCase):
         self.client.executor = false_ack
         with self.assertRaisesRegex(d.DeploymentError, '読戻し'):
             self.deploy()
-        self.assertEqual(len(self.client.batches), 1)
+        # Acknowledgements can lead readback until the phase/50-operation boundary.
+        self.assertEqual(len(self.client.batches), 3)
         self.assertEqual(len(self.client.filters), len(self.base))
 
     def test_transient_readback_recovers_without_more_writes(self):

@@ -126,7 +126,7 @@ class RecoveryTests(unittest.TestCase):
         self.start_patch(patch.object(FakeFilters, "list", new=listing))
         self.deploy()
         self.assertEqual(len(calls), len(self.plan["add"]))
-        self.assertEqual(len(reads_after_error), 3)  # Two recovery reads plus batch-size=1 verification.
+        self.assertEqual(len(reads_after_error), 2)  # Two recovery reads; no immediate duplicate list.
         self.sleeper.assert_called_once_with(1.25)
         self.assert_complete()
 

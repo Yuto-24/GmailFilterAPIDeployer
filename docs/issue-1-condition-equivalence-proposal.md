@@ -1,6 +1,6 @@
 # Issue #1：条件式の表現差を扱う仕様案
 
-**状態：仕様合意待ち。実装は変更していない。** 2026-10-27、PR #15マージ後の`f2240c9`を調査した。実Gmail・認証情報・利用者のMaster XMLにはアクセスせず、公式資料と合成入力だけを使用した。
+**状態：2026-10-27に推奨初版の仕様合意・実装済み。レビュー対象。Trash追加案は保留。** PR #15マージ後の`f2240c9`を調査し、利用者が「推奨範囲で実装を進める」と承認した。実Gmail・認証情報・利用者のMaster XMLにはアクセスせず、公式資料と合成入力だけを使用した。実装の検証範囲は[検証記録](reports/2026-10-27-issue-1-condition-equivalence.md)に記載する。
 
 ## 推奨する進め方と解消範囲
 
@@ -11,7 +11,7 @@
 
 **元のIssueで挙がった「fromフィールドとqueryの差」「subjectフィールドとqueryの差」は、この案では解消しない。Trashの外側括弧も初版では残す。** それらを同等とみなす根拠が足りないためである。初版だけで元の3例が解決した、あるいはIssue #1全体をCloseできるとは扱わない。解消できるのは、下表の別の限定例である。
 
-| 合成例 | 現行の追加/削除 | 推奨案の期待値 |
+| 合成例 | 旧方式の追加/削除 | 初版の追加/削除 |
 | --- | --- | --- |
 | `query`の`from:a@example.invalid OR from:b@example.invalid`対`{from:a@example.invalid from:b@example.invalid}` | 1 / 1 | 0 / 0 |
 | `query`の`(({from:a@example.invalid from:b@example.invalid}))`対`{from:a@example.invalid from:b@example.invalid}` | 1 / 1 | 0 / 0 |
@@ -20,7 +20,7 @@
 | APIの`subject: "{スカウトが届きました}"`対XML由来の`query: "subject:{スカウトが届きました}"` | 1 / 1 | 1 / 1を維持 |
 | Trashの`query: "((in:spam {phishing}))"`対`query: "(in:spam {phishing})"` | 1 / 1 | 1 / 1を維持 |
 
-「現行」は実際に`build_template`→`canonical_template`と`live_as_template`を通して`delta`で確認した結果。「期待値」は未実装の提案であり、実装済みの結果ではない。各例のactionは同一とした。件数削減率や配備時間への効果は実アカウントで測っていない。
+旧方式は仕様検討時に`build_template`→`canonical_template`と`live_as_template`を通して`delta`で確認した結果。初版は合成入力の回帰テストで確認した値であり、各例のactionは同一とした。件数削減率や配備時間への効果は実アカウントで測っていない。
 
 ## 公式資料が示すこと・示さないこと
 
@@ -83,15 +83,15 @@ Action/Delete・Trashのグループ承認→最終承認、承認前の読取�
 
 既存方式を`legacy`、合意した初版を`query-v1`とする。汎用的なversion管理機構や利用者向け切替CLIは作らない。正規化方式は実行中の計画に固定し、下位関数へ明示的に渡す。グローバルな既定値の途中変更や、hash計算時だけの正規化は避ける。
 
-新規計画には`schema: gmail-filters-deploy-plan/v5`と`normalization_version: query-v1`を記録する案を推奨する。v5では`selected_groups`未設定が現在のv3相当、設定済みが現在のv4相当であり、グループ選択してもv5を維持する。新schemaは旧バイナリに新計画を拒否させるためのもので、journal/checkpoint形式まで増やす必要はない。
+新規計画には`schema: gmail-filters-deploy-plan/v5`と`normalization_version: query-v1`を記録する。v5では`selected_groups`未設定が従来のv3相当、設定済みが従来のv4相当であり、グループ選択してもv5を維持する。新schemaは旧バイナリに新計画を拒否させるためのもので、journal/checkpoint形式は増やさない。
 
 | 入力計画 | 正規化方式・扱い |
 | --- | --- |
-| 現在のv3/v4、normalization_versionなし | `legacy`で再開。XML再コンパイル・API読戻し・payloadも従来規則を使う。digestやjournalを書き換えない。 |
+| 既存のv3/v4、normalization_versionなし | `legacy`で再開。XML再コンパイル・API読戻し・payloadも従来規則を使う。digestを再署名せず、journalに新方式の診断を後付けしない。通常の進捗更新は行う。 |
 | v5、normalization_versionがquery-v1 | 初版規則を全経路へ適用。version情報もapproval_digestの対象にする。 |
 | 不明なschema/version、v5のversion欠落、v3/v4に新versionを付加 | 承認・変更API前に停止。旧計画を自動移行しない。 |
 
-`run`ではロック取得後、**最初のXMLコンパイルとAPI取得より先に**pending計画の方式を選ぶ。現行コードは第4フェーズでpendingを読むため、この入口の位置を調整する必要がある。新規ならquery-v1、pendingがあればその方式を最終結果比較まで使う。`apply`も計画読込み直後に選び、`plan`/`validate`/`verify`など新規の独立操作はquery-v1を明示使用する。独立`verify`は新規基準の検証であり、旧pendingの再開照合を代行しない。
+`run`ではロック取得後、**最初のXMLコンパイルとAPI取得より先に**pending計画の方式を選ぶ。従来は第4フェーズでpendingを読んでいたが、この入口の位置を変更した。新規ならquery-v1、pendingがあればその方式を最終結果比較まで使う。`apply`も計画読込み直後に選び、`plan`/`validate`/`verify`など新規の独立操作はquery-v1を明示使用する。独立`verify`は新規基準の検証であり、旧pendingの再開照合を代行しない。
 
 ### 関数の責務
 
@@ -109,9 +109,9 @@ Action/Delete・Trashのグループ承認→最終承認、承認前の読取�
 
 特に`planned_states`は毎回XMLを再コンパイルし、`batch_progress`や削除ID選択はテンプレートのdictを直接比較する。このため`delta`だけの修正では整合しない。新計画・旧計画それぞれで、入口から最終照合まで同じ方式を使うことが実装レビューの重点になる。
 
-## 実装後に必要な検証
+## 検証契約
 
-仕様合意後、以下を合成fixtureとネットワーク無効のSDK環境で検証する。今回は仕様書作成だけのため、新規unit testや正規化実装は追加していない。
+以下を合成fixtureとネットワーク無効のSDK環境で検証した。結果と旧実装を使った互換性検証の根拠は[検証記録](reports/2026-10-27-issue-1-condition-equivalence.md)を参照する。
 
 - **許可範囲**：query OR/中括弧/全体括弧、subjectのASCII連続スペース、冪等性、入力非変更、XMLとAPIの同じ最終表現、payload往復。
 - **対象外の保持**：引用中のOR、日本語query、全角空白・NBSP・タブ、negatedQuery、否定、AND混在、内部グループ、不釣合い括弧、`in:spam(...)`、from/subject/toとqueryの移動をしない。
@@ -120,10 +120,10 @@ Action/Delete・Trashのグループ承認→最終承認、承認前の読取�
 - **旧計画**：v3/v4と既存journalを合成fixtureとして固定し、legacyでdigest不変・payload不変・同じIDの重複送信なしで再開する。未知versionは変更前に停止する。v5は旧バイナリで拒否されることも確認する。
 - **承認・復旧**：Action/Delete/Trashの制約と承認順、50操作境界、末尾、途中終了、応答喪失、rate-limit後の再開、Issue #3の計測表示を既存テストで回帰確認する。
 
-## 合意が必要な点
+## 合意結果（2026-10-27）
 
-1. **初版の範囲**：推奨するquery内単純OR・その全体括弧・subjectのASCIIスペースと、未確認差分の表示を実装するか。正規化をまだ有効化せず、診断表示だけを先行する選択も可能。その場合は旧計画方式を増やす必要がなく、変更要求削減はまだ得られない。
-2. **Trashの追加候補**：初版から外すという推奨に従うか、上記の限定形だけを追加で承認するか。from/subject跨ぎはどちらでも保留。
-3. **旧計画との互換性**：v3/v4はlegacyのまま再開し、新計画だけv5/query-v1とする案でよいか。旧計画の自動移行や承認済みdigestの更新は行わない。
+1. **初版の範囲**：query内単純OR・その全体括弧・subjectのASCIIスペースと、未確認差分の表示を実装する。診断表示のみの案は採用しない。
+2. **Trashの追加候補**：初版から外す。from/subject跨ぎも保留する。
+3. **旧計画との互換性**：v3/v4はlegacyのまま再開し、新計画だけv5/query-v1とする。旧計画の自動移行や承認済みdigestの更新は行わない。
 
-合意後は、核となる純粋関数→計画方式と入出力境界→表示・回帰検証の順で実装できる。限定初版の完了と、元のIssue例すべての解消は別々に報告する。
+合意した限定初版を実装した。限定初版の完了と、元のIssue例すべての解消は別々に報告する。

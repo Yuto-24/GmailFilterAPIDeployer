@@ -248,13 +248,21 @@ class CadenceTests(unittest.TestCase):
         with patch.object(d, 'save_json', crash), self.assertRaises(KeyboardInterrupt):
             self.execute()
         self.assertFalse(self.state()['verified'])
+        state = self.state()
+        state['events'].append({'note': '照合待ちの記録'})
+        d.save_json(self.log, state)
+        read_text = Path.read_text
+        def locale_read(path, encoding=None, errors=None):
+            return read_text(path, encoding=encoding or 'cp932', errors=errors)
         with patch.object(d, 'get_client', return_value=(self.client, object())), \
              patch.object(d, 'account_email', return_value=self.plan['account']), \
-             patch.object(d, 'confirm_interactive', side_effect=AssertionError('already applied')):
+             patch.object(d, 'confirm_interactive', side_effect=AssertionError('already applied')), \
+             patch.object(Path, 'read_text', locale_read):
             self.assertEqual(d.main(['run', '--local-dir', str(self.local),
                                     '--expected-email', self.plan['account']]), 0)
         self.assertTrue(self.state()['verified'])
         self.assertEqual(self.state()['completed_add'], 3)
+        self.assertEqual(self.state()['events'][-1], {'note': '照合待ちの記録'})
         self.assertFalse(pending.exists())
 
     def test_old_batch_checkpoint_without_new_fields_resumes(self):

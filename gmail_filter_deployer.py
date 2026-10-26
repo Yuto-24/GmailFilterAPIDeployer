@@ -1711,7 +1711,7 @@ def cmd_run(args):
             added, removed = batch_progress(base, plan, current, journal, labels)
             a_done, r_done = len(added), len(removed)
             if a_done == len(plan['add']) and r_done == len(plan['remove']):
-                state = json.loads(journal.read_text()) if journal.exists() else {
+                state = json.loads(journal.read_text(encoding='utf-8')) if journal.exists() else {
                     "account": acct, "plan_digest": plan['approval_digest'], "events": []}
                 state.update(verified=True, completed_add=a_done, completed_remove=r_done,
                              acknowledged_add=a_done, acknowledged_remove=r_done)

@@ -102,6 +102,31 @@ def api_error_code(exc: Exception) -> str:
     return f"HTTP {status}" if isinstance(status, int) else type(exc).__name__
 
 
+def api_error_details(exc: Exception) -> dict:
+    """Preserve Google's diagnostic fields, never request headers or credentials.
+
+    Messages may describe account-specific settings, so these details belong in
+    the private local journal rather than public reports or source control.
+    """
+    details = {"code": api_error_code(exc), "exception_type": type(exc).__name__}
+    try:
+        payload = json.loads(exc.content)
+        error = payload.get("error", {})
+        if isinstance(error, dict):
+            for key in ("code", "status", "message"):
+                value = error.get(key)
+                if isinstance(value, (str, int)):
+                    details["google_" + key] = value[:4096] if isinstance(value, str) else value
+            errors = error.get("errors", [])
+            if isinstance(errors, list):
+                details["errors"] = [{k: value[:4096] for k in ("reason", "domain", "message")
+                                      if isinstance(value := row.get(k), str)}
+                                     for row in errors[:25] if isinstance(row, dict)]
+    except (AttributeError, TypeError, ValueError):
+        pass
+    return details
+
+
 def retry_wait(label: str, attempt: int, exc: Exception, verbose: bool) -> None:
     delay = API_RETRY_DELAYS_SECONDS[attempt] + random.uniform(0, 1)
     if verbose:
@@ -973,6 +998,16 @@ def batch_progress(base, plan, current, log, labels=None):
     return done["add"], done["remove"]
 
 
+def execute_filter_single(step, request, callback):
+    """Send one ordinary request with no replay; retain the journal callback."""
+    try:
+        response = request.execute(num_retries=0)
+    except Exception as exc:
+        callback(str(step), None, exc)
+    else:
+        callback(str(step), response, None)
+
+
 def execute_filter_batch(client, requests, callback):
     """Use the SDK multipart codec, but permit exactly one HTTP transmission.
 
@@ -997,7 +1032,7 @@ def execute_filter_batch(client, requests, callback):
     batch.execute(http=OneSend())
 
 
-def perform_batched(client, plan, base, target, current, labels, log, batch_size, verbose):
+def perform_batched(client, plan, base, target, current, labels, log, batch_size, verbose, max_batches=None):
     """Execute bounded batches; stop on partial failure and resume from live IDs."""
     adds, removes = batch_progress(base, plan, current, log, labels)
     state = json.loads(log.read_text(encoding="utf-8")) if log.exists() else {
@@ -1016,11 +1051,21 @@ def perform_batched(client, plan, base, target, current, labels, log, batch_size
     if order[0] == "remove" and len(removes) < len(plan["remove"]):
         print("旧ルールを先に削除するため、新ルール追加まで一部の振り分け条件が一時的に無効になります。", flush=True)
 
+    sent_batches = 0
+
+    def budget_exhausted():
+        if max_batches is not None and sent_batches >= max_batches:
+            print("指定したバッチ数まで実行し照合しました。保留計画を保持して終了します。", flush=True)
+            return True
+        return False
+
     for kind in order:
         completed = adds if kind == "add" else removes
         remaining = [i for i in range(len(plan[kind])) if i not in completed]
         if not remaining:
             continue
+        if budget_exhausted():
+            return False
         # Labels must exist before filter batches. Label creation remains serial
         # with the original read-before-retry protection.
         if kind == "add":
@@ -1060,6 +1105,8 @@ def perform_batched(client, plan, base, target, current, labels, log, batch_size
                 checkpoint(current, labels, adds, removes)
 
         for offset in range(0, len(remaining), batch_size):
+            if budget_exhausted():
+                return False
             steps = remaining[offset:offset + batch_size]
             # A fresh pre-batch snapshot also checks for changes between batches.
             current, labels = api_fetch(client, verbose=verbose)
@@ -1078,7 +1125,8 @@ def perform_batched(client, plan, base, target, current, labels, log, batch_size
                     demand(not any(row["filter"] == rule for row in current), "追加対象が既に存在します")
                     request = client.users().settings().filters().create(userId="me", body=to_api(rule, labels))
                 requests.append((i, request))
-            pending = {"kind": kind, "steps": steps, "ids": ids, "successes": {}, "errors": {}}
+            pending = {"kind": kind, "steps": steps, "ids": ids, "successes": {}, "errors": {},
+                       "error_details": {}, "transport": "single" if batch_size == 1 else "batch"}
             state["batch_checkpoint"]["pending"] = pending
             save_json(log, state)  # Durable intent BEFORE any HTTP write.
 
@@ -1088,6 +1136,7 @@ def perform_batched(client, plan, base, target, current, labels, log, batch_size
                        "バッチ応答IDが不正です")
                 if exception is not None:
                     pending["errors"][request_id] = api_error_code(exception)
+                    pending["error_details"][request_id] = api_error_details(exception)
                 else:
                     fid = ids[request_id] if kind == "remove" else (response or {}).get("id")
                     demand(isinstance(fid, str) and fid.strip(), "バッチ追加の応答IDが不正です")
@@ -1100,10 +1149,13 @@ def perform_batched(client, plan, base, target, current, labels, log, batch_size
 
             failed = False
             try:
-                timed_operation(f"Gmail filters.batch {kind} [{steps[0]+1}–{steps[-1]+1}/{len(plan[kind])}]",
-                                lambda: execute_filter_batch(client, requests, callback), verbose)
+                timed_operation(f"Gmail filters.{pending['transport']} {kind} "
+                                f"[{steps[0]+1}–{steps[-1]+1}/{len(plan[kind])}]",
+                                lambda: (execute_filter_single(*requests[0], callback) if batch_size == 1 else
+                                         execute_filter_batch(client, requests, callback)), verbose)
             except Exception as exc:
                 pending["transport_error"] = api_error_code(exc)
+                pending["transport_error_details"] = api_error_details(exc)
                 save_json(log, state)
                 failed = True
             failed = failed or bool(pending["errors"]) or len(pending["successes"]) != len(steps)
@@ -1134,7 +1186,9 @@ def perform_batched(client, plan, base, target, current, labels, log, batch_size
                 time.sleep(READBACK_DELAYS_SECONDS[attempt])
             state.update(completed_add=len(a), completed_remove=len(r))
             state["events"].append({"kind": "filter_batch", "operation": kind, "steps": steps,
+                                    "transport": pending["transport"],
                                     "successes": dict(pending["successes"]), "errors": dict(pending["errors"]),
+                                    "error_details": dict(pending["error_details"]),
                                     "completed_add": len(a), "completed_remove": len(r),
                                     "timestamp_utc": datetime.now(timezone.utc).isoformat()})
             save_json(log, state)
@@ -1142,6 +1196,7 @@ def perform_batched(client, plan, base, target, current, labels, log, batch_size
                 raise DeploymentError(f"バッチが一部失敗または応答不明です。実設定を読戻しました。"
                                       f"削除済 {len(r)}/{len(plan['remove'])} / 追加済 {len(a)}/{len(plan['add'])}。"
                                       + RECOVERY_STOP)
+            sent_batches += 1
             adds, removes, current, labels = a, r, rows, now_labels
             checkpoint(current, labels, adds, removes)
             print(f"バッチ照合済み: 削除 {len(removes)}/{len(plan['remove'])} / "
@@ -1156,12 +1211,22 @@ def perform_batched(client, plan, base, target, current, labels, log, batch_size
     print(f"配備完了: {len(target)}件、API読戻し一致。Gmail UI exportも別途取得して照合してください")
 
 
+def validate_batch_limit(log, batch_size, max_batches):
+    prior = json.loads(log.read_text(encoding="utf-8")) if log.exists() else {}
+    demand(max_batches is None or max_batches > 0, "max-batchesは1以上で指定してください")
+    demand(max_batches is None or batch_size > 1 or prior.get("batch_checkpoint") is not None,
+           "max-batchesは複数件バッチまたは既存バッチ計画の再開専用です。"
+           "新規の1件逐次処理では指定を外してください")
+    return prior
+
+
 def validate_before_final_approval(plan: dict, expected_email: str, log: Path,
-                                   batch_size: int, current: list[dict]) -> None:
+                                   batch_size: int, current: list[dict], max_batches=None) -> None:
     """Check all locally decidable execution invariants before consent."""
     demand(expected_email.lower() == plan["account"].lower(),
            "承認対象のGmailアカウントが認証アカウントと異なります")
     demand(1 <= batch_size <= 25, "batch-sizeは1〜25件で指定してください")
+    validate_batch_limit(log, batch_size, max_batches)
     demand(plan["approval_digest"] == json_hash({
         k:v for k,v in plan.items() if k not in {"created_utc", "approval_digest"}}),
         "承認計画のハッシュが一致しません")
@@ -1193,13 +1258,15 @@ def validate_before_final_approval(plan: dict, expected_email: str, log: Path,
             to_api(rule, labels)
 
 
-def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_size=20, verbose=False):
+def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_size=1, verbose=False,
+            max_batches=None):
     demand(expected.lower() == plan["account"].lower(), "対象アカウントが承認計画と不一致")
     demand(digest == plan["approval_digest"], "承認ハッシュが一致しません")
     demand(plan["approval_digest"] == json_hash(
         {k: v for k, v in plan.items() if k not in {"created_utc", "approval_digest"}}),
         "承認済み計画が改変されています")
     demand(1 <= batch_size <= 25, "batch-sizeは1〜25件で指定してください")
+    prior = validate_batch_limit(log, batch_size, max_batches)
     base, target = planned_states(plan)
     order = plan.get("operation_order", "add_first")
     demand(order in ("remove_first", "add_first"), "配備順序が不正です")
@@ -1207,9 +1274,8 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
     demand(peak <= FILTER_LIMIT,
            f"配備中の最大フィルタ数{peak}件がGmail上限{FILTER_LIMIT}件を超えます")
     current, labels = fetch_for_deploy(client, verbose=verbose)
-    prior = json.loads(log.read_text(encoding="utf-8")) if log.exists() else {}
     if batch_size > 1 or prior.get("batch_checkpoint") is not None:
-        return perform_batched(client, plan, base, target, current, labels, log, batch_size, verbose)
+        return perform_batched(client, plan, base, target, current, labels, log, batch_size, verbose, max_batches)
     live = [x["filter"] for x in current]
     a_done, r_done = detect_position(base, plan, live)
     print(f"配備開始（{'削除→追加' if order == 'remove_first' else '旧版・追加→削除'}）: "
@@ -1540,7 +1606,8 @@ def cmd_apply(args):
     demand(acct == args.expected_email.lower(), f"認証アカウントが違います: {acct}")
     demand(not plan["remove"] or args.allow_removals,
            f"旧フィルタ{len(plan['remove'])}件の削除予定があります。plan.jsonを確認し、承認する場合だけ--allow-removalsを指定してください")
-    perform(client, plan, acct, args.approve, args.log, args.batch_size, verbose=args.verbose)
+    perform(client, plan, acct, args.approve, args.log, args.batch_size, verbose=args.verbose,
+            max_batches=getattr(args, "max_batches", None))
 
 
 def cmd_verify(args):
@@ -1773,7 +1840,8 @@ def cmd_run(args):
         # Every deterministic precondition is checked BEFORE final [y/N].
         latest, _ = api_fetch(client, verbose=args.verbose)
         journal = args.local_dir / 'logs' / (plan['approval_digest'] + '.json')
-        validate_before_final_approval(plan, acct, journal, args.batch_size, latest)
+        validate_before_final_approval(plan, acct, journal, args.batch_size, latest,
+                                       max_batches=getattr(args, "max_batches", None))
         print("事前検証: 計画・削除ID・容量・進捗ログ・API payloadを確認済み。", flush=True)
         if not confirm_interactive("上記の内容でGmailのフィルタ設定を変更しますか？ [y/N]: "):
             print("最終承認されなかったため、Gmail設定は変更していません。", flush=True)
@@ -1782,11 +1850,14 @@ def cmd_run(args):
             save_json(plan_file, plan)
             save_json(pending_file, plan)  # Save only after final approval, before API mutation.
         print("[6/6] Gmailへ配備し、APIの読戻しで検証中...", flush=True)
-        timed_operation(
+        result = timed_operation(
             "承認済み計画の配備（削除・追加・検証）",
             lambda: perform(client, plan, acct, plan['approval_digest'],
-                            journal, args.batch_size, verbose=args.verbose),
+                            journal, args.batch_size, verbose=args.verbose,
+                            max_batches=getattr(args, "max_batches", None)),
             args.verbose)
+        if result is False:
+            return
         pending_file.unlink()
         actual, _ = api_fetch(client, verbose=args.verbose)
         master = compile_xml(target_path)
@@ -1828,7 +1899,7 @@ def main(argv=None):
     default_local = root / "local"
     p = sub.add_parser("run", help="検証→差分表示→対話承認→配備→API照合を1コマンドで実行")
     p.add_argument("--target", type=Path, help="任意: デフォルトは最新Masterを自動選択")
-    p.add_argument("--batch-size", type=int, default=20, help="削除・追加のHTTPバッチ件数。1〜25、既定20。1は逐次処理")
+    p.add_argument("--batch-size", type=int, default=1, help="削除・追加のHTTPバッチ件数。1〜25、既定1。1は逐次処理")
     p.add_argument("-v", "--verbose", action="store_true", help="フィルタ単位の処理・API照合の詳細を表示")
     p.set_defaults(func=cmd_run)
     p = sub.add_parser("validate", help="オフライン: 最新Master XMLを検証（--baseは任意）")
@@ -1847,7 +1918,7 @@ def main(argv=None):
     p.add_argument("--approve", required=True, help="planが表示したapproval_digest")
     p.add_argument("--allow-removals", action="store_true", help="既存非保護ルールの削除を明示的に承認")
     p.add_argument("--log", type=Path, default=default_local / "deploy_log.json")
-    p.add_argument("--batch-size", type=int, default=20, help="削除・追加のHTTPバッチ件数。1〜25、既定20")
+    p.add_argument("--batch-size", type=int, default=1, help="削除・追加のHTTPバッチ件数。1〜25、既定1")
     p.add_argument("-v", "--verbose", action="store_true", help="フィルタ単位の配備・API照合詳細を表示")
     p.set_defaults(func=cmd_apply)
     p = sub.add_parser("verify", help="Gmail API実設定と最新版Masterの完全照合")
@@ -1862,8 +1933,13 @@ def main(argv=None):
         p.add_argument("--expected-email", help="対象Gmailアドレス。省略時はGMAIL_EXPECTED_EMAILを使用")
         p.add_argument("--client-secrets", type=Path, default=default_local / "credentials.json")
         p.add_argument("--token", type=Path, default=default_local / "token.json")
+    for name in ("run", "apply"):
+        sub.choices[name].add_argument("--max-batches", type=int,
+                                       help="指定数のバッチを照合後、保留計画を保持して終了（既定は全件）")
     args = ap.parse_args(argv)
     try:
+        max_batches = getattr(args, "max_batches", None)
+        demand(max_batches is None or max_batches > 0, "max-batchesは1以上で指定してください")
         if args.cmd in ("plan", "apply", "verify", "run"):
             args.expected_email = resolve_expected_email(args.expected_email)
         started = time.perf_counter()

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from datetime import datetime, timezone
 import hashlib
 import http.client
@@ -44,27 +46,137 @@ class DeploymentError(Exception):
     pass
 
 
+# Only these fixed categories are aggregated; labels, IDs and rule content never
+# become metric keys. Timings are overlapping views, not additive totals.
+API_KINDS = ("labels.list", "filters.list", "labels.create", "filters.create", "filters.delete",
+             "filters.batch.create", "filters.batch.delete")
+OBSERVATION = ContextVar("deployment_observation", default=None)
+
+
+class Observation:
+    def __init__(self, command, verbose=False):
+        self.command = command
+        self.verbose = verbose
+        self.started = time.perf_counter()
+        self.approval_wait = 0.0
+        self.deployment_seconds = 0.0
+        self.phase = None
+        self.apis = {}
+        self.batch_items = {}
+        self.outcome = "完了"
+
+    def finish_phase(self, status="完了"):
+        if self.phase is None:
+            return
+        label, started, deployment = self.phase
+        seconds = time.perf_counter() - started
+        if deployment:
+            self.deployment_seconds += seconds
+        if self.verbose:
+            print(f"{timestamp_prefix()}[フェーズ{status}] {label} ({seconds:.2f}s)", flush=True)
+        self.phase = None
+
+    def start_phase(self, label, *, deployment=False):
+        self.finish_phase()
+        self.phase = (label, time.perf_counter(), deployment)
+        if self.verbose:
+            print(f"{timestamp_prefix()}[フェーズ開始] {label}", flush=True)
+
+    def record_api(self, kind, seconds, succeeded):
+        if kind not in API_KINDS:
+            return
+        row = self.apis.setdefault(kind, {"attempts": 0, "success": 0, "failure": 0,
+                                          "seconds": 0.0, "max_seconds": 0.0})
+        row["attempts"] += 1
+        row["success" if succeeded else "failure"] += 1
+        row["seconds"] += seconds
+        row["max_seconds"] = max(row["max_seconds"], seconds)
+
+    def report(self):
+        total = time.perf_counter() - self.started
+        title = "run全体（対話確認を含む）" if self.command == "run" else "apply全体"
+        print(f"{timestamp_prefix()}[計測] {title}: {total:.2f}s / "
+              f"承認入力待ち: {self.approval_wait:.2f}s / "
+              f"承認入力待ち除外: {max(0.0, total - self.approval_wait):.2f}s / "
+              f"配備区間: {self.deployment_seconds:.2f}s / 結果: {self.outcome}", flush=True)
+        if not self.verbose:
+            return
+        for kind in API_KINDS:
+            row = self.apis.get(kind)
+            if row is None:
+                continue
+            print(f"[API集計] {kind}: 試行={row['attempts']} 成功={row['success']} "
+                  f"失敗/中断={row['failure']} 合計={row['seconds']:.2f}s "
+                  f"平均={row['seconds'] / row['attempts']:.2f}s 最大={row['max_seconds']:.2f}s",
+                  flush=True)
+            items = self.batch_items.get(kind)
+            if items:
+                print(f"  内部要求: 送出対象={items['submitted']} 成功応答={items['success']} "
+                      f"失敗応答={items['failure']} 応答不明={items['unknown']} "
+                      "（個別レイテンシは計測不可）", flush=True)
+        if not self.apis:
+            print("[API集計] Gmail API試行なし", flush=True)
+
+
+@contextmanager
+def observe_command(command, verbose=False):
+    observation = Observation(command, verbose)
+    token = OBSERVATION.set(observation)
+    try:
+        yield observation
+    except BaseException as exc:
+        observation.outcome = "中断" if isinstance(exc, KeyboardInterrupt) else "例外停止"
+        observation.finish_phase("停止")
+        raise
+    finally:
+        try:
+            observation.finish_phase()
+            observation.report()
+        finally:
+            OBSERVATION.reset(token)
+
+
+def start_phase(label, *, deployment=False):
+    observation = OBSERVATION.get()
+    if observation is not None:
+        observation.start_phase(label, deployment=deployment)
+
+
+def observation_outcome(outcome):
+    observation = OBSERVATION.get()
+    if observation is not None:
+        observation.outcome = outcome
+
+
 def timestamp_prefix() -> str:
     """Use an offset-aware clock stamp; the Docker timezone may differ from the host."""
     return f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] "
 
 
-def timed_operation(label: str, call, verbose: bool = False):
+def timed_operation(label: str, call, verbose: bool = False, *, api_kind=None,
+                    response_success=None):
     """Record wall-clock timestamps and monotonic duration without changing API semantics."""
     started = time.perf_counter()
     if verbose:
         print(f"{timestamp_prefix()}[処理開始] {label}", flush=True)
+    succeeded = False
     try:
         result = call()
-    except Exception:
+        succeeded = (response_success(result) if response_success and OBSERVATION.get() is not None
+                     and api_kind in API_KINDS else True)
+        return result
+    finally:
+        seconds = time.perf_counter() - started
+        observation = OBSERVATION.get()
+        if observation is not None:
+            # Existing detailed operation labels may include private information;
+            # match only the fixed API prefix, never retain the rest of the label.
+            kind = api_kind or next((kind for kind in API_KINDS
+                if label == f"Gmail {kind}" or label.startswith(f"Gmail {kind} ")), None)
+            observation.record_api(kind, seconds, succeeded)
         if verbose:
-            print(f"{timestamp_prefix()}[処理失敗] {label} "
-                  f"({time.perf_counter() - started:.2f}s)", flush=True)
-        raise
-    if verbose:
-        print(f"{timestamp_prefix()}[処理完了] {label} "
-              f"({time.perf_counter() - started:.2f}s)", flush=True)
-    return result
+            print(f"{timestamp_prefix()}[処理{'完了' if succeeded else '失敗'}] {label} "
+                  f"({seconds:.2f}s)", flush=True)
 
 
 # Three total attempts. SDK-level retries remain disabled: writes must reconcile first.
@@ -999,35 +1111,58 @@ def batch_progress(base, plan, current, log, labels=None):
     return done["add"], done["remove"]
 
 
-def execute_filter_single(step, request, callback):
+def execute_filter_single(step, request, callback, *, api_kind=None):
     """Send one ordinary request with no replay; retain the journal callback."""
     try:
-        response = request.execute(num_retries=0)
+        response = timed_operation("単独HTTP要求", lambda: request.execute(num_retries=0),
+                                   api_kind=api_kind)
     except Exception as exc:
         callback(str(step), None, exc)
     else:
         callback(str(step), response, None)
 
 
-def execute_filter_batch(client, requests, callback):
+def execute_filter_batch(client, requests, callback, *, api_kind=None):
     """Use the SDK multipart codec, but permit exactly one HTTP transmission.
 
     BatchHttpRequest.execute can replay inner 401 responses, even though the
     ordinary HttpRequest retry count is zero. This transport refuses a second
     send; recovery always happens through our persisted journal and readback.
     """
+    observation = OBSERVATION.get()
+    items = None
+    seen = set()
+    request_ids = {str(step) for step, _ in requests}
+
+    def observed_callback(request_id, response, exception):
+        # Observe the response before the journal callback: a disk failure must
+        # not turn a successful HTTP response into a failed API request.
+        if items is not None and request_id in request_ids and request_id not in seen:
+            seen.add(request_id)
+            items["success" if exception is None else "failure"] += 1
+            items["unknown"] -= 1
+        callback(request_id, response, exception)
+
     class OneSend:
         sent = False
 
         def request(self, *args, **kwargs):
+            nonlocal items
             demand(not self.sent, "バッチの暗黙の再送を拒否しました")
             self.sent = True
             # Gmail does not promise parallel execution inside a batch. Keep
             # the old per-operation read budget, with a fixed connect timeout.
             kwargs["timeout"] = (60, 60 * len(requests))
-            return client._http.request(*args, **kwargs)
+            if observation is not None and api_kind in API_KINDS:
+                items = observation.batch_items.setdefault(api_kind,
+                    {"submitted": 0, "success": 0, "failure": 0, "unknown": 0})
+                items["submitted"] += len(requests)
+                items["unknown"] += len(requests)
+            return timed_operation("バッチ外側HTTP要求", lambda: client._http.request(*args, **kwargs),
+                                   api_kind=api_kind,
+                                   response_success=lambda result: 200 <= int(result[0].status) < 300)
 
-    batch = client.new_batch_http_request(callback=callback)
+    batch = client.new_batch_http_request(callback=observed_callback)
     for step, request in requests:
         batch.add(request, request_id=str(step))
     batch.execute(http=OneSend())
@@ -1281,8 +1416,10 @@ def perform_batched(client, plan, base, target, current, labels, log, batch_size
                 try:
                     timed_operation(f"Gmail filters.{pending['transport']} {kind} "
                                     f"[{steps[0]+1}–{steps[-1]+1}/{len(plan[kind])}]",
-                                    lambda: (execute_filter_single(*requests[0], callback) if batch_size == 1 else
-                                             execute_filter_batch(client, requests, callback)), verbose)
+                                    lambda: (execute_filter_single(*requests[0], callback,
+                                        api_kind="filters.delete" if kind == "remove" else "filters.create")
+                                        if batch_size == 1 else execute_filter_batch(client, requests, callback,
+                                        api_kind="filters.batch.delete" if kind == "remove" else "filters.batch.create")), verbose)
                 except Exception as exc:
                     pending["transport_error"] = api_error_code(exc)
                     pending["transport_error_details"] = api_error_details(exc)
@@ -1525,14 +1662,19 @@ def cmd_plan(args):
 
 
 def cmd_apply(args):
+    start_phase("[1/3] 承認計画の読込み")
     plan = json.loads(args.plan.read_text(encoding="utf-8"))
+    start_phase("[2/3] Google OAuth認証とアカウント照合")
     client, creds = get_client(args.client_secrets, args.token, allow_auth=False)
     acct = account_email(creds)
     demand(acct == args.expected_email.lower(), f"認証アカウントが違います: {acct}")
     demand(not plan["remove"] or args.allow_removals,
            f"旧フィルタ{len(plan['remove'])}件の削除予定があります。plan.jsonを確認し、承認する場合だけ--allow-removalsを指定してください")
-    perform(client, plan, acct, args.approve, args.log, args.batch_size, verbose=args.verbose,
-            max_batches=getattr(args, "max_batches", None))
+    start_phase("[3/3] 承認済み計画の配備・API読戻し", deployment=True)
+    result = perform(client, plan, acct, args.approve, args.log, args.batch_size, verbose=args.verbose,
+                     max_batches=getattr(args, "max_batches", None))
+    if result is False:
+        observation_outcome("途中終了（保留計画を保持）")
 
 
 def cmd_verify(args):
@@ -1617,7 +1759,13 @@ def confirm_interactive(prompt: str = "上記の変更をGmailに反映します
     # No implicit approval through piped input or background/scheduled runs.
     demand(sys.stdin.isatty(), "対話端末が必要です。docker compose run（-Tなし）で実行してください")
     try:
-        answer = input(prompt).strip().lower()
+        started = time.perf_counter()
+        try:
+            answer = input(prompt).strip().lower()
+        finally:
+            observation = OBSERVATION.get()
+            if observation is not None:
+                observation.approval_wait += time.perf_counter() - started
     except (EOFError, KeyboardInterrupt):
         print("\nキャンセルしました。Gmailは変更していません。")
         return False
@@ -1654,8 +1802,6 @@ def cmd_run(args):
     A pending approved plan is resumed rather than replanning from a partial
     live state. Separate per-plan journals allow indefinitely many releases.
     """
-    from contextlib import contextmanager
-
     @contextmanager
     def exclusive_lock(path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1679,23 +1825,27 @@ def cmd_run(args):
                     pass
 
     with exclusive_lock(args.local_dir / 'run.lock'):
+        start_phase("[1/6] 最新Master XMLを選択・検証")
         print("[1/6] 最新Master XMLを選択・検証中...", flush=True)
         target_path = select_master(args.local_dir, args.target)
         target = compile_xml(target_path)  # Offline preflight before OAuth.
         print(f"      検証完了: {target_path.name}（{len(target)}件）", flush=True)
         if args.verbose:
             print(f"{timestamp_prefix()}[詳細] Master SHA-256: {file_hash(target_path)}", flush=True)
+        start_phase("[2/6] Google OAuth認証とアカウント照合")
         print("[2/6] Google OAuth認証とアカウント照合中...", flush=True)
         client, creds = get_client(args.client_secrets, args.token)
         acct = account_email(creds)
         demand(acct == args.expected_email, f"認証Googleアカウント不一致: {acct} != {args.expected_email}")
         print(f"      認証済み: {acct}", flush=True)
+        start_phase("[3/6] Gmailの現行ラベル・フィルタ取得")
         print("[3/6] Gmailの現行ラベル・フィルタを取得中...", flush=True)
         current, labels = timed_operation(
             "Gmail初期フィルタ・ラベル取得",
             lambda: read_gmail_filters_preflight(client), args.verbose)
         live = [x['filter'] for x in current]
         print(f"      取得完了: {len(live)}フィルタ / {len(labels)}ラベル", flush=True)
+        start_phase("[4/6] 変更差分と保護ルールの照合")
         print("[4/6] 変更差分と保護ルールを照合中...", flush=True)
         pending_file = args.local_dir / 'run_pending.json'
         plan_file = args.local_dir / 'run_plan.json'
@@ -1722,21 +1872,22 @@ def cmd_run(args):
                 save_json(journal, state)
                 print(f"前回の配備は既に反映済みです。MasterとAPI一致: {len(old_target)}件", flush=True)
                 pending_file.unlink()
+                observation_outcome("前回配備の反映済みを照合")
                 return
             print(f"前回の中断計画を検出しました（追加済 {a_done}/{len(plan['add'])}、削除済 {r_done}/{len(plan['remove'])}）。")
         else:
             plan = make_plan(None, target_path, live, acct, labels)
             if not plan['add'] and not plan['remove']:
                 print(f"変更不要：{acct} の{len(target)}フィルタが最新Masterに一致しています。", flush=True)
+                observation_outcome("変更不要")
                 return
             save_json(plan_file, plan)
         if args.verbose:
             print(f"{timestamp_prefix()}[詳細] 追加 {len(plan['add'])}件 / 削除 {len(plan['remove'])}件 / 新規ラベル {len(plan['new_label_names'])}件", flush=True)
             print(f"{timestamp_prefix()}[詳細] 計画SHA-256: {plan['approval_digest']}", flush=True)
         conflicts = [] if pending_file.exists() else deletion_preview(plan, current)
+        start_phase("[5/6] 差分内容の確認と承認")
         print("[5/6] 差分内容の確認と承認...", flush=True)
-        if args.verbose:
-            print(f"{timestamp_prefix()}[計測] 対話確認フェーズを開始（承認待ち時間を含む）", flush=True)
         show_run_plan(plan, plan_file if not pending_file.exists() else pending_file,
                       verbose=args.verbose, conflicts=conflicts)
         if pending_file.exists():
@@ -1750,6 +1901,7 @@ def cmd_run(args):
             selected = interactive_group_selection(plan)
             if not selected:
                 print("承認された変更がないため、Gmail設定は変更しません。", flush=True)
+                observation_outcome("承認辞退")
                 return
             plan = select_plan_groups(plan, selected, current=current)
             # Validate the approved subset, labels, and live snapshot BEFORE
@@ -1779,10 +1931,12 @@ def cmd_run(args):
         print("事前検証: 計画・削除ID・容量・進捗ログ・API payloadを確認済み。", flush=True)
         if not confirm_interactive("上記の内容でGmailのフィルタ設定を変更しますか？ [y/N]: "):
             print("最終承認されなかったため、Gmail設定は変更していません。", flush=True)
+            observation_outcome("承認辞退")
             return
         if not pending_file.exists():
             save_json(plan_file, plan)
             save_json(pending_file, plan)  # Save only after final approval, before API mutation.
+        start_phase("[6/6] Gmailへ配備・API読戻し検証", deployment=True)
         print("[6/6] Gmailへ配備し、APIの読戻しで検証中...", flush=True)
         result = timed_operation(
             "承認済み計画の配備（削除・追加・検証）",
@@ -1791,6 +1945,7 @@ def cmd_run(args):
                             max_batches=getattr(args, "max_batches", None)),
             args.verbose)
         if result is False:
+            observation_outcome("途中終了（保留計画を保持）")
             return
         pending_file.unlink()
         # perform's final confirmed snapshot already includes skipped rules.
@@ -1873,17 +2028,12 @@ def main(argv=None):
                                        help="指定数のバッチを照合後、保留計画を保持して終了（既定は全件）")
     args = ap.parse_args(argv)
     try:
-        max_batches = getattr(args, "max_batches", None)
-        demand(max_batches is None or max_batches > 0, "max-batchesは1以上で指定してください")
-        if args.cmd in ("plan", "apply", "verify", "run"):
-            args.expected_email = resolve_expected_email(args.expected_email)
-        started = time.perf_counter()
-        try:
+        with observe_command(args.cmd, args.verbose) if args.cmd in ("run", "apply") else nullcontext():
+            max_batches = getattr(args, "max_batches", None)
+            demand(max_batches is None or max_batches > 0, "max-batchesは1以上で指定してください")
+            if args.cmd in ("plan", "apply", "verify", "run"):
+                args.expected_email = resolve_expected_email(args.expected_email)
             args.func(args)
-        finally:
-            if args.cmd == "run" and args.verbose:
-                print(f"{timestamp_prefix()}[計測] run全体（対話確認を含む）: "
-                      f"{time.perf_counter() - started:.2f}s", flush=True)
     except DeploymentError as exc:
         print("STOP: " + str(exc), file=sys.stderr)
         return 2

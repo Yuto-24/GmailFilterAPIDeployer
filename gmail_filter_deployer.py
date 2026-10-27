@@ -40,6 +40,11 @@ KNOWN = {
     "shouldTrash", "sizeOperator", "sizeUnit",
 }
 FILTER_LIMIT = 1000
+CURRENT_NORMALIZATION = "query-v1"
+LEGACY_PLAN_SCHEMAS = ("gmail-filters-deploy-plan/v3", "gmail-filters-deploy-plan/v4")
+CURRENT_PLAN_SCHEMA = "gmail-filters-deploy-plan/v5"
+SENDER_ADDRESS = r"[A-Za-z0-9]+(?:[._+-][A-Za-z0-9]+)*@(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,63}"
+FROM_ATOM = "from:" + SENDER_ADDRESS
 
 
 class DeploymentError(Exception):
@@ -515,9 +520,54 @@ def build_template(p: dict[str, str]) -> dict:
     return {"criteria": criteria, "action": {"addLabelIds": sorted(set(adds)), "removeLabelIds": sorted(set(removes))}}
 
 
-def canonical_template(obj: dict) -> dict:
+def normalization_for_plan(plan: dict) -> str:
+    """Select one pinned interpretation; legacy plans never acquire new semantics."""
+    if plan.get("schema") in LEGACY_PLAN_SCHEMAS:
+        demand("normalization_version" not in plan, "旧計画に正規化versionが追加されています")
+        return "legacy"
+    demand(plan.get("schema") == CURRENT_PLAN_SCHEMA and
+           plan.get("normalization_version") == CURRENT_NORMALIZATION,
+           "未知または欠落した計画schema/正規化versionです。承認計画を自動変換せず停止します")
+    return CURRENT_NORMALIZATION
+
+
+def normalize_criteria(criteria: dict, *, normalization: str) -> tuple[dict, list[str]]:
+    """Normalize only whole sender disjunctions and ASCII spaces in native subject."""
+    demand(normalization in ("legacy", CURRENT_NORMALIZATION), "未知の正規化方式です")
+    result = dict(criteria)
+    reasons = []
+    if normalization == "legacy":
+        return result, reasons
+    query = result.get("query")
+    if isinstance(query, str):
+        body = query
+        # Peel candidate whole wrappers, then require the complete remaining
+        # string to match the small grammar. No partial rewrite survives failure.
+        while body.startswith("(") and body.endswith(")"):
+            body = body[1:-1]
+        if re.fullmatch(FROM_ATOM + r"(?: OR " + FROM_ATOM + r")+", body):
+            replacement = "{" + " ".join(body.split(" OR ")) + "}"
+        elif re.fullmatch(r"\{" + FROM_ATOM + r"(?: " + FROM_ATOM + r")+\}", body):
+            replacement = body
+        else:
+            replacement = query
+        if replacement != query:
+            result["query"] = replacement
+            reasons.append("query_sender_or")
+    subject = result.get("subject")
+    if isinstance(subject, str):
+        replacement = re.sub(" {2,}", " ", subject)
+        if replacement != subject:
+            result["subject"] = replacement
+            reasons.append("subject_ascii_spaces")
+    return result, reasons
+
+
+def canonical_template(obj: dict, *, normalization=CURRENT_NORMALIZATION) -> dict:
+    """Apply the pinned condition interpretation and the existing action cleanup."""
     criteria = dict(obj.get("criteria", {}))
     criteria = {k: v.strip() if isinstance(v, str) else v for k, v in criteria.items() if v not in (None, "", False)}
+    criteria, _ = normalize_criteria(criteria, normalization=normalization)
     # API may return all optional empty arrays/false values. Normalize those only.
     action = obj.get("action", {})
     adds = sorted(set(action.get("addLabelIds") or []))
@@ -528,16 +578,33 @@ def canonical_template(obj: dict) -> dict:
     return {"criteria": criteria, "action": {"addLabelIds": adds, "removeLabelIds": removes}}
 
 
-def compile_xml(path: Path) -> list[dict]:
+def normalization_note(obj: dict, *, normalization: str) -> dict | None:
+    """Retain changed criteria outside the semantic template for private diagnostics."""
+    before = canonical_template(obj, normalization="legacy")["criteria"]
+    after, reasons = normalize_criteria(before, normalization=normalization)
+    if not reasons:
+        return None
+    return {"before_criteria": dict(obj.get("criteria", {})),
+            "after_criteria": after, "reasons": reasons}
+
+
+def compile_xml(path: Path, *, normalization=CURRENT_NORMALIZATION, audit=None) -> list[dict]:
+    """Compile XML using one mode and reject duplicates after canonicalization."""
     entries = atom_entries(path)
     check_xml_rules(entries)
-    out = [canonical_template(build_template(p)) for p in entries]
+    out = []
+    for index, properties in enumerate(entries, 1):
+        raw = build_template(properties)
+        out.append(canonical_template(raw, normalization=normalization))
+        if audit is not None and (note := normalization_note(raw, normalization=normalization)):
+            audit.append({"source": "xml", "entry": index, **note})
     dups = [k for k, n in Counter(json_hash(x) for x in out).items() if n > 1]
     demand(not dups, f"API変換後に意味的重複: {len(dups)}種類。手動解決が必要")
     return out
 
 
-def live_as_template(f: dict, names_by_id: dict[str, str]) -> dict:
+def live_as_template(f: dict, names_by_id: dict[str, str], *, normalization=CURRENT_NORMALIZATION) -> dict:
+    """Map live label IDs and interpret conditions in the active plan's mode."""
     c = dict(f.get("criteria", {}))
     a = dict(f.get("action", {}))
     mapped = []
@@ -548,11 +615,21 @@ def live_as_template(f: dict, names_by_id: dict[str, str]) -> dict:
             demand(lid in names_by_id, f"不明なGmailラベルID {lid}：ラベル一覧再取得が必要")
             mapped.append("label:" + names_by_id[lid])
     a["addLabelIds"] = mapped
-    return canonical_template({"criteria": c, "action": a})
+    return canonical_template({"criteria": c, "action": a}, normalization=normalization)
 
 
-def to_api(t: dict, ids_by_name: dict[str, str]) -> dict:
-    t = canonical_template(t)
+def live_row(f: dict, names_by_id: dict[str, str], *, normalization: str) -> dict:
+    """Keep API criteria provenance beside, never inside, the comparable filter."""
+    row = {"id": f.get("id"), "filter": live_as_template(f, names_by_id, normalization=normalization)}
+    note = normalization_note(f, normalization=normalization)
+    if note is not None:
+        row["normalization"] = note
+    return row
+
+
+def to_api(t: dict, ids_by_name: dict[str, str], *, normalization=CURRENT_NORMALIZATION) -> dict:
+    """Serialize only criteria/actions using the same mode as planning and readback."""
+    t = canonical_template(t, normalization=normalization)
     a = dict(t["action"])
     new = []
     for x in a["addLabelIds"]:
@@ -694,7 +771,8 @@ def account_email(creds) -> str:
         raise DeploymentError(f"認証アカウントのemailを照合できません: {e}") from e
 
 
-def filters_with_known_labels(client, labels_by_name: dict[str, str], *, verbose=False) -> list[dict]:
+def filters_with_known_labels(client, labels_by_name: dict[str, str], *, verbose=False,
+                              normalization=CURRENT_NORMALIZATION) -> list[dict]:
     """Read live filters using labels validated by the immediately preceding pre-delete read.
 
     The next pre-delete read and the final full verification still refresh labels.
@@ -706,7 +784,7 @@ def filters_with_known_labels(client, labels_by_name: dict[str, str], *, verbose
         verbose).get("filter", [])
     demand(len(filters) <= FILTER_LIMIT, f"Gmail側フィルタ数が異常: {len(filters)}")
     try:
-        return [{"id": x.get("id"), "filter": live_as_template(x, names_by_id)} for x in filters]
+        return [live_row(x, names_by_id, normalization=normalization) for x in filters]
     except DeploymentError as exc:
         if "不明なGmailラベルID" not in str(exc):
             raise
@@ -715,11 +793,14 @@ def filters_with_known_labels(client, labels_by_name: dict[str, str], *, verbose
         if verbose:
             print(f"{timestamp_prefix()}[詳細] 未知のラベルIDを検出。"
                   "Gmailラベル・フィルタ一覧を完全再取得します", flush=True)
-        current, _ = fetch_for_deploy(client, verbose=verbose)
+        current, _ = fetch_for_deploy(client, verbose=verbose, normalization=normalization)
         return current
 
 
-def api_fetch(client, *, verbose: bool = False, retry_reads: bool = True) -> tuple[list[dict], dict[str, str]]:
+def api_fetch(client, *, verbose: bool = False, retry_reads: bool = True,
+              normalization=CURRENT_NORMALIZATION) -> tuple[list[dict], dict[str, str]]:
+    """Read Gmail settings once per resource and normalize in the selected mode."""
+    demand(normalization in ("legacy", CURRENT_NORMALIZATION), "未知の正規化方式です")
     labels = read_operation(
         "Gmail labels.list", lambda: client.users().labels().list(userId="me").execute(num_retries=0),
         verbose, retry=retry_reads).get("labels", [])
@@ -736,13 +817,13 @@ def api_fetch(client, *, verbose: bool = False, retry_reads: bool = True) -> tup
         "Gmail filters.list", lambda: client.users().settings().filters().list(userId="me").execute(num_retries=0),
         verbose, retry=retry_reads).get("filter", [])
     demand(len(filters) <= FILTER_LIMIT, f"Gmail側フィルタ数が異常: {len(filters)}")
-    normalized = [{"id": x.get("id"), "filter": live_as_template(x, names_by_id)} for x in filters]
+    normalized = [live_row(x, names_by_id, normalization=normalization) for x in filters]
     return normalized, label_names
 
 
-def fetch_for_deploy(client, verbose: bool = False):
-    """Preserve the original single-argument call for existing API mocks."""
-    return api_fetch(client, verbose=True) if verbose else api_fetch(client)
+def fetch_for_deploy(client, verbose: bool = False, *, normalization=CURRENT_NORMALIZATION):
+    """Read deployment state with the plan's pinned condition interpretation."""
+    return api_fetch(client, verbose=verbose, normalization=normalization)
 
 
 def compare_base_live(base: list[dict], target: list[dict], live: list[dict]) -> str:
@@ -819,12 +900,13 @@ def deletion_preview(plan: dict, current: list[dict]) -> list[dict]:
 def select_plan_groups(plan: dict, selected: list[str],
                        current: list[dict] | None = None) -> dict:
     """Pin a subset of groups to the original live snapshot and XML hash."""
-    demand(plan.get("schema") == "gmail-filters-deploy-plan/v3" and
+    normalization = normalization_for_plan(plan)
+    demand(plan.get("schema") in ("gmail-filters-deploy-plan/v3", CURRENT_PLAN_SCHEMA) and
            not plan.get("selected_groups"), "新規の差分計画のみ選択できます")
-    master = compile_xml(Path(plan["target_path"]))
+    master = compile_xml(Path(plan["target_path"]), normalization=normalization)
     demand(file_hash(plan["target_path"]) == plan["target_sha256"],
            "承認前にMaster XMLが変更されました。再計画してください")
-    base = [canonical_template(x) for x in plan["baseline_snapshot"]]
+    base = [canonical_template(x, normalization=normalization) for x in plan["baseline_snapshot"]]
     intended = selected_master_target(master, base, selected)
     added, candidate_removals = delta(base, intended)
     skipped = classify_deletion_conflicts(candidate_removals, base, current)
@@ -844,7 +926,8 @@ def select_plan_groups(plan: dict, selected: list[str],
            f"Gmailの上限{FILTER_LIMIT}件を超えます。最終承認前に処理を見直してください")
     from copy import deepcopy
     new_plan = deepcopy(plan)
-    new_plan["schema"] = "gmail-filters-deploy-plan/v4"
+    new_plan["schema"] = ("gmail-filters-deploy-plan/v4" if normalization == "legacy"
+                          else CURRENT_PLAN_SCHEMA)
     new_plan["skipped_deletions"] = skipped
     new_plan["selected_groups"] = sorted(selected)
     new_plan["target_size"] = len(effective)
@@ -883,9 +966,26 @@ def interactive_group_selection(plan: dict) -> list[str]:
 
 
 def make_plan(base_path: Path | None, target_path: Path, live: list[dict], acct: str, labels: dict,
-              extra_baselines: list[Path] | None = None) -> dict:
+              extra_baselines: list[Path] | None = None, *, normalization=CURRENT_NORMALIZATION,
+              live_rows=None) -> dict:
     """Build a pinned, fully reviewed diff from a live API snapshot by default."""
-    target = compile_xml(target_path)
+    audit = []
+    target = compile_xml(target_path, normalization=normalization, audit=audit)
+    raw_live = live
+    if live_rows is not None:
+        raw_live = [{"criteria": row.get("normalization", {}).get(
+            "before_criteria", row["filter"]["criteria"]), "action": row["filter"]["action"]}
+            for row in live_rows]
+        demand(counter(canonical_template(row, normalization=normalization) for row in raw_live) ==
+               counter(canonical_template(row, normalization=normalization) for row in live),
+               "API条件の正規化診断情報がフィルタと一致しません")
+    legacy_live = [canonical_template(row, normalization="legacy") for row in raw_live]
+    live = [canonical_template(row, normalization=normalization) for row in live]
+    if normalization != "legacy":
+        for index, raw in enumerate(raw_live):
+            if note := normalization_note(raw, normalization=normalization):
+                source = {"filter_id": live_rows[index].get("id")} if live_rows is not None else {"entry": index + 1}
+                audit.append({"source": "api", **source, **note})
     validate_delete_label_only(target)
     if base_path is None:
         demand(not extra_baselines, "--also-baselineは--baseとともに指定してください")
@@ -893,7 +993,7 @@ def make_plan(base_path: Path | None, target_path: Path, live: list[dict], acct:
         base = list(live)
     else:
         baseline_paths = [base_path] + (extra_baselines or [])
-        valid = [(p, compile_xml(p)) for p in baseline_paths]
+        valid = [(p, compile_xml(p, normalization=normalization)) for p in baseline_paths]
         status = next(((p, b) for p, b in valid if counter(live) == counter(b)), None)
         if counter(live) == counter(target):
             status = (target_path, target)
@@ -912,7 +1012,7 @@ def make_plan(base_path: Path | None, target_path: Path, live: list[dict], acct:
     existing_labels = set(labels)
     new_labels = sorted(set(x[6:] for t in adds for x in t["action"]["addLabelIds"] if x.startswith("label:")) - existing_labels)
     plan = {
-        "schema": "gmail-filters-deploy-plan/v3",
+        "schema": "gmail-filters-deploy-plan/v3" if normalization == "legacy" else CURRENT_PLAN_SCHEMA,
         "operation_order": "remove_first",
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "account": acct,
@@ -935,30 +1035,33 @@ def make_plan(base_path: Path | None, target_path: Path, live: list[dict], acct:
         "trash_add_count": sum(is_trash(x) for x in adds),
         "trash_remove_count": sum(is_trash(x) for x in removes),
     }
+    if normalization != "legacy":
+        legacy_target = compile_xml(target_path, normalization="legacy")
+        plan["normalization_version"] = normalization
+        plan["normalization_audit"] = audit
+        plan["normalization_matched"] = (sum((counter(live) & counter(target)).values()) -
+                                         sum((counter(legacy_live) & counter(legacy_target)).values()))
     plan["approval_digest"] = json_hash({k: v for k, v in plan.items() if k not in {"created_utc", "approval_digest"}})
     return plan
 
 
 def planned_states(plan: dict):
     """Pin actual baseline and target to the approved plan, including resume."""
-    master = compile_xml(Path(plan["target_path"]))
+    normalization = normalization_for_plan(plan)
+    master = compile_xml(Path(plan["target_path"]), normalization=normalization)
     validate_delete_label_only(master)
     demand(file_hash(plan["target_path"]) == plan["target_sha256"], "計画作成後にTarget XMLが変わりました")
     source = plan.get("baseline_path")
     if source:
-        base = compile_xml(Path(source))
+        base = compile_xml(Path(source), normalization=normalization)
         demand(file_hash(source) == plan["baseline_sha256"], "計画作成後に基準XMLが変わりました")
     else:
-        demand(plan.get("schema") in ("gmail-filters-deploy-plan/v3", "gmail-filters-deploy-plan/v4"),
-               "旧版の配備計画は実行できません。実Gmailの状態を確認してください")
-        base = [canonical_template(x) for x in plan["baseline_snapshot"]]
+        base = [canonical_template(x, normalization=normalization) for x in plan["baseline_snapshot"]]
     demand(counter(base) == counter(plan["baseline_snapshot"]), "プランの基準スナップショットが変わりました")
     demand(tokens_digest(base) == plan["live_snapshot_hash"], "基準スナップショットのハッシュが不一致")
-    demand(plan.get("schema") in ("gmail-filters-deploy-plan/v3", "gmail-filters-deploy-plan/v4"),
-           "旧形式の配備計画は適用できません。途中状態を手動照合してください")
     demand(plan.get("operation_order", "add_first") in ("remove_first", "add_first"),
            "配備順序の指定が不正です")
-    if plan.get("schema") == "gmail-filters-deploy-plan/v4":
+    if plan.get("schema") == "gmail-filters-deploy-plan/v4" or "selected_groups" in plan:
         demand("selected_groups" in plan, "承認グループ情報がありません")
         intended = selected_master_target(master, base, plan["selected_groups"])
         skips = plan.get("skipped_deletions", [])
@@ -1189,6 +1292,7 @@ def perform_batched(client, plan, base, target, current, labels, log, batch_size
     them until the next checkpoint. Resume always validates the expected state and
     any in-flight subset against a fresh API snapshot before sending anything.
     """
+    normalization = normalization_for_plan(plan)
     adds, removes = batch_progress(base, plan, current, log, labels)
     state = json.loads(log.read_text(encoding="utf-8")) if log.exists() else {
         "account": plan["account"], "plan_digest": plan["approval_digest"], "events": []}
@@ -1200,6 +1304,7 @@ def perform_batched(client, plan, base, target, current, labels, log, batch_size
     sent_batches = 0
 
     def checkpoint(rows, now_labels, a, r, *, confirmed=False):
+        """Persist expected rows and distinguish acknowledged from readback-confirmed progress."""
         state["batch_checkpoint"] = {"schema": 1, "rows": rows, "labels": dict(now_labels),
                                      "add": sorted(a), "remove": sorted(r), "pending": None,
                                      "readback_confirmed": confirmed}
@@ -1212,7 +1317,7 @@ def perform_batched(client, plan, base, target, current, labels, log, batch_size
         """Reconcile without writes; failed batches keep intent for exact-subset resume."""
         pending = state["batch_checkpoint"].get("pending")
         for attempt in range(len(READBACK_DELAYS_SECONDS) + 1):
-            rows, now_labels = api_fetch(client, verbose=verbose, retry_reads=False)
+            rows, now_labels = api_fetch(client, verbose=verbose, retry_reads=False, normalization=normalization)
             try:
                 a, r = batch_progress(base, plan, rows, log, now_labels)
             except DeploymentError as exc:
@@ -1249,6 +1354,7 @@ def perform_batched(client, plan, base, target, current, labels, log, batch_size
         raise AssertionError("unreachable readback")
 
     def confirm_checkpoint():
+        """Refresh deployment state and persist it as fully readback-confirmed."""
         nonlocal current, labels, adds, removes, since_readback
         current, labels, adds, removes = readback()
         checkpoint(current, labels, adds, removes, confirmed=True)
@@ -1257,6 +1363,7 @@ def perform_batched(client, plan, base, target, current, labels, log, batch_size
               f"追加済み: {len(adds)}/{len(plan['add'])}（全件照合済み）", flush=True)
 
     def budget_exhausted():
+        """Confirm outstanding writes before stopping at the requested batch limit."""
         if max_batches is not None and sent_batches >= max_batches:
             if since_readback:
                 confirm_checkpoint()
@@ -1286,9 +1393,10 @@ def perform_batched(client, plan, base, target, current, labels, log, batch_size
                 label_recovery_attempted = False
 
                 def reconcile_label():
+                    """Resolve a label creation outcome while rejecting unrelated filter or label changes."""
                     nonlocal label_recovery_attempted
                     label_recovery_attempted = True
-                    rows, now = api_fetch(client, verbose=verbose, retry_reads=False)
+                    rows, now = api_fetch(client, verbose=verbose, retry_reads=False, normalization=normalization)
                     demand(filter_snapshot(rows) == filter_snapshot(current),
                            "ラベル作成中にフィルタ設定が変更されました")
                     if name in now:
@@ -1302,10 +1410,12 @@ def perform_batched(client, plan, base, target, current, labels, log, batch_size
                 save_json(log, state)
 
                 def record(event):
+                    """Persist a recovery event with the label creation context."""
                     state["events"].append({**event, "operation": "create_label", "name": name})
                     save_json(log, state)
 
                 def send_label():
+                    """Attempt label creation once and reset the recovery-read marker."""
                     nonlocal label_recovery_attempted
                     label_recovery_attempted = False
                     return client.users().labels().create(userId="me", body={
@@ -1348,7 +1458,8 @@ def perform_batched(client, plan, base, target, current, labels, log, batch_size
                     request = client.users().settings().filters().delete(userId="me", id=ids[str(i)])
                 else:
                     demand(not any(row["filter"] == rule for row in current), "追加対象が既に存在します")
-                    request = client.users().settings().filters().create(userId="me", body=to_api(rule, labels))
+                    request = client.users().settings().filters().create(userId="me", body=to_api(rule, labels,
+                                                                                              normalization=normalization))
                 requests.append((i, request))
             pending = {"kind": kind, "steps": steps, "ids": ids, "successes": {}, "errors": {},
                        "error_details": {}, "transport": "single" if batch_size == 1 else "batch"}
@@ -1356,6 +1467,7 @@ def perform_batched(client, plan, base, target, current, labels, log, batch_size
             save_json(log, state)
 
             def callback(request_id, response, exception):
+                """Validate a batch response ID and persist its success or failure before continuing."""
                 demand(request_id in {str(i) for i in steps} and
                        request_id not in pending["successes"] and request_id not in pending["errors"],
                        "バッチ応答IDが不正です")
@@ -1384,9 +1496,10 @@ def perform_batched(client, plan, base, target, current, labels, log, batch_size
                 recovery_attempted = False
 
                 def reconcile_single():
+                    """Resolve the current serial mutation against a fresh snapshot in the pinned mode."""
                     nonlocal recovery_attempted, since_readback
                     recovery_attempted = True
-                    rows, now = api_fetch(client, verbose=verbose, retry_reads=False)
+                    rows, now = api_fetch(client, verbose=verbose, retry_reads=False, normalization=normalization)
                     a, r = batch_progress(base, plan, rows, log, now)
                     state.update(completed_add=len(a), completed_remove=len(r))
                     save_json(log, state)
@@ -1399,11 +1512,13 @@ def perform_batched(client, plan, base, target, current, labels, log, batch_size
                     return True, {"id": fid}
 
                 def record_single(event):
+                    """Persist a recovery event with its filter operation and step."""
                     state["events"].append({**event, "operation": "delete_filter" if kind == "remove" else "create_filter",
                                             "step": i + 1})
                     save_json(log, state)
 
                 def send_single():
+                    """Execute the serial request once without SDK retries."""
                     nonlocal recovery_attempted
                     recovery_attempted = False
                     return request.execute(num_retries=0)
@@ -1489,6 +1604,7 @@ def validate_batch_limit(log, batch_size, max_batches):
 def validate_before_final_approval(plan: dict, expected_email: str, log: Path,
                                    batch_size: int, current: list[dict], max_batches=None) -> None:
     """Check all locally decidable execution invariants before consent."""
+    normalization = normalization_for_plan(plan)
     demand(expected_email.lower() == plan["account"].lower(),
            "承認対象のGmailアカウントが認証アカウントと異なります")
     demand(1 <= batch_size <= 25, "batch-sizeは1〜25件で指定してください")
@@ -1521,11 +1637,13 @@ def validate_before_final_approval(plan: dict, expected_email: str, log: Path,
     labels.update({name: name for name in plan["expected_label_names"]})
     for i, rule in enumerate(plan["add"]):
         if i not in added:
-            to_api(rule, labels)
+            to_api(rule, labels, normalization=normalization)
 
 
 def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_size=1, verbose=False,
             max_batches=None, readback_interval=50):
+    """Validate the approved plan and resume deployment using its pinned interpretation."""
+    normalization = normalization_for_plan(plan)
     demand(expected.lower() == plan["account"].lower(), "対象アカウントが承認計画と不一致")
     demand(digest == plan["approval_digest"], "承認ハッシュが一致しません")
     demand(plan["approval_digest"] == json_hash(
@@ -1540,7 +1658,7 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
     peak = max(len(base), len(target)) if order == "remove_first" else len(base) + len(plan["add"])
     demand(peak <= FILTER_LIMIT,
            f"配備中の最大フィルタ数{peak}件がGmail上限{FILTER_LIMIT}件を超えます")
-    current, labels = fetch_for_deploy(client, verbose=verbose)
+    current, labels = fetch_for_deploy(client, verbose=verbose, normalization=normalization)
     return perform_batched(client, plan, base, target, current, labels, log, batch_size, verbose,
                            max_batches, readback_interval)
 
@@ -1552,6 +1670,8 @@ def verify_partial(client, base: list[dict], plan: dict, add_count: int, remove_
                    *, verbose=False, label_cache: dict[str, str] | None = None,
                    expected_filter_ids: set[str] | None = None,
                    diagnostic_dir: Path | None = None):
+    """Read back the expected progress in the plan mode without issuing mutations."""
+    normalization = normalization_for_plan(plan)
     expected = prefix_counts(base, plan, add_count, remove_count)
 
     # A mismatching Gmail list may be transient immediately after a mutation.
@@ -1560,9 +1680,9 @@ def verify_partial(client, base: list[dict], plan: dict, add_count: int, remove_
     attempts = len(READBACK_DELAYS_SECONDS) + 1
     for attempt in range(attempts):
         if label_cache is None:
-            current, _ = fetch_for_deploy(client, verbose=verbose)
+            current, _ = fetch_for_deploy(client, verbose=verbose, normalization=normalization)
         else:
-            current = filters_with_known_labels(client, label_cache, verbose=verbose)
+            current = filters_with_known_labels(client, label_cache, verbose=verbose, normalization=normalization)
         actual = counter([x["filter"] for x in current])
         if expected == actual:
             if attempt:
@@ -1629,8 +1749,9 @@ def verify_partial(client, base: list[dict], plan: dict, add_count: int, remove_
 
 
 def cmd_validate(args):
+    """Validate XML offline under the current normalization and report optional baseline differences."""
     target_path = select_master(args.local_dir, args.target)
-    target = compile_xml(target_path)
+    target = compile_xml(target_path, normalization=CURRENT_NORMALIZATION)
     report = {
         "target": str(target_path), "target_sha256": file_hash(target_path),
         "target_health": check_xml_rules(atom_entries(target_path)),
@@ -1638,7 +1759,7 @@ def cmd_validate(args):
         "action_delete_label_only": True,
     }
     if args.base:
-        base = compile_xml(args.base)
+        base = compile_xml(args.base, normalization=CURRENT_NORMALIZATION)
         added, removed = delta(base, target)
         demand(len(base) + len(added) <= FILTER_LIMIT, "追加先行時にGmail上限1000件を超えます")
         report.update({"base": str(args.base), "base_sha256": file_hash(args.base),
@@ -1655,12 +1776,14 @@ def cmd_validate(args):
 
 
 def cmd_plan(args):
+    """Save a read-only live-to-Master plan with the current normalization and audit."""
     target_path = select_master(args.local_dir, args.target)
     client, creds = get_client(args.client_secrets, args.token)
     acct = account_email(creds)
     demand(acct == args.expected_email.lower(), f"Googleアカウント不一致: {acct} != {args.expected_email}")
-    current, labels = api_fetch(client)
-    plan = make_plan(args.base, target_path, [x["filter"] for x in current], acct, labels, args.also_baseline or [])
+    current, labels = api_fetch(client, normalization=CURRENT_NORMALIZATION)
+    plan = make_plan(args.base, target_path, [x["filter"] for x in current], acct, labels,
+                     args.also_baseline or [], normalization=CURRENT_NORMALIZATION, live_rows=current)
     save_json(args.out, plan)
     print(json.dumps({"account": acct, "current": len(current), "target": plan["target_size"],
                       "master": str(target_path), "add": len(plan["add"]), "remove": len(plan["remove"]),
@@ -1671,12 +1794,14 @@ def cmd_plan(args):
                       "trash_add": plan["trash_add_count"],
                       "trash_remove": plan["trash_remove_count"]}, ensure_ascii=False, indent=2))
     print("ドライランのみ。Gmailは変更していません。削除対象はplan.jsonで必ず確認してください")
+    show_normalization_summary(plan)
 
 
 def cmd_apply(args):
     """Apply a pinned approved plan with authentication and deployment timing phases."""
     start_phase("[1/3] 承認計画の読込み")
     plan = json.loads(args.plan.read_text(encoding="utf-8"))
+    normalization_for_plan(plan)  # Reject unknown interpretations before OAuth/API access.
     start_phase("[2/3] Google OAuth認証とアカウント照合")
     client, creds = get_client(args.client_secrets, args.token, allow_auth=False)
     acct = account_email(creds)
@@ -1691,11 +1816,12 @@ def cmd_apply(args):
 
 
 def cmd_verify(args):
+    """Compare live settings with Master under the current normalization and reject differences."""
     client, creds = get_client(args.client_secrets, args.token, allow_auth=False)
     acct = account_email(creds)
     demand(acct == args.expected_email.lower(), "認証アカウント不一致")
-    target = compile_xml(select_master(args.local_dir, args.target))
-    current, _ = api_fetch(client)
+    target = compile_xml(select_master(args.local_dir, args.target), normalization=CURRENT_NORMALIZATION)
+    current, _ = api_fetch(client, normalization=CURRENT_NORMALIZATION)
     actual = [x["filter"] for x in current]
     adds, removes = delta(target, actual)
     report = {"account": acct, "target": len(target), "live": len(actual),
@@ -1712,6 +1838,32 @@ def format_filter_summary(row: dict) -> str:
     criteria = json.dumps(row["criteria"], ensure_ascii=False, sort_keys=True)
     action = json.dumps(row["action"], ensure_ascii=False, sort_keys=True)
     return f"条件={criteria} / 処理={action}"
+
+
+def show_normalization_summary(plan: dict, *, verbose=False) -> None:
+    """Explain established equivalences without guessing pairs for remaining changes."""
+    if normalization_for_plan(plan) == "legacy":
+        return
+    matched = plan.get("normalization_matched", 0)
+    if matched:
+        print(f"表記を統一して一致したルール: {matched}件（変更不要）", flush=True)
+    uncertain = False
+    for row in plan["add"] + plan["remove"]:
+        criteria = row["criteria"]
+        query = criteria.get("query")
+        if (query and not re.fullmatch(r"\{" + FROM_ATOM + r"(?: " + FROM_ATOM + r")+\}", query)
+                or criteria.get("negatedQuery")
+                or " OR " in criteria.get("from", "")
+                or "{" in criteria.get("subject", "")):
+            uncertain = True
+    if uncertain:
+        print("同等性未確認: 対象外のquery式・否定・from/subject等のフィールド間移動は"
+              "自動判定しません。追加と削除をそれぞれ確認してください。", flush=True)
+    if verbose:
+        for note in plan.get("normalization_audit", []):
+            print(f"[正規化] {note['source']} / 理由={','.join(note['reasons'])} / "
+                  f"変換前={json.dumps(note['before_criteria'], ensure_ascii=False, sort_keys=True)} / "
+                  f"変換後={json.dumps(note['after_criteria'], ensure_ascii=False, sort_keys=True)}", flush=True)
 
 
 def show_group_details(plan: dict, group: str) -> tuple[int, int]:
@@ -1786,10 +1938,10 @@ def confirm_interactive(prompt: str = "上記の変更をGmailに反映します
     return answer in {"y", "yes"}
 
 
-def read_gmail_filters_preflight(client):
+def read_gmail_filters_preflight(client, *, normalization=CURRENT_NORMALIZATION):
     """Report API configuration/read errors before any Gmail writes can occur."""
     try:
-        return api_fetch(client)
+        return api_fetch(client, normalization=normalization)
     except Exception as exc:
         message = str(exc)
         if "accessNotConfigured" in message or "Gmail API has not been used" in message:
@@ -1818,6 +1970,7 @@ def cmd_run(args):
     """
     @contextmanager
     def exclusive_lock(path: Path):
+        """Prevent concurrent run commands while the local plan and journal are in use."""
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open('a+b') as lockfile:
             try:
@@ -1839,10 +1992,13 @@ def cmd_run(args):
                     pass
 
     with exclusive_lock(args.local_dir / 'run.lock'):
+        pending_file = args.local_dir / 'run_pending.json'
+        pending_plan = json.loads(pending_file.read_text(encoding='utf-8')) if pending_file.exists() else None
+        normalization = normalization_for_plan(pending_plan) if pending_plan is not None else CURRENT_NORMALIZATION
         start_phase("[1/6] 最新Master XMLを選択・検証")
         print("[1/6] 最新Master XMLを選択・検証中...", flush=True)
         target_path = select_master(args.local_dir, args.target)
-        target = compile_xml(target_path)  # Offline preflight before OAuth.
+        target = compile_xml(target_path, normalization=normalization)  # Offline preflight before OAuth.
         print(f"      検証完了: {target_path.name}（{len(target)}件）", flush=True)
         if args.verbose:
             print(f"{timestamp_prefix()}[詳細] Master SHA-256: {file_hash(target_path)}", flush=True)
@@ -1856,17 +2012,14 @@ def cmd_run(args):
         print("[3/6] Gmailの現行ラベル・フィルタを取得中...", flush=True)
         current, labels = timed_operation(
             "Gmail初期フィルタ・ラベル取得",
-            lambda: read_gmail_filters_preflight(client), args.verbose)
+            lambda: read_gmail_filters_preflight(client, normalization=normalization), args.verbose)
         live = [x['filter'] for x in current]
         print(f"      取得完了: {len(live)}フィルタ / {len(labels)}ラベル", flush=True)
         start_phase("[4/6] 変更差分と保護ルールの照合")
         print("[4/6] 変更差分と保護ルールを照合中...", flush=True)
-        pending_file = args.local_dir / 'run_pending.json'
         plan_file = args.local_dir / 'run_plan.json'
-        if pending_file.exists():
-            plan = json.loads(pending_file.read_text(encoding='utf-8'))
-            demand(plan.get('schema') in ('gmail-filters-deploy-plan/v3','gmail-filters-deploy-plan/v4'),
-                   '旧版の配備計画が残っています。途中状態を確認してください')
+        if pending_plan is not None:
+            plan = pending_plan
             demand(plan['account'] == acct, '途中計画のアカウントが一致しません')
             demand(plan['target_path'] == str(target_path.resolve()), '途中計画の対象Masterと現行Masterが異なります。再開を停止しました')
             base, old_target = planned_states(plan)
@@ -1890,8 +2043,12 @@ def cmd_run(args):
                 return
             print(f"前回の中断計画を検出しました（追加済 {a_done}/{len(plan['add'])}、削除済 {r_done}/{len(plan['remove'])}）。")
         else:
-            plan = make_plan(None, target_path, live, acct, labels)
+            plan = make_plan(None, target_path, live, acct, labels, normalization=normalization,
+                             live_rows=current)
+            show_normalization_summary(plan, verbose=args.verbose)
             if not plan['add'] and not plan['remove']:
+                if normalization != "legacy":
+                    save_json(plan_file, plan)  # Preserve the audit even when no writes are needed.
                 print(f"変更不要：{acct} の{len(target)}フィルタが最新Masterに一致しています。", flush=True)
                 observation_outcome("変更不要")
                 return
@@ -1921,7 +2078,7 @@ def cmd_run(args):
             # Validate the approved subset, labels, and live snapshot BEFORE
             # the final question. Keep this check read-only.
             planned_states(plan)
-            refreshed, _ = api_fetch(client, verbose=args.verbose)
+            refreshed, _ = api_fetch(client, verbose=args.verbose, normalization=normalization)
             demand(counter(x["filter"] for x in refreshed) == counter(live),
                    "承認操作中にGmail側でフィルタ設定が変更されました。再実行して差分を更新してください")
             skipped = plan["skipped_deletions"]
@@ -1938,7 +2095,7 @@ def cmd_run(args):
             print(f"実行件数: 追加 {len(plan['add'])}件 / 削除 {len(plan['remove'])}件"
                   f" / スキップ {len(plan['skipped_deletions'])}件", flush=True)
         # Every deterministic precondition is checked BEFORE final [y/N].
-        latest = api_fetch(client, verbose=args.verbose)[0] if pending_file.exists() else refreshed
+        latest = api_fetch(client, verbose=args.verbose, normalization=normalization)[0] if pending_file.exists() else refreshed
         journal = args.local_dir / 'logs' / (plan['approval_digest'] + '.json')
         validate_before_final_approval(plan, acct, journal, args.batch_size, latest,
                                        max_batches=getattr(args, "max_batches", None))
@@ -1964,7 +2121,7 @@ def cmd_run(args):
         pending_file.unlink()
         # perform's final confirmed snapshot already includes skipped rules.
         actual = result["rows"]
-        master = compile_xml(target_path)
+        master = compile_xml(target_path, normalization=normalization)
         master_only, gmail_only = delta([x["filter"] for x in actual], master)
         skipped = plan.get("skipped_deletions", [])
         print("\n【配備結果】", flush=True)

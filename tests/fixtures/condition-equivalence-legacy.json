@@ -1,0 +1,450 @@
+{
+  "generated_from": "f2240c9b662fbc4c510ac3f353540f133b8d1c00",
+  "master_xml": "<?xml version='1.0' encoding='utf-8'?>\n<feed xmlns=\"http://www.w3.org/2005/Atom\" xmlns:apps=\"http://schemas.google.com/apps/2006\"><entry><apps:property name=\"hasTheWord\" value=\"from:a@example.invalid OR from:b@example.invalid\" /><apps:property name=\"subject\" value=\"meeting  reminder\" /><apps:property name=\"label\" value=\"Type/Test\" /></entry><entry><apps:property name=\"from\" value=\"new@example.invalid\" /><apps:property name=\"label\" value=\"Type/Test\" /></entry><entry><apps:property name=\"hasTheWord\" value=\"from:c@example.invalid OR from:d@example.invalid\" /><apps:property name=\"subject\" value=\"new  reminder\" /><apps:property name=\"label\" value=\"Type/Test\" /></entry></feed>",
+  "baseline_templates": [
+    {
+      "criteria": {
+        "subject": "meeting  reminder",
+        "query": "(from:a@example.invalid OR from:b@example.invalid)"
+      },
+      "action": {
+        "addLabelIds": [
+          "label:Type/Test"
+        ],
+        "removeLabelIds": []
+      }
+    },
+    {
+      "criteria": {
+        "from": "obsolete@example.invalid"
+      },
+      "action": {
+        "addLabelIds": [
+          "label:Type/Test"
+        ],
+        "removeLabelIds": []
+      }
+    }
+  ],
+  "target_templates": [
+    {
+      "criteria": {
+        "subject": "meeting  reminder",
+        "query": "(from:a@example.invalid OR from:b@example.invalid)"
+      },
+      "action": {
+        "addLabelIds": [
+          "label:Type/Test"
+        ],
+        "removeLabelIds": []
+      }
+    },
+    {
+      "criteria": {
+        "from": "new@example.invalid"
+      },
+      "action": {
+        "addLabelIds": [
+          "label:Type/Test"
+        ],
+        "removeLabelIds": []
+      }
+    },
+    {
+      "criteria": {
+        "subject": "new  reminder",
+        "query": "(from:c@example.invalid OR from:d@example.invalid)"
+      },
+      "action": {
+        "addLabelIds": [
+          "label:Type/Test"
+        ],
+        "removeLabelIds": []
+      }
+    }
+  ],
+  "cases": {
+    "v3": {
+      "plan": {
+        "schema": "gmail-filters-deploy-plan/v3",
+        "operation_order": "remove_first",
+        "created_utc": "2026-10-26T00:00:00+00:00",
+        "account": "legacy@example.invalid",
+        "baseline_path": null,
+        "baseline_sha256": null,
+        "baseline_snapshot": [
+          {
+            "criteria": {
+              "subject": "meeting  reminder",
+              "query": "(from:a@example.invalid OR from:b@example.invalid)"
+            },
+            "action": {
+              "addLabelIds": [
+                "label:Type/Test"
+              ],
+              "removeLabelIds": []
+            }
+          },
+          {
+            "criteria": {
+              "from": "obsolete@example.invalid"
+            },
+            "action": {
+              "addLabelIds": [
+                "label:Type/Test"
+              ],
+              "removeLabelIds": []
+            }
+          }
+        ],
+        "target_path": "/synthetic-legacy/master.xml",
+        "target_sha256": "311faf42bb3fd0f39ce6b40f85c7a7d5b641e6de396c4981d2f9496903fa6a66",
+        "baseline_size": 2,
+        "target_size": 3,
+        "live_snapshot_hash": "94df0274a071c0c2ac658c549e1b1a60c86150b59bbffa29fa02f7c81fedad27",
+        "expected_label_names": [
+          "Type/Test"
+        ],
+        "new_label_names": [],
+        "add": [
+          {
+            "criteria": {
+              "subject": "new  reminder",
+              "query": "(from:c@example.invalid OR from:d@example.invalid)"
+            },
+            "action": {
+              "addLabelIds": [
+                "label:Type/Test"
+              ],
+              "removeLabelIds": []
+            }
+          },
+          {
+            "criteria": {
+              "from": "new@example.invalid"
+            },
+            "action": {
+              "addLabelIds": [
+                "label:Type/Test"
+              ],
+              "removeLabelIds": []
+            }
+          }
+        ],
+        "remove": [
+          {
+            "criteria": {
+              "from": "obsolete@example.invalid"
+            },
+            "action": {
+              "addLabelIds": [
+                "label:Type/Test"
+              ],
+              "removeLabelIds": []
+            }
+          }
+        ],
+        "current_delete_count": 0,
+        "target_delete_count": 0,
+        "current_trash_count": 0,
+        "target_trash_count": 0,
+        "trash_add_count": 0,
+        "trash_remove_count": 0,
+        "approval_digest": "9bece5c498fb271db1fdb8d14974a39485d332c3ea23a6213de6174489b1bb4e"
+      },
+      "journal": {
+        "account": "legacy@example.invalid",
+        "acknowledged_add": 0,
+        "acknowledged_remove": 1,
+        "batch_checkpoint": {
+          "add": [],
+          "labels": {
+            "Type/Test": "Label_1"
+          },
+          "pending": null,
+          "readback_confirmed": true,
+          "remove": [
+            0
+          ],
+          "rows": [
+            {
+              "filter": {
+                "action": {
+                  "addLabelIds": [
+                    "label:Type/Test"
+                  ],
+                  "removeLabelIds": []
+                },
+                "criteria": {
+                  "query": "(from:a@example.invalid OR from:b@example.invalid)",
+                  "subject": "meeting  reminder"
+                }
+              },
+              "id": "filter_1"
+            }
+          ],
+          "schema": 1
+        },
+        "completed_add": 0,
+        "completed_remove": 1,
+        "events": [
+          {
+            "error_details": {},
+            "errors": {},
+            "kind": "filter_batch",
+            "operation": "remove",
+            "steps": [
+              0
+            ],
+            "successes": {
+              "0": "filter_2"
+            },
+            "timestamp_utc": "2026-10-26T00:00:00+00:00",
+            "transport": "batch"
+          }
+        ],
+        "plan_digest": "9bece5c498fb271db1fdb8d14974a39485d332c3ea23a6213de6174489b1bb4e",
+        "readback_interval": 50,
+        "serial_recovery": false,
+        "verified": false
+      },
+      "api_filters": [
+        {
+          "id": "filter_1",
+          "criteria": {
+            "subject": "meeting  reminder",
+            "query": "(from:a@example.invalid OR from:b@example.invalid)"
+          },
+          "action": {
+            "addLabelIds": [
+              "Label_1"
+            ],
+            "removeLabelIds": []
+          }
+        }
+      ],
+      "id_to_label": {
+        "Label_1": "Type/Test"
+      },
+      "next_id": 2,
+      "expected_remaining_payloads": [
+        {
+          "criteria": {
+            "subject": "new  reminder",
+            "query": "(from:c@example.invalid OR from:d@example.invalid)"
+          },
+          "action": {
+            "addLabelIds": [
+              "Label_1"
+            ],
+            "removeLabelIds": []
+          }
+        },
+        {
+          "criteria": {
+            "from": "new@example.invalid"
+          },
+          "action": {
+            "addLabelIds": [
+              "Label_1"
+            ],
+            "removeLabelIds": []
+          }
+        }
+      ]
+    },
+    "v4": {
+      "plan": {
+        "schema": "gmail-filters-deploy-plan/v4",
+        "operation_order": "remove_first",
+        "created_utc": "2026-10-26T00:00:00+00:00",
+        "account": "legacy@example.invalid",
+        "baseline_path": null,
+        "baseline_sha256": null,
+        "baseline_snapshot": [
+          {
+            "criteria": {
+              "subject": "meeting  reminder",
+              "query": "(from:a@example.invalid OR from:b@example.invalid)"
+            },
+            "action": {
+              "addLabelIds": [
+                "label:Type/Test"
+              ],
+              "removeLabelIds": []
+            }
+          },
+          {
+            "criteria": {
+              "from": "obsolete@example.invalid"
+            },
+            "action": {
+              "addLabelIds": [
+                "label:Type/Test"
+              ],
+              "removeLabelIds": []
+            }
+          }
+        ],
+        "target_path": "/synthetic-legacy/master.xml",
+        "target_sha256": "311faf42bb3fd0f39ce6b40f85c7a7d5b641e6de396c4981d2f9496903fa6a66",
+        "baseline_size": 2,
+        "target_size": 3,
+        "live_snapshot_hash": "94df0274a071c0c2ac658c549e1b1a60c86150b59bbffa29fa02f7c81fedad27",
+        "expected_label_names": [
+          "Type/Test"
+        ],
+        "new_label_names": [],
+        "add": [
+          {
+            "criteria": {
+              "subject": "new  reminder",
+              "query": "(from:c@example.invalid OR from:d@example.invalid)"
+            },
+            "action": {
+              "addLabelIds": [
+                "label:Type/Test"
+              ],
+              "removeLabelIds": []
+            }
+          },
+          {
+            "criteria": {
+              "from": "new@example.invalid"
+            },
+            "action": {
+              "addLabelIds": [
+                "label:Type/Test"
+              ],
+              "removeLabelIds": []
+            }
+          }
+        ],
+        "remove": [
+          {
+            "criteria": {
+              "from": "obsolete@example.invalid"
+            },
+            "action": {
+              "addLabelIds": [
+                "label:Type/Test"
+              ],
+              "removeLabelIds": []
+            }
+          }
+        ],
+        "current_delete_count": 0,
+        "target_delete_count": 0,
+        "current_trash_count": 0,
+        "target_trash_count": 0,
+        "trash_add_count": 0,
+        "trash_remove_count": 0,
+        "approval_digest": "46dd257050520aadab923b6cfa3369bfa7aead7fbd81bd11645e468c0d691787",
+        "skipped_deletions": [],
+        "selected_groups": [
+          "other"
+        ]
+      },
+      "journal": {
+        "account": "legacy@example.invalid",
+        "acknowledged_add": 0,
+        "acknowledged_remove": 1,
+        "batch_checkpoint": {
+          "add": [],
+          "labels": {
+            "Type/Test": "Label_1"
+          },
+          "pending": null,
+          "readback_confirmed": true,
+          "remove": [
+            0
+          ],
+          "rows": [
+            {
+              "filter": {
+                "action": {
+                  "addLabelIds": [
+                    "label:Type/Test"
+                  ],
+                  "removeLabelIds": []
+                },
+                "criteria": {
+                  "query": "(from:a@example.invalid OR from:b@example.invalid)",
+                  "subject": "meeting  reminder"
+                }
+              },
+              "id": "filter_1"
+            }
+          ],
+          "schema": 1
+        },
+        "completed_add": 0,
+        "completed_remove": 1,
+        "events": [
+          {
+            "error_details": {},
+            "errors": {},
+            "kind": "filter_batch",
+            "operation": "remove",
+            "steps": [
+              0
+            ],
+            "successes": {
+              "0": "filter_2"
+            },
+            "timestamp_utc": "2026-10-26T00:00:00+00:00",
+            "transport": "batch"
+          }
+        ],
+        "plan_digest": "46dd257050520aadab923b6cfa3369bfa7aead7fbd81bd11645e468c0d691787",
+        "readback_interval": 50,
+        "serial_recovery": false,
+        "verified": false
+      },
+      "api_filters": [
+        {
+          "id": "filter_1",
+          "criteria": {
+            "subject": "meeting  reminder",
+            "query": "(from:a@example.invalid OR from:b@example.invalid)"
+          },
+          "action": {
+            "addLabelIds": [
+              "Label_1"
+            ],
+            "removeLabelIds": []
+          }
+        }
+      ],
+      "id_to_label": {
+        "Label_1": "Type/Test"
+      },
+      "next_id": 2,
+      "expected_remaining_payloads": [
+        {
+          "criteria": {
+            "subject": "new  reminder",
+            "query": "(from:c@example.invalid OR from:d@example.invalid)"
+          },
+          "action": {
+            "addLabelIds": [
+              "Label_1"
+            ],
+            "removeLabelIds": []
+          }
+        },
+        {
+          "criteria": {
+            "from": "new@example.invalid"
+          },
+          "action": {
+            "addLabelIds": [
+              "Label_1"
+            ],
+            "removeLabelIds": []
+          }
+        }
+      ]
+    }
+  }
+}

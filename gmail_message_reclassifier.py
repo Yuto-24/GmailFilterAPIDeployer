@@ -569,8 +569,21 @@ def observe(api, plan, journal, row, mode, *, now=None):
     return now
 
 
+def validate_labels(api, plan):
+    """Permit unrelated new user definitions, never missing or changed saved labels.
+
+    Message reads deliberately retain the saved catalog: a newly created label
+    attached to a target is an external user-label change and must stop recovery.
+    Planning itself still requires an exact catalog throughout all searches.
+    """
+    live = api.labels()
+    require(all(live.get(lid) == row for lid, row in plan.labels.items())
+            and all(row["type"] == "user" for lid, row in live.items() if lid not in plan.labels),
+            "ラベル定義がバックアップと一致しません")
+
+
 def reconcile(api, plan, journal, mode):
-    require(api.labels() == plan.labels, "ラベル定義がバックアップと一致しません")
+    validate_labels(api, plan)
     if mode == "apply":
         api.filters_match(plan.rules, plan.labels, normalization=plan.manifest["normalization_version"])
     for row in plan.rows():
@@ -641,7 +654,7 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
                     d.observation_outcome("メール更新途中終了（保留計画を保持）")
                     return False
                 ids = all_ids[offset:offset + batch_size]
-                require(api.labels() == plan.labels, "送信前にラベル定義の変更を検出しました")
+                validate_labels(api, plan)
                 if mode == "apply":
                     api.filters_match(plan.rules, plan.labels, normalization=plan.manifest["normalization_version"])
                 systems = {}
@@ -667,7 +680,7 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
                             "送信中にシステム状態が変更されました: " + mid)
                     observe(api, plan, journal, plan.row(mid), mode, now=now)
                 journal.db.commit()
-                require(api.labels() == plan.labels, "送信後にラベル定義の変更を検出しました")
+                validate_labels(api, plan)
                 if failure is not None:
                     raise d.DeploymentError("メール更新の応答が失敗・不明です。読戻しを保存し停止しました。再開で未反映分を確認してください") from failure
                 expected = "applied" if mode == "apply" else "restored"

@@ -440,6 +440,54 @@ class MessageTests(unittest.TestCase):
             self.execute(plan)
         self.assertFalse(self.client.writes)
 
+    def test_unrelated_new_label_does_not_block_resume_or_restore(self):
+        plan = self.plan()
+        self.assertFalse(self.execute(plan, max_batches=1))
+        self.client.id_to_label["NewLabel"] = "Unrelated/New"
+        self.client.add("unrelated", ("SENT", "NewLabel"))
+        self.assertTrue(self.execute(plan))
+        self.assertTrue(self.execute(plan, mode="restore"))
+        for mid in ("a", "b", "c", "d"):
+            self.assertEqual(self.user_set(mid), {"Manual"})
+        self.assertEqual(self.user_set("unrelated"), {"NewLabel"})
+        self.assertNotIn("NewLabel", {lid for body in self.client.writes
+                                      for lid in body["addLabelIds"] + body["removeLabelIds"]})
+
+    def test_new_label_attached_to_target_blocks_apply_restore_and_readback(self):
+        plan = self.plan()
+        self.client.id_to_label["NewLabel"] = "Unrelated/New"
+        self.client.mail["a"]["labelIds"].append("NewLabel")
+        with self.assertRaises(d.DeploymentError):
+            self.execute(plan)
+        self.assertFalse(self.client.writes)
+        self.client.mail["a"]["labelIds"].remove("NewLabel")
+        self.assertTrue(self.execute(plan))
+        self.client.mail["a"]["labelIds"].append("NewLabel")
+        before = len(self.client.writes)
+        with self.assertRaises(d.DeploymentError):
+            self.execute(plan, mode="restore")
+        self.assertEqual(len(self.client.writes), before)
+        self.client.mail["a"]["labelIds"].remove("NewLabel")
+        def attach_during_send(body):
+            self.client.mail[body["ids"][0]]["labelIds"].append("NewLabel")
+        self.client.on_write = attach_during_send
+        with self.assertRaises(d.DeploymentError):
+            self.execute(plan, mode="restore")
+        self.assertEqual(len(self.client.writes), before + 1)
+        self.assertTrue((self.local / m.PENDING).exists())
+
+    def test_any_new_definition_during_planning_still_invalidates_search_snapshot(self):
+        changed = False
+        def new_label(kind):
+            nonlocal changed
+            if kind == "messages.get" and not changed:
+                self.client.id_to_label["NewLabel"] = "Unrelated/New"
+                changed = True
+        self.client.on_request = new_label
+        with self.assertRaises(d.DeploymentError):
+            self.plan()
+        self.assertFalse(self.client.writes)
+
     def test_label_dependent_search_is_frozen_before_any_mutation(self):
         write_xml(self.master, [{"hasTheWord": "label:Manual/Private", "label": "Type/A"}])
         self.client = Client(d.compile_xml(self.master))

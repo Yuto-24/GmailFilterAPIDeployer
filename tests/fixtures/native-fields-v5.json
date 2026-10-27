@@ -1,0 +1,686 @@
+{
+  "generated_from": "7331e42eb49ec5ea7a9d09cd34e77e4576c1573d",
+  "master_xml": "<?xml version='1.0' encoding='utf-8'?>\n<feed xmlns=\"http://www.w3.org/2005/Atom\" xmlns:apps=\"http://schemas.google.com/apps/2006\"><entry><apps:property name=\"from\" value=\"keep1@example.invalid OR keep2@example.invalid\" /><apps:property name=\"subject\" value=\"{keep message}\" /><apps:property name=\"hasTheWord\" value=\"&quot;original phrase&quot;\" /><apps:property name=\"label\" value=\"Type/Test\" /></entry><entry><apps:property name=\"from\" value=\"a@example.invalid OR b@example.invalid\" /><apps:property name=\"subject\" value=\"meeting  reminder\" /><apps:property name=\"label\" value=\"Type/Test\" /></entry><entry><apps:property name=\"subject\" value=\"{new message}\" /><apps:property name=\"label\" value=\"Type/Test\" /></entry><entry><apps:property name=\"from\" value=\"delete-new@example.invalid\" /><apps:property name=\"label\" value=\"Action/Delete\" /></entry></feed>",
+  "baseline_templates": [
+    {
+      "criteria": {
+        "query": "{from:keep1@example.invalid from:keep2@example.invalid} subject:{keep message} (\"original phrase\")"
+      },
+      "action": {
+        "addLabelIds": [
+          "label:Type/Test"
+        ],
+        "removeLabelIds": []
+      }
+    },
+    {
+      "criteria": {
+        "from": "obsolete@example.invalid"
+      },
+      "action": {
+        "addLabelIds": [
+          "label:Type/Test"
+        ],
+        "removeLabelIds": []
+      }
+    },
+    {
+      "criteria": {
+        "from": "delete-old@example.invalid"
+      },
+      "action": {
+        "addLabelIds": [
+          "label:Action/Delete"
+        ],
+        "removeLabelIds": []
+      }
+    }
+  ],
+  "target_templates": [
+    {
+      "criteria": {
+        "query": "{from:keep1@example.invalid from:keep2@example.invalid} subject:{keep message} (\"original phrase\")"
+      },
+      "action": {
+        "addLabelIds": [
+          "label:Type/Test"
+        ],
+        "removeLabelIds": []
+      }
+    },
+    {
+      "criteria": {
+        "subject": "meeting reminder",
+        "query": "{from:a@example.invalid from:b@example.invalid}"
+      },
+      "action": {
+        "addLabelIds": [
+          "label:Type/Test"
+        ],
+        "removeLabelIds": []
+      }
+    },
+    {
+      "criteria": {
+        "query": "subject:{new message}"
+      },
+      "action": {
+        "addLabelIds": [
+          "label:Type/Test"
+        ],
+        "removeLabelIds": []
+      }
+    },
+    {
+      "criteria": {
+        "from": "delete-new@example.invalid"
+      },
+      "action": {
+        "addLabelIds": [
+          "label:Action/Delete"
+        ],
+        "removeLabelIds": []
+      }
+    }
+  ],
+  "cases": {
+    "unselected": {
+      "plan": {
+        "schema": "gmail-filters-deploy-plan/v5",
+        "operation_order": "remove_first",
+        "created_utc": "2026-10-27T00:00:00+00:00",
+        "account": "v5@example.invalid",
+        "baseline_path": null,
+        "baseline_sha256": null,
+        "baseline_snapshot": [
+          {
+            "criteria": {
+              "query": "{from:keep1@example.invalid from:keep2@example.invalid} subject:{keep message} (\"original phrase\")"
+            },
+            "action": {
+              "addLabelIds": [
+                "label:Type/Test"
+              ],
+              "removeLabelIds": []
+            }
+          },
+          {
+            "criteria": {
+              "from": "obsolete@example.invalid"
+            },
+            "action": {
+              "addLabelIds": [
+                "label:Type/Test"
+              ],
+              "removeLabelIds": []
+            }
+          },
+          {
+            "criteria": {
+              "from": "delete-old@example.invalid"
+            },
+            "action": {
+              "addLabelIds": [
+                "label:Action/Delete"
+              ],
+              "removeLabelIds": []
+            }
+          }
+        ],
+        "target_path": "/synthetic-v5/master.xml",
+        "target_sha256": "ae4128c844d42898dfb6b3d1c6cccae4181801a60d5d9d9e0798f0ae8b68e99b",
+        "baseline_size": 3,
+        "target_size": 4,
+        "live_snapshot_hash": "6498aa02a7ba6a6c4303bcdd1191db2f5d813a757b9e423855be6af2984de238",
+        "expected_label_names": [
+          "Action/Delete",
+          "Type/Test"
+        ],
+        "new_label_names": [],
+        "add": [
+          {
+            "criteria": {
+              "subject": "meeting reminder",
+              "query": "{from:a@example.invalid from:b@example.invalid}"
+            },
+            "action": {
+              "addLabelIds": [
+                "label:Type/Test"
+              ],
+              "removeLabelIds": []
+            }
+          },
+          {
+            "criteria": {
+              "query": "subject:{new message}"
+            },
+            "action": {
+              "addLabelIds": [
+                "label:Type/Test"
+              ],
+              "removeLabelIds": []
+            }
+          },
+          {
+            "criteria": {
+              "from": "delete-new@example.invalid"
+            },
+            "action": {
+              "addLabelIds": [
+                "label:Action/Delete"
+              ],
+              "removeLabelIds": []
+            }
+          }
+        ],
+        "remove": [
+          {
+            "criteria": {
+              "from": "obsolete@example.invalid"
+            },
+            "action": {
+              "addLabelIds": [
+                "label:Type/Test"
+              ],
+              "removeLabelIds": []
+            }
+          },
+          {
+            "criteria": {
+              "from": "delete-old@example.invalid"
+            },
+            "action": {
+              "addLabelIds": [
+                "label:Action/Delete"
+              ],
+              "removeLabelIds": []
+            }
+          }
+        ],
+        "current_delete_count": 1,
+        "target_delete_count": 1,
+        "current_trash_count": 0,
+        "target_trash_count": 0,
+        "trash_add_count": 0,
+        "trash_remove_count": 0,
+        "normalization_version": "query-v1",
+        "normalization_audit": [
+          {
+            "source": "xml",
+            "entry": 2,
+            "before_criteria": {
+              "subject": "meeting  reminder",
+              "query": "{from:a@example.invalid from:b@example.invalid}"
+            },
+            "after_criteria": {
+              "subject": "meeting reminder",
+              "query": "{from:a@example.invalid from:b@example.invalid}"
+            },
+            "reasons": [
+              "subject_ascii_spaces"
+            ]
+          }
+        ],
+        "normalization_matched": 0,
+        "approval_digest": "e8604ca0e980bcfee93161b52fe7851ad6cfa07503465f026abe40213d5a75c7"
+      },
+      "journal": {
+        "account": "v5@example.invalid",
+        "acknowledged_add": 0,
+        "acknowledged_remove": 2,
+        "batch_checkpoint": {
+          "add": [],
+          "labels": {
+            "Action/Delete": "Label_2",
+            "Type/Test": "Label_1"
+          },
+          "pending": null,
+          "readback_confirmed": true,
+          "remove": [
+            0,
+            1
+          ],
+          "rows": [
+            {
+              "filter": {
+                "action": {
+                  "addLabelIds": [
+                    "label:Type/Test"
+                  ],
+                  "removeLabelIds": []
+                },
+                "criteria": {
+                  "query": "{from:keep1@example.invalid from:keep2@example.invalid} subject:{keep message} (\"original phrase\")"
+                }
+              },
+              "id": "filter_1"
+            }
+          ],
+          "schema": 1
+        },
+        "completed_add": 0,
+        "completed_remove": 2,
+        "events": [
+          {
+            "error_details": {},
+            "errors": {},
+            "kind": "filter_batch",
+            "operation": "remove",
+            "steps": [
+              0,
+              1
+            ],
+            "successes": {
+              "0": "filter_2",
+              "1": "filter_3"
+            },
+            "timestamp_utc": "2026-10-27T00:00:00+00:00",
+            "transport": "batch"
+          }
+        ],
+        "plan_digest": "e8604ca0e980bcfee93161b52fe7851ad6cfa07503465f026abe40213d5a75c7",
+        "readback_interval": 50,
+        "serial_recovery": false,
+        "verified": false
+      },
+      "api_filters": [
+        {
+          "id": "filter_1",
+          "criteria": {
+            "query": "{from:keep1@example.invalid from:keep2@example.invalid} subject:{keep message} (\"original phrase\")"
+          },
+          "action": {
+            "addLabelIds": [
+              "Label_1"
+            ],
+            "removeLabelIds": []
+          }
+        }
+      ],
+      "id_to_label": {
+        "Label_1": "Type/Test",
+        "Label_2": "Action/Delete"
+      },
+      "next_id": 3,
+      "effective_target": [
+        {
+          "criteria": {
+            "query": "{from:keep1@example.invalid from:keep2@example.invalid} subject:{keep message} (\"original phrase\")"
+          },
+          "action": {
+            "addLabelIds": [
+              "label:Type/Test"
+            ],
+            "removeLabelIds": []
+          }
+        },
+        {
+          "criteria": {
+            "subject": "meeting reminder",
+            "query": "{from:a@example.invalid from:b@example.invalid}"
+          },
+          "action": {
+            "addLabelIds": [
+              "label:Type/Test"
+            ],
+            "removeLabelIds": []
+          }
+        },
+        {
+          "criteria": {
+            "query": "subject:{new message}"
+          },
+          "action": {
+            "addLabelIds": [
+              "label:Type/Test"
+            ],
+            "removeLabelIds": []
+          }
+        },
+        {
+          "criteria": {
+            "from": "delete-new@example.invalid"
+          },
+          "action": {
+            "addLabelIds": [
+              "label:Action/Delete"
+            ],
+            "removeLabelIds": []
+          }
+        }
+      ],
+      "expected_remaining_payloads": [
+        {
+          "criteria": {
+            "subject": "meeting reminder",
+            "query": "{from:a@example.invalid from:b@example.invalid}"
+          },
+          "action": {
+            "addLabelIds": [
+              "Label_1"
+            ],
+            "removeLabelIds": []
+          }
+        },
+        {
+          "criteria": {
+            "query": "subject:{new message}"
+          },
+          "action": {
+            "addLabelIds": [
+              "Label_1"
+            ],
+            "removeLabelIds": []
+          }
+        },
+        {
+          "criteria": {
+            "from": "delete-new@example.invalid"
+          },
+          "action": {
+            "addLabelIds": [
+              "Label_2"
+            ],
+            "removeLabelIds": []
+          }
+        }
+      ]
+    },
+    "selected_other": {
+      "plan": {
+        "schema": "gmail-filters-deploy-plan/v5",
+        "operation_order": "remove_first",
+        "created_utc": "2026-10-27T00:00:00+00:00",
+        "account": "v5@example.invalid",
+        "baseline_path": null,
+        "baseline_sha256": null,
+        "baseline_snapshot": [
+          {
+            "criteria": {
+              "query": "{from:keep1@example.invalid from:keep2@example.invalid} subject:{keep message} (\"original phrase\")"
+            },
+            "action": {
+              "addLabelIds": [
+                "label:Type/Test"
+              ],
+              "removeLabelIds": []
+            }
+          },
+          {
+            "criteria": {
+              "from": "obsolete@example.invalid"
+            },
+            "action": {
+              "addLabelIds": [
+                "label:Type/Test"
+              ],
+              "removeLabelIds": []
+            }
+          },
+          {
+            "criteria": {
+              "from": "delete-old@example.invalid"
+            },
+            "action": {
+              "addLabelIds": [
+                "label:Action/Delete"
+              ],
+              "removeLabelIds": []
+            }
+          }
+        ],
+        "target_path": "/synthetic-v5/master.xml",
+        "target_sha256": "ae4128c844d42898dfb6b3d1c6cccae4181801a60d5d9d9e0798f0ae8b68e99b",
+        "baseline_size": 3,
+        "target_size": 4,
+        "live_snapshot_hash": "6498aa02a7ba6a6c4303bcdd1191db2f5d813a757b9e423855be6af2984de238",
+        "expected_label_names": [
+          "Action/Delete",
+          "Type/Test"
+        ],
+        "new_label_names": [],
+        "add": [
+          {
+            "criteria": {
+              "subject": "meeting reminder",
+              "query": "{from:a@example.invalid from:b@example.invalid}"
+            },
+            "action": {
+              "addLabelIds": [
+                "label:Type/Test"
+              ],
+              "removeLabelIds": []
+            }
+          },
+          {
+            "criteria": {
+              "query": "subject:{new message}"
+            },
+            "action": {
+              "addLabelIds": [
+                "label:Type/Test"
+              ],
+              "removeLabelIds": []
+            }
+          }
+        ],
+        "remove": [
+          {
+            "criteria": {
+              "from": "obsolete@example.invalid"
+            },
+            "action": {
+              "addLabelIds": [
+                "label:Type/Test"
+              ],
+              "removeLabelIds": []
+            }
+          }
+        ],
+        "current_delete_count": 1,
+        "target_delete_count": 1,
+        "current_trash_count": 0,
+        "target_trash_count": 0,
+        "trash_add_count": 0,
+        "trash_remove_count": 0,
+        "normalization_version": "query-v1",
+        "normalization_audit": [
+          {
+            "source": "xml",
+            "entry": 2,
+            "before_criteria": {
+              "subject": "meeting  reminder",
+              "query": "{from:a@example.invalid from:b@example.invalid}"
+            },
+            "after_criteria": {
+              "subject": "meeting reminder",
+              "query": "{from:a@example.invalid from:b@example.invalid}"
+            },
+            "reasons": [
+              "subject_ascii_spaces"
+            ]
+          }
+        ],
+        "normalization_matched": 0,
+        "approval_digest": "7887814fb23537e59f72c8e3327e9480e3ff9ab115f8d0ec07104dc675bad7dc",
+        "skipped_deletions": [],
+        "selected_groups": [
+          "other"
+        ]
+      },
+      "journal": {
+        "account": "v5@example.invalid",
+        "acknowledged_add": 0,
+        "acknowledged_remove": 1,
+        "batch_checkpoint": {
+          "add": [],
+          "labels": {
+            "Action/Delete": "Label_2",
+            "Type/Test": "Label_1"
+          },
+          "pending": null,
+          "readback_confirmed": true,
+          "remove": [
+            0
+          ],
+          "rows": [
+            {
+              "filter": {
+                "action": {
+                  "addLabelIds": [
+                    "label:Type/Test"
+                  ],
+                  "removeLabelIds": []
+                },
+                "criteria": {
+                  "query": "{from:keep1@example.invalid from:keep2@example.invalid} subject:{keep message} (\"original phrase\")"
+                }
+              },
+              "id": "filter_1"
+            },
+            {
+              "filter": {
+                "action": {
+                  "addLabelIds": [
+                    "label:Action/Delete"
+                  ],
+                  "removeLabelIds": []
+                },
+                "criteria": {
+                  "from": "delete-old@example.invalid"
+                }
+              },
+              "id": "filter_3"
+            }
+          ],
+          "schema": 1
+        },
+        "completed_add": 0,
+        "completed_remove": 1,
+        "events": [
+          {
+            "error_details": {},
+            "errors": {},
+            "kind": "filter_batch",
+            "operation": "remove",
+            "steps": [
+              0
+            ],
+            "successes": {
+              "0": "filter_2"
+            },
+            "timestamp_utc": "2026-10-27T00:00:00+00:00",
+            "transport": "batch"
+          }
+        ],
+        "plan_digest": "7887814fb23537e59f72c8e3327e9480e3ff9ab115f8d0ec07104dc675bad7dc",
+        "readback_interval": 50,
+        "serial_recovery": false,
+        "verified": false
+      },
+      "api_filters": [
+        {
+          "id": "filter_1",
+          "criteria": {
+            "query": "{from:keep1@example.invalid from:keep2@example.invalid} subject:{keep message} (\"original phrase\")"
+          },
+          "action": {
+            "addLabelIds": [
+              "Label_1"
+            ],
+            "removeLabelIds": []
+          }
+        },
+        {
+          "id": "filter_3",
+          "criteria": {
+            "from": "delete-old@example.invalid"
+          },
+          "action": {
+            "addLabelIds": [
+              "Label_2"
+            ],
+            "removeLabelIds": []
+          }
+        }
+      ],
+      "id_to_label": {
+        "Label_1": "Type/Test",
+        "Label_2": "Action/Delete"
+      },
+      "next_id": 3,
+      "effective_target": [
+        {
+          "criteria": {
+            "query": "{from:keep1@example.invalid from:keep2@example.invalid} subject:{keep message} (\"original phrase\")"
+          },
+          "action": {
+            "addLabelIds": [
+              "label:Type/Test"
+            ],
+            "removeLabelIds": []
+          }
+        },
+        {
+          "criteria": {
+            "subject": "meeting reminder",
+            "query": "{from:a@example.invalid from:b@example.invalid}"
+          },
+          "action": {
+            "addLabelIds": [
+              "label:Type/Test"
+            ],
+            "removeLabelIds": []
+          }
+        },
+        {
+          "criteria": {
+            "query": "subject:{new message}"
+          },
+          "action": {
+            "addLabelIds": [
+              "label:Type/Test"
+            ],
+            "removeLabelIds": []
+          }
+        },
+        {
+          "criteria": {
+            "from": "delete-old@example.invalid"
+          },
+          "action": {
+            "addLabelIds": [
+              "label:Action/Delete"
+            ],
+            "removeLabelIds": []
+          }
+        }
+      ],
+      "expected_remaining_payloads": [
+        {
+          "criteria": {
+            "subject": "meeting reminder",
+            "query": "{from:a@example.invalid from:b@example.invalid}"
+          },
+          "action": {
+            "addLabelIds": [
+              "Label_1"
+            ],
+            "removeLabelIds": []
+          }
+        },
+        {
+          "criteria": {
+            "query": "subject:{new message}"
+          },
+          "action": {
+            "addLabelIds": [
+              "Label_1"
+            ],
+            "removeLabelIds": []
+          }
+        }
+      ]
+    }
+  }
+}

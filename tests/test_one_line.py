@@ -69,11 +69,13 @@ class TestOneLine(unittest.TestCase):
         self.assertEqual(d.counter(now),d.counter(d.compile_xml(self.xml)))
 
     def test_approve_delete_and_basic_with_final_confirmation(self):
+        """Apply approved groups after final consent and preserve the native subject criterion."""
         base=d.compile_xml(self.base)
         foreign={'criteria':{'from':'obsolete.delete@example.invalid'},
                  'action':{'addLabelIds':['label:Action/Delete'],'removeLabelIds':[]}}
         self.client=FakeClient([x for x in base if not d.is_delete(x)] + [foreign])
         def approve_only_delete(prompt):
+            """Approve the Delete group and the final confirmation."""
             return "Action/Delete" in prompt or "上記の内容で" in prompt
         with patch.object(d,'get_client',return_value=(self.client,object())), \
              patch.object(d,'confirm_interactive',side_effect=approve_only_delete) as ask:
@@ -83,7 +85,7 @@ class TestOneLine(unittest.TestCase):
         self.assertEqual(sum(d.is_delete(x) for x in now),1)
         self.assertTrue(any(x["criteria"].get("from")=="ads@example.invalid" for x in now))
         self.assertTrue(any(x["criteria"].get("from")=="service@example.invalid" and
-                            "query" in x["criteria"] for x in now))
+                            x["criteria"].get("subject")=="{sale coupon}" for x in now))
         self.assertFalse((self.local/'run_pending.json').exists())
 
     def test_all_groups_declined_no_gmail_changes(self):
@@ -166,6 +168,7 @@ class TestOneLine(unittest.TestCase):
         self.assertFalse((self.local/'logs').exists())
 
     def test_sensitive_declined_but_basic_applied_after_final_consent(self):
+        """Keep declined sensitive groups while applying the approved native-subject change."""
         baseline=d.compile_xml(self.base)
         custom_delete={'criteria':{'from':'custom-delete@example.invalid'},
                        'action':{'addLabelIds':['label:Action/Delete'],'removeLabelIds':[]}}
@@ -175,6 +178,7 @@ class TestOneLine(unittest.TestCase):
                                [custom_delete,custom_trash])
         prompts=[]
         def choice(prompt):
+            """Decline sensitive groups and approve only the final ordinary-change confirmation."""
             prompts.append(prompt)
             return '上記の内容で' in prompt
         with patch.object(d,'get_client',return_value=(self.client,object())), \
@@ -185,7 +189,7 @@ class TestOneLine(unittest.TestCase):
         self.assertIn(custom_delete,live)
         self.assertIn(custom_trash,live)
         self.assertTrue(any(x['criteria'].get('from')=='service@example.invalid'
-                            and 'query' in x['criteria'] for x in live))
+                            and x['criteria'].get('subject')=='{sale coupon}' for x in live))
 
     def test_basic_default_summary_without_rule_details(self):
         from contextlib import redirect_stdout

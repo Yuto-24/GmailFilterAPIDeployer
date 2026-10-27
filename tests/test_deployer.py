@@ -112,8 +112,9 @@ class TestDeployer(unittest.TestCase):
         client=FakeClient(self.b)
         live,labels=d.api_fetch(client)
         plan=d.make_plan(None,self.target,[x['filter'] for x in live], 'test@example.invalid', labels)
-        self.assertEqual(plan['schema'],'gmail-filters-deploy-plan/v5')
-        self.assertEqual(plan['normalization_version'],'query-v1')
+        self.assertEqual(plan['schema'],'gmail-filters-deploy-plan/v7')
+        self.assertEqual(plan['normalization_version'],'query-v2')
+        self.assertEqual(plan['compilation_version'],'xml-fields-v1')
         self.assertIsNone(plan['baseline_path'])
         self.assertEqual((len(plan['add']),len(plan['remove'])),(2,1))
         self.assertEqual(d.counter(d.planned_states(plan)[0]),d.counter(self.b))
@@ -146,8 +147,12 @@ class TestDeployer(unittest.TestCase):
         self.assertEqual((len(add),len(remove)),(2,1))
 
     def test_compound_from_query(self):
+        """Keep accepted native fields by default while retaining the legacy query compiler."""
         f=d.build_template({'from':'a@example.invalid OR b@example.invalid','subject':'{one two}','label':'Type/Account'})
-        self.assertEqual(f['criteria']['query'],'{from:a@example.invalid from:b@example.invalid} subject:{one two}')
+        self.assertEqual(f['criteria'],{'from':'a@example.invalid OR b@example.invalid','subject':'{one two}'})
+        legacy=d.build_template({'from':'a@example.invalid OR b@example.invalid','subject':'{one two}',
+                                 'label':'Type/Account'}, compilation='legacy')
+        self.assertEqual(legacy['criteria']['query'],'{from:a@example.invalid from:b@example.invalid} subject:{one two}')
 
     def test_reject_unsafe_delete(self):
         with self.assertRaises(d.DeploymentError):

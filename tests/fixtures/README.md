@@ -24,3 +24,42 @@ XML構築とインメモリ通信の補助に既存のテストhelperを使用�
 ファイル読み取り先だけを一時Masterへ置き換えます。fixtureのplan・digestは書き換えず、
 旧payload一致、既存ID維持、削除再送なし、旧journalイベント保持、新方式の補助情報なしを確認します。
 再生成はshallow checkoutのCI要件ではありません。
+
+## nativeフィールド保持前のv5計画
+
+`native-fields-v5.json`は、PR #16マージcommit
+`7331e42eb49ec5ea7a9d09cd34e77e4576c1573d`の実モジュールで生成した合成データです。
+未選択のv5と、通常グループだけを選択したv5について、最初の削除バッチを読戻し確認した
+途中journalを固定しています。残す既存ルールと未送信の追加payloadにfrom OR・subject中括弧を含め、
+新compilerを誤用すると再開が失敗する入力にしています。選択済みの例ではAction/Delete変更を
+見送り、既存のDeleteルールを残します。
+
+```sh
+python3 tests/fixtures/generate_native_fields_v5.py
+```
+
+上と同様、ローカルの旧Gitソースと固定時計を使い、実装を再現するモデルは作りません。
+可搬な`/synthetic-v5/master.xml`への変更後、旧モジュールのhash関数で計画digestを確定して凍結します。
+再開テストではplan/digestを書き換えず、ファイル参照先だけを一時XMLへ置き換えます。
+v5 × 未選択/選択済み × apply/runの4経路でcompiler=legacy・normalizer=query-v1を確認し、
+旧payload・既存ID・旧イベント・見送りグループを維持します。compilation監査は後付けしません。
+旧未選択planを現在の選択関数へ渡した結果も、旧モジュールが生成した選択済みplanと完全一致させます。
+
+## 限定spam括弧正規化前のv6計画
+
+`spam-wrappers-v6.json`は、native保持実装済みcommit
+`76e5407bfa86d6a89cad947cbf665a695f272a78`の実モジュールから生成した合成データです。
+二重括弧のTrashを既存のまま残す未選択計画、Trash変更を選択して新規作成する計画、
+Trash変更を見送り通常ルールだけ配備する計画の3例を保存します。各例で削除工程が確認済み、
+追加が未送信のjournalを固定しています。native from OR・subjectも含みます。
+
+```sh
+python3 tests/fixtures/generate_spam_wrappers_v6.py
+```
+
+旧モジュール自身がplan・payload・checkpointを生成し、固定時刻と可搬パス
+`/synthetic-v6/<scenario>/master.xml`を使い、旧hashでdigestを確定して凍結します。
+恒常テストではJSONと一時XMLのみを使い、planやdigestを変更・再署名しません。
+3例×apply/runでxml-fields-v1/query-v1を最後まで維持し、新規Trashの二重括弧payload、
+保持・見送りTrashの元IDと原criteria、旧イベント、削除再送なしを確認します。
+query-v2の理由を旧journalへ挿入しません。再開完了後の再実行でもcreateが増えないことを確認します。

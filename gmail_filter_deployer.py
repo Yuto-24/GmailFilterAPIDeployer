@@ -40,9 +40,14 @@ KNOWN = {
     "shouldTrash", "sizeOperator", "sizeUnit",
 }
 FILTER_LIMIT = 1000
-CURRENT_NORMALIZATION = "query-v1"
+QUERY_V1_NORMALIZATION = "query-v1"
+CURRENT_NORMALIZATION = "query-v2"
+SUPPORTED_NORMALIZATIONS = ("legacy", QUERY_V1_NORMALIZATION, CURRENT_NORMALIZATION)
+CURRENT_COMPILATION = "xml-fields-v1"
 LEGACY_PLAN_SCHEMAS = ("gmail-filters-deploy-plan/v3", "gmail-filters-deploy-plan/v4")
-CURRENT_PLAN_SCHEMA = "gmail-filters-deploy-plan/v5"
+QUERY_V1_PLAN_SCHEMA = "gmail-filters-deploy-plan/v5"
+NATIVE_V1_PLAN_SCHEMA = "gmail-filters-deploy-plan/v6"
+CURRENT_PLAN_SCHEMA = "gmail-filters-deploy-plan/v7"
 SENDER_ADDRESS = r"[A-Za-z0-9]+(?:[._+-][A-Za-z0-9]+)*@(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,63}"
 FROM_ATOM = "from:" + SENDER_ADDRESS
 
@@ -466,7 +471,8 @@ def query_atom(key: str, value: str) -> str:
     return f"{key}:{value}"
 
 
-def build_template(p: dict[str, str]) -> dict:
+def build_legacy_template(p: dict[str, str]) -> dict:
+    """Preserve the original XML acceptance rules and query-building behavior."""
     criteria = {}
     fragments = []
     if p.get("from"):
@@ -520,20 +526,60 @@ def build_template(p: dict[str, str]) -> dict:
     return {"criteria": criteria, "action": {"addLabelIds": sorted(set(adds)), "removeLabelIds": sorted(set(removes))}}
 
 
-def normalization_for_plan(plan: dict) -> str:
-    """Select one pinned interpretation; legacy plans never acquire new semantics."""
+def build_template(p: dict[str, str], *, compilation=CURRENT_COMPILATION) -> dict:
+    """Validate with the old compiler, then preserve native fields in the new mode."""
+    demand(compilation in ("legacy", CURRENT_COMPILATION), "未知のXMLコンパイル方式です")
+    template = build_legacy_template(p)
+    if compilation == "legacy":
+        return template
+    # All original syntax/action checks above still run, including rejected OR
+    # forms. Only the destination of accepted from/subject values changes.
+    criteria = template["criteria"]
+    criteria.pop("query", None)
+    for key in ("from", "subject"):
+        if p.get(key):
+            criteria[key] = p[key].strip()
+    if p.get("hasTheWord"):
+        criteria["query"] = "(" + p["hasTheWord"].strip() + ")"
+    return template
+
+
+def plan_modes(plan: dict) -> tuple[str, str]:
+    """Validate the exact schema/version pair before selecting compiler and normalizer."""
     if plan.get("schema") in LEGACY_PLAN_SCHEMAS:
-        demand("normalization_version" not in plan, "旧計画に正規化versionが追加されています")
-        return "legacy"
+        demand("normalization_version" not in plan and "compilation_version" not in plan,
+               "旧計画に解釈versionが追加されています")
+        return "legacy", "legacy"
+    if plan.get("schema") == QUERY_V1_PLAN_SCHEMA:
+        demand(plan.get("normalization_version") == QUERY_V1_NORMALIZATION and
+               "compilation_version" not in plan, "v5計画の正規化/コンパイルversionが不正です")
+        return "legacy", QUERY_V1_NORMALIZATION
+    if plan.get("schema") == NATIVE_V1_PLAN_SCHEMA:
+        demand(plan.get("normalization_version") == QUERY_V1_NORMALIZATION and
+               plan.get("compilation_version") == CURRENT_COMPILATION,
+               "v6計画の正規化/コンパイルversionが不正です")
+        return CURRENT_COMPILATION, QUERY_V1_NORMALIZATION
     demand(plan.get("schema") == CURRENT_PLAN_SCHEMA and
-           plan.get("normalization_version") == CURRENT_NORMALIZATION,
-           "未知または欠落した計画schema/正規化versionです。承認計画を自動変換せず停止します")
-    return CURRENT_NORMALIZATION
+           plan.get("normalization_version") == CURRENT_NORMALIZATION and
+           plan.get("compilation_version") == CURRENT_COMPILATION,
+           "未知または欠落した計画schema/解釈versionです。承認計画を自動変換せず停止します")
+    return CURRENT_COMPILATION, CURRENT_NORMALIZATION
+
+
+def normalization_for_plan(plan: dict) -> str:
+    """Return the pinned normalizer only after validating both interpretation versions."""
+    return plan_modes(plan)[1]
+
+
+def simple_spam_query(body: str) -> bool:
+    """Recognize one unwrapped ASCII spam query, excluding standalone operator words."""
+    match = re.fullmatch(r"in:spam \{([A-Za-z0-9]+(?: [A-Za-z0-9]+)*)\}", body)
+    return bool(match and not {"AND", "OR", "AROUND", "NOT"}.intersection(match.group(1).split(" ")))
 
 
 def normalize_criteria(criteria: dict, *, normalization: str) -> tuple[dict, list[str]]:
-    """Normalize only whole sender disjunctions and ASCII spaces in native subject."""
-    demand(normalization in ("legacy", CURRENT_NORMALIZATION), "未知の正規化方式です")
+    """Apply pinned notation rules; only query-v2 also normalizes narrow spam wrappers."""
+    demand(normalization in SUPPORTED_NORMALIZATIONS, "未知の正規化方式です")
     result = dict(criteria)
     reasons = []
     if normalization == "legacy":
@@ -545,7 +591,11 @@ def normalize_criteria(criteria: dict, *, normalization: str) -> tuple[dict, lis
         # string to match the small grammar. No partial rewrite survives failure.
         while body.startswith("(") and body.endswith(")"):
             body = body[1:-1]
-        if re.fullmatch(FROM_ATOM + r"(?: OR " + FROM_ATOM + r")+", body):
+        reason = "query_sender_or"
+        if normalization == CURRENT_NORMALIZATION and simple_spam_query(body):
+            replacement = "(" + body + ")"
+            reason = "query_spam_outer_parentheses"
+        elif re.fullmatch(FROM_ATOM + r"(?: OR " + FROM_ATOM + r")+", body):
             replacement = "{" + " ".join(body.split(" OR ")) + "}"
         elif re.fullmatch(r"\{" + FROM_ATOM + r"(?: " + FROM_ATOM + r")+\}", body):
             replacement = body
@@ -553,7 +603,7 @@ def normalize_criteria(criteria: dict, *, normalization: str) -> tuple[dict, lis
             replacement = query
         if replacement != query:
             result["query"] = replacement
-            reasons.append("query_sender_or")
+            reasons.append(reason)
     subject = result.get("subject")
     if isinstance(subject, str):
         replacement = re.sub(" {2,}", " ", subject)
@@ -588,16 +638,32 @@ def normalization_note(obj: dict, *, normalization: str) -> dict | None:
             "after_criteria": after, "reasons": reasons}
 
 
-def compile_xml(path: Path, *, normalization=CURRENT_NORMALIZATION, audit=None) -> list[dict]:
-    """Compile XML using one mode and reject duplicates after canonicalization."""
+def compile_xml(path: Path, *, compilation=CURRENT_COMPILATION,
+                normalization=CURRENT_NORMALIZATION, audit=None, compilation_audit=None) -> list[dict]:
+    """Compile with pinned policies, keeping mapping provenance separate from normalization."""
+    demand(compilation in ("legacy", CURRENT_COMPILATION), "未知のXMLコンパイル方式です")
+    demand(normalization in SUPPORTED_NORMALIZATIONS, "未知の正規化方式です")
     entries = atom_entries(path)
     check_xml_rules(entries)
     out = []
+    old_templates = []
     for index, properties in enumerate(entries, 1):
-        raw = build_template(properties)
+        raw = build_template(properties, compilation=compilation)
         out.append(canonical_template(raw, normalization=normalization))
         if audit is not None and (note := normalization_note(raw, normalization=normalization)):
             audit.append({"source": "xml", "entry": index, **note})
+        if compilation != "legacy":
+            old = canonical_template(build_template(properties, compilation="legacy"),
+                                     normalization=normalization)
+            old_templates.append(old)
+            if compilation_audit is not None and old["criteria"] != out[-1]["criteria"]:
+                compilation_audit.append({"source": "xml", "entry": index,
+                    "before_compilation": "legacy", "after_compilation": compilation,
+                    "before_criteria": old["criteria"], "after_criteria": out[-1]["criteria"]})
+    # Keeping fields must not silently expand acceptance to a Master that the
+    # previous compiler rejected because its compiled rules were duplicates.
+    old_dups = [k for k, n in Counter(json_hash(x) for x in old_templates).items() if n > 1]
+    demand(not old_dups, f"従来のAPI変換後に意味的重複: {len(old_dups)}種類。手動解決が必要")
     dups = [k for k, n in Counter(json_hash(x) for x in out).items() if n > 1]
     demand(not dups, f"API変換後に意味的重複: {len(dups)}種類。手動解決が必要")
     return out
@@ -800,7 +866,7 @@ def filters_with_known_labels(client, labels_by_name: dict[str, str], *, verbose
 def api_fetch(client, *, verbose: bool = False, retry_reads: bool = True,
               normalization=CURRENT_NORMALIZATION) -> tuple[list[dict], dict[str, str]]:
     """Read Gmail settings once per resource and normalize in the selected mode."""
-    demand(normalization in ("legacy", CURRENT_NORMALIZATION), "未知の正規化方式です")
+    demand(normalization in SUPPORTED_NORMALIZATIONS, "未知の正規化方式です")
     labels = read_operation(
         "Gmail labels.list", lambda: client.users().labels().list(userId="me").execute(num_retries=0),
         verbose, retry=retry_reads).get("labels", [])
@@ -900,10 +966,11 @@ def deletion_preview(plan: dict, current: list[dict]) -> list[dict]:
 def select_plan_groups(plan: dict, selected: list[str],
                        current: list[dict] | None = None) -> dict:
     """Pin a subset of groups to the original live snapshot and XML hash."""
-    normalization = normalization_for_plan(plan)
-    demand(plan.get("schema") in ("gmail-filters-deploy-plan/v3", CURRENT_PLAN_SCHEMA) and
+    compilation, normalization = plan_modes(plan)
+    demand(plan.get("schema") in ("gmail-filters-deploy-plan/v3", QUERY_V1_PLAN_SCHEMA,
+                                 NATIVE_V1_PLAN_SCHEMA, CURRENT_PLAN_SCHEMA) and
            not plan.get("selected_groups"), "新規の差分計画のみ選択できます")
-    master = compile_xml(Path(plan["target_path"]), normalization=normalization)
+    master = compile_xml(Path(plan["target_path"]), compilation=compilation, normalization=normalization)
     demand(file_hash(plan["target_path"]) == plan["target_sha256"],
            "承認前にMaster XMLが変更されました。再計画してください")
     base = [canonical_template(x, normalization=normalization) for x in plan["baseline_snapshot"]]
@@ -927,7 +994,7 @@ def select_plan_groups(plan: dict, selected: list[str],
     from copy import deepcopy
     new_plan = deepcopy(plan)
     new_plan["schema"] = ("gmail-filters-deploy-plan/v4" if normalization == "legacy"
-                          else CURRENT_PLAN_SCHEMA)
+                          else plan["schema"])
     new_plan["skipped_deletions"] = skipped
     new_plan["selected_groups"] = sorted(selected)
     new_plan["target_size"] = len(effective)
@@ -966,11 +1033,17 @@ def interactive_group_selection(plan: dict) -> list[str]:
 
 
 def make_plan(base_path: Path | None, target_path: Path, live: list[dict], acct: str, labels: dict,
-              extra_baselines: list[Path] | None = None, *, normalization=CURRENT_NORMALIZATION,
-              live_rows=None) -> dict:
+              extra_baselines: list[Path] | None = None, *, compilation=CURRENT_COMPILATION,
+              normalization=CURRENT_NORMALIZATION, live_rows=None) -> dict:
     """Build a pinned, fully reviewed diff from a live API snapshot by default."""
+    demand((compilation, normalization) in (("legacy", "legacy"), ("legacy", QUERY_V1_NORMALIZATION),
+                                          (CURRENT_COMPILATION, QUERY_V1_NORMALIZATION),
+                                          (CURRENT_COMPILATION, CURRENT_NORMALIZATION)),
+           "未対応のコンパイル/正規化方式の組合せです")
     audit = []
-    target = compile_xml(target_path, normalization=normalization, audit=audit)
+    compilation_audit = []
+    target = compile_xml(target_path, compilation=compilation, normalization=normalization,
+                         audit=audit, compilation_audit=compilation_audit)
     raw_live = live
     if live_rows is not None:
         raw_live = [{"criteria": row.get("normalization", {}).get(
@@ -993,7 +1066,7 @@ def make_plan(base_path: Path | None, target_path: Path, live: list[dict], acct:
         base = list(live)
     else:
         baseline_paths = [base_path] + (extra_baselines or [])
-        valid = [(p, compile_xml(p, normalization=normalization)) for p in baseline_paths]
+        valid = [(p, compile_xml(p, compilation=compilation, normalization=normalization)) for p in baseline_paths]
         status = next(((p, b) for p, b in valid if counter(live) == counter(b)), None)
         if counter(live) == counter(target):
             status = (target_path, target)
@@ -1012,7 +1085,9 @@ def make_plan(base_path: Path | None, target_path: Path, live: list[dict], acct:
     existing_labels = set(labels)
     new_labels = sorted(set(x[6:] for t in adds for x in t["action"]["addLabelIds"] if x.startswith("label:")) - existing_labels)
     plan = {
-        "schema": "gmail-filters-deploy-plan/v3" if normalization == "legacy" else CURRENT_PLAN_SCHEMA,
+        "schema": (CURRENT_PLAN_SCHEMA if normalization == CURRENT_NORMALIZATION else
+                   NATIVE_V1_PLAN_SCHEMA if compilation == CURRENT_COMPILATION else
+                   "gmail-filters-deploy-plan/v3" if normalization == "legacy" else QUERY_V1_PLAN_SCHEMA),
         "operation_order": "remove_first",
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "account": acct,
@@ -1036,24 +1111,35 @@ def make_plan(base_path: Path | None, target_path: Path, live: list[dict], acct:
         "trash_remove_count": sum(is_trash(x) for x in removes),
     }
     if normalization != "legacy":
-        legacy_target = compile_xml(target_path, normalization="legacy")
+        legacy_target = compile_xml(target_path, compilation=compilation, normalization="legacy")
         plan["normalization_version"] = normalization
         plan["normalization_audit"] = audit
         plan["normalization_matched"] = (sum((counter(live) & counter(target)).values()) -
                                          sum((counter(legacy_live) & counter(legacy_target)).values()))
+    if compilation != "legacy":
+        old_target = compile_xml(target_path, compilation="legacy", normalization=normalization)
+        plan["compilation_version"] = compilation
+        plan["compilation_audit"] = compilation_audit
+        comparison = {"scope": "master_vs_live_at_planning", "normalization_version": normalization}
+        for name, compiler, master in (("previous", "legacy", old_target), ("current", compilation, target)):
+            proposed_add, proposed_remove = delta(live, master)
+            comparison[name] = {"compilation_version": compiler,
+                "matched": sum((counter(live) & counter(master)).values()),
+                "add": len(proposed_add), "remove": len(proposed_remove)}
+        plan["compilation_comparison"] = comparison
     plan["approval_digest"] = json_hash({k: v for k, v in plan.items() if k not in {"created_utc", "approval_digest"}})
     return plan
 
 
 def planned_states(plan: dict):
     """Pin actual baseline and target to the approved plan, including resume."""
-    normalization = normalization_for_plan(plan)
-    master = compile_xml(Path(plan["target_path"]), normalization=normalization)
+    compilation, normalization = plan_modes(plan)
+    master = compile_xml(Path(plan["target_path"]), compilation=compilation, normalization=normalization)
     validate_delete_label_only(master)
     demand(file_hash(plan["target_path"]) == plan["target_sha256"], "計画作成後にTarget XMLが変わりました")
     source = plan.get("baseline_path")
     if source:
-        base = compile_xml(Path(source), normalization=normalization)
+        base = compile_xml(Path(source), compilation=compilation, normalization=normalization)
         demand(file_hash(source) == plan["baseline_sha256"], "計画作成後に基準XMLが変わりました")
     else:
         base = [canonical_template(x, normalization=normalization) for x in plan["baseline_snapshot"]]
@@ -1749,9 +1835,9 @@ def verify_partial(client, base: list[dict], plan: dict, add_count: int, remove_
 
 
 def cmd_validate(args):
-    """Validate XML offline under the current normalization and report optional baseline differences."""
+    """Validate XML offline with current compilation and normalization policies."""
     target_path = select_master(args.local_dir, args.target)
-    target = compile_xml(target_path, normalization=CURRENT_NORMALIZATION)
+    target = compile_xml(target_path, compilation=CURRENT_COMPILATION, normalization=CURRENT_NORMALIZATION)
     report = {
         "target": str(target_path), "target_sha256": file_hash(target_path),
         "target_health": check_xml_rules(atom_entries(target_path)),
@@ -1759,7 +1845,7 @@ def cmd_validate(args):
         "action_delete_label_only": True,
     }
     if args.base:
-        base = compile_xml(args.base, normalization=CURRENT_NORMALIZATION)
+        base = compile_xml(args.base, compilation=CURRENT_COMPILATION, normalization=CURRENT_NORMALIZATION)
         added, removed = delta(base, target)
         demand(len(base) + len(added) <= FILTER_LIMIT, "追加先行時にGmail上限1000件を超えます")
         report.update({"base": str(args.base), "base_sha256": file_hash(args.base),
@@ -1776,14 +1862,15 @@ def cmd_validate(args):
 
 
 def cmd_plan(args):
-    """Save a read-only live-to-Master plan with the current normalization and audit."""
+    """Save a read-only plan with current policies and separate compilation/normalization audits."""
     target_path = select_master(args.local_dir, args.target)
     client, creds = get_client(args.client_secrets, args.token)
     acct = account_email(creds)
     demand(acct == args.expected_email.lower(), f"Googleアカウント不一致: {acct} != {args.expected_email}")
     current, labels = api_fetch(client, normalization=CURRENT_NORMALIZATION)
     plan = make_plan(args.base, target_path, [x["filter"] for x in current], acct, labels,
-                     args.also_baseline or [], normalization=CURRENT_NORMALIZATION, live_rows=current)
+                     args.also_baseline or [], compilation=CURRENT_COMPILATION,
+                     normalization=CURRENT_NORMALIZATION, live_rows=current)
     save_json(args.out, plan)
     print(json.dumps({"account": acct, "current": len(current), "target": plan["target_size"],
                       "master": str(target_path), "add": len(plan["add"]), "remove": len(plan["remove"]),
@@ -1816,11 +1903,12 @@ def cmd_apply(args):
 
 
 def cmd_verify(args):
-    """Compare live settings with Master under the current normalization and reject differences."""
+    """Compare live settings with Master using the current compiler and normalizer."""
     client, creds = get_client(args.client_secrets, args.token, allow_auth=False)
     acct = account_email(creds)
     demand(acct == args.expected_email.lower(), "認証アカウント不一致")
-    target = compile_xml(select_master(args.local_dir, args.target), normalization=CURRENT_NORMALIZATION)
+    target = compile_xml(select_master(args.local_dir, args.target), compilation=CURRENT_COMPILATION,
+                         normalization=CURRENT_NORMALIZATION)
     current, _ = api_fetch(client, normalization=CURRENT_NORMALIZATION)
     actual = [x["filter"] for x in current]
     adds, removes = delta(target, actual)
@@ -1841,9 +1929,14 @@ def format_filter_summary(row: dict) -> str:
 
 
 def show_normalization_summary(plan: dict, *, verbose=False) -> None:
-    """Explain established equivalences without guessing pairs for remaining changes."""
-    if normalization_for_plan(plan) == "legacy":
+    """Distinguish field-preserving compilation from established notation equivalence."""
+    normalization = normalization_for_plan(plan)
+    if normalization == "legacy":
         return
+    compilation_audit = plan.get("compilation_audit", [])
+    if compilation_audit and verbose:
+        print(f"XMLのfrom・subjectを元のフィールドに保持: {len(compilation_audit)}件"
+              "（フィールド間の同等性は判定していません）", flush=True)
     matched = plan.get("normalization_matched", 0)
     if matched:
         print(f"表記を統一して一致したルール: {matched}件（変更不要）", flush=True)
@@ -1851,7 +1944,10 @@ def show_normalization_summary(plan: dict, *, verbose=False) -> None:
     for row in plan["add"] + plan["remove"]:
         criteria = row["criteria"]
         query = criteria.get("query")
-        if (query and not re.fullmatch(r"\{" + FROM_ATOM + r"(?: " + FROM_ATOM + r")+\}", query)
+        known_query = query and (re.fullmatch(r"\{" + FROM_ATOM + r"(?: " + FROM_ATOM + r")+\}", query)
+            or normalization == CURRENT_NORMALIZATION and query.startswith("(") and query.endswith(")")
+            and simple_spam_query(query[1:-1]))
+        if (query and not known_query
                 or criteria.get("negatedQuery")
                 or " OR " in criteria.get("from", "")
                 or "{" in criteria.get("subject", "")):
@@ -1860,6 +1956,17 @@ def show_normalization_summary(plan: dict, *, verbose=False) -> None:
         print("同等性未確認: 対象外のquery式・否定・from/subject等のフィールド間移動は"
               "自動判定しません。追加と削除をそれぞれ確認してください。", flush=True)
     if verbose:
+        if compilation_audit:
+            comparison = plan["compilation_comparison"]
+            before, after = comparison["previous"], comparison["current"]
+            print(f"[XML変換] 計画作成時のMaster全体とGmailの比較（旧方式→今回）: "
+                  f"一致 {before['matched']}→{after['matched']} / "
+                  f"追加 {before['add']}→{after['add']} / 削除 {before['remove']}→{after['remove']}", flush=True)
+        for note in compilation_audit:
+            print(f"[XML変換] 項目={note['entry']} / "
+                  f"方式={note['before_compilation']}→{note['after_compilation']} / "
+                  f"旧条件={json.dumps(note['before_criteria'], ensure_ascii=False, sort_keys=True)} / "
+                  f"今回条件={json.dumps(note['after_criteria'], ensure_ascii=False, sort_keys=True)}", flush=True)
         for note in plan.get("normalization_audit", []):
             print(f"[正規化] {note['source']} / 理由={','.join(note['reasons'])} / "
                   f"変換前={json.dumps(note['before_criteria'], ensure_ascii=False, sort_keys=True)} / "
@@ -1994,11 +2101,12 @@ def cmd_run(args):
     with exclusive_lock(args.local_dir / 'run.lock'):
         pending_file = args.local_dir / 'run_pending.json'
         pending_plan = json.loads(pending_file.read_text(encoding='utf-8')) if pending_file.exists() else None
-        normalization = normalization_for_plan(pending_plan) if pending_plan is not None else CURRENT_NORMALIZATION
+        compilation, normalization = (plan_modes(pending_plan) if pending_plan is not None else
+                                      (CURRENT_COMPILATION, CURRENT_NORMALIZATION))
         start_phase("[1/6] 最新Master XMLを選択・検証")
         print("[1/6] 最新Master XMLを選択・検証中...", flush=True)
         target_path = select_master(args.local_dir, args.target)
-        target = compile_xml(target_path, normalization=normalization)  # Offline preflight before OAuth.
+        target = compile_xml(target_path, compilation=compilation, normalization=normalization)  # Before OAuth.
         print(f"      検証完了: {target_path.name}（{len(target)}件）", flush=True)
         if args.verbose:
             print(f"{timestamp_prefix()}[詳細] Master SHA-256: {file_hash(target_path)}", flush=True)
@@ -2043,8 +2151,8 @@ def cmd_run(args):
                 return
             print(f"前回の中断計画を検出しました（追加済 {a_done}/{len(plan['add'])}、削除済 {r_done}/{len(plan['remove'])}）。")
         else:
-            plan = make_plan(None, target_path, live, acct, labels, normalization=normalization,
-                             live_rows=current)
+            plan = make_plan(None, target_path, live, acct, labels, compilation=compilation,
+                             normalization=normalization, live_rows=current)
             show_normalization_summary(plan, verbose=args.verbose)
             if not plan['add'] and not plan['remove']:
                 if normalization != "legacy":
@@ -2121,7 +2229,7 @@ def cmd_run(args):
         pending_file.unlink()
         # perform's final confirmed snapshot already includes skipped rules.
         actual = result["rows"]
-        master = compile_xml(target_path, normalization=normalization)
+        master = compile_xml(target_path, compilation=compilation, normalization=normalization)
         master_only, gmail_only = delta([x["filter"] for x in actual], master)
         skipped = plan.get("skipped_deletions", [])
         print("\n【配備結果】", flush=True)

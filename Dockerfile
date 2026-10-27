@@ -11,6 +11,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt \
     && useradd --uid 1000 --gid app --no-create-home app
 
 COPY gmail_filter_deployer.py /app/gmail_filter_deployer.py
+COPY gmail_message_reclassifier.py /app/gmail_message_reclassifier.py
 USER app
 
 ENTRYPOINT ["python", "/app/gmail_filter_deployer.py"]

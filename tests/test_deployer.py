@@ -348,6 +348,10 @@ class TestDeployer(unittest.TestCase):
         self.assertTrue(json.loads(log.read_text())['verified'])
 
 class TestExpectedEmail(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
     def test_environment_value_is_default(self):
         with patch.dict('os.environ', {'GMAIL_EXPECTED_EMAIL': ' User@Example.Com '}, clear=True):
             self.assertEqual(d.resolve_expected_email(None), 'user@example.com')
@@ -378,7 +382,7 @@ class TestExpectedEmail(unittest.TestCase):
             for command in ('plan', 'verify', 'apply'):
                 with self.subTest(command=command):
                     handler={'plan':'cmd_plan','verify':'cmd_verify','apply':'cmd_apply'}[command]
-                    argv=[command, '--expected-email','chosen@example.com']
+                    argv=[command, '--expected-email','chosen@example.com', '--local-dir', self.tmp.name]
                     if command=='apply':
                         argv.extend(['--approve','digest'])
                     with patch.object(d, handler) as fake:
@@ -390,7 +394,7 @@ class TestExpectedEmail(unittest.TestCase):
             for command in ('plan', 'apply', 'verify'):
                 with self.subTest(command=command):
                     handler={'plan':'cmd_plan','apply':'cmd_apply','verify':'cmd_verify'}[command]
-                    argv=[command]
+                    argv=[command, '--local-dir', self.tmp.name]
                     if command=='apply': argv.extend(['--approve','digest'])
                     with patch.object(d, handler) as fake:
                         self.assertEqual(d.main(argv),0)

@@ -199,9 +199,9 @@ class CommandMeasurementTests(unittest.TestCase):
         self.argv = ["run", "--local-dir", str(self.local), "--expected-email", "test@example.invalid"]
 
     def answer(self, prompt):
-        """Approve a prompt after five seconds of synthetic user wait."""
+        """Approve filters and decline the independent message phase after five seconds."""
         self.clock.advance(5)
-        return "y"
+        return "n" if "再分類を準備" in prompt else "y"
 
     def test_verbose_six_phases_wait_and_deployment_do_not_double_count(self):
         # Force both sensitive group prompts as well as the final confirmation.
@@ -212,14 +212,14 @@ class CommandMeasurementTests(unittest.TestCase):
         with patch("builtins.input", side_effect=self.answer) as ask:
             self.assertEqual(d.main(self.argv + ["-v"]), 0)
         observation = self.observations[-1]
-        self.assertEqual(ask.call_count, 3)
-        self.assertEqual(observation.approval_wait, 15)
+        self.assertEqual(ask.call_count, 4)
+        self.assertEqual(observation.approval_wait, 20)
         output = self.output.getvalue()
         self.assertEqual(len(re.findall(r"\[フェーズ開始\] \[[1-6]/6\]", output)), 6)
         self.assertEqual(len(re.findall(r"\[フェーズ完了\] \[[1-6]/6\]", output)), 6)
         self.assertRegex(output, r"\[\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d\d:\d\d\] \[フェーズ完了\]")
         seconds = sum(row["seconds"] for row in observation.apis.values())
-        self.assertEqual(self.clock.now, seconds + 11 + 15)
+        self.assertEqual(self.clock.now, seconds + 11 + 20)
         # Initial/preapproval listing happens outside the deployment interval.
         self.assertEqual(observation.deployment_seconds, seconds - 8)
         self.assertTrue(all(row["max_seconds"] == 2 for row in observation.apis.values()))
@@ -236,11 +236,13 @@ class CommandMeasurementTests(unittest.TestCase):
         self.assertNotIn("[API集計]", first)
         self.assertNotIn("[フェーズ開始]", first)
         self.assertIn("配備開始", first)
-        with patch("builtins.input", side_effect=AssertionError("unexpected prompt")):
+        with patch("builtins.input", side_effect=self.answer) as ask:
             self.assertEqual(d.main(self.argv), 0)
+        self.assertEqual(ask.call_count, 1)
+        self.assertIn("再分類を準備", ask.call_args.args[0])
         second = self.observations[-1]
         self.assertEqual(second.outcome, "変更不要")
-        self.assertEqual(second.approval_wait, 0)
+        self.assertEqual(second.approval_wait, 5)
         self.assertEqual(second.deployment_seconds, 0)
         self.assertEqual(set(second.apis), {"labels.list", "filters.list"})
         self.assertEqual(second.apis["filters.list"]["attempts"], 1)
@@ -266,8 +268,10 @@ class CommandMeasurementTests(unittest.TestCase):
         self.assertEqual(self.observations[-1].outcome, "途中終了（保留計画を保持）")
         self.assertTrue((self.local / "run_pending.json").exists())
         self.client = FakeClient(d.compile_xml(self.master))
-        with patch("builtins.input", side_effect=AssertionError("already applied")):
+        with patch("builtins.input", side_effect=self.answer) as ask:
             self.assertEqual(d.main(self.argv), 0)
+        self.assertEqual(ask.call_count, 1)
+        self.assertIn("再分類を準備", ask.call_args.args[0])
         self.assertEqual(self.observations[-1].outcome, "前回配備の反映済みを照合")
         self.assertFalse((self.local / "run_pending.json").exists())
 
@@ -319,7 +323,7 @@ class CommandMeasurementTests(unittest.TestCase):
         d.save_json(path, plan)
         argv = ["apply", "--plan", str(path), "--approve", plan["approval_digest"],
                 "--log", str(self.local / "journal.json"), "--expected-email", plan["account"],
-                "--allow-removals", "-v"]
+                "--allow-removals", "-v", "--local-dir", str(self.local)]
         self.assertEqual(d.main(argv), 0)
         observation = self.observations[-1]
         self.assertEqual(observation.approval_wait, 0)

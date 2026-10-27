@@ -2,6 +2,8 @@
 
 Gmailに現在登録されているフィルタと、最新版Master XMLとの差分を照合して配備するCLIです。Docker Composeに対応します。
 
+配備後には、独立した承認で既存メールのユーザーラベルをMasterに合わせて再分類できます。バックアップ、固定計画、中断再開、ユーザーラベルの復元に対応します。
+
 ## 最短の運用：配備は1コマンド
 
 最初に1度だけ`local/credentials.json`（Google Cloud OAuth DesktopクライアントJSON）、`.env`（Gmailアドレス）を用意します。Master XMLは`local/masters/`に**元のファイル名のまま**保存します。旧Masterやリネームは不要です。
@@ -24,6 +26,10 @@ docker compose run --rm --service-ports deployer run
 ```
 
 実行内容は **XML検証 → OAuth認証・アカウント照合 → 差分計算 → 基本の件数表示 → Action/Delete全件表示・グループ承認 → Trash全件表示・グループ承認 → 最終確認 `[y/N]` → 配備 → API照合** です。
+
+配備完了・変更不要の場合は、ユーザーラベル用フィルタがMasterと一致することを確認し、**「既存メールの再分類を準備しますか？ [y/N]」** を表示します。承諾するとメール用OAuth認証、対象列挙、バックアップ、検索・計画を行います。件数とラベル別の解除・付与を表示した後、**メール更新専用の最終 `[y/N]`** で承認された場合だけ更新します。フィルタ配備を承認しただけではメール更新を承認したことになりません。非対話の`run`は再分類を開始しません。
+
+再分類は受信トレイ・アーカイブ済みのメールにある**手動分を含む全ユーザーラベル**を、Masterに一致するラベル集合へ置き換えます。複数一致はすべて付与、一致なしはユーザーラベルなしになります。SENT・DRAFT・SPAM・TRASH・CHAT付きメールは除外します。システムラベル、本文、添付、ラベル定義は更新しません。`Action/Delete`もラベルの付与だけです。詳細は[再分類・再開・復元の仕様](docs/issue-6-message-reclassification.md)を参照してください。
 
 **承認の順序は基本 → Action/Delete → Trash → 最終確認**です。基本（Type・Service・Org等）は個別承認せず、最後の全体承認に含めます。基本の詳細は`run -v`で表示できます。DeleteとTrashの差分は`-v`なしでも、追加・削除する全ルールの条件と処理を表示します。条件変更はGmail API上の旧ルール削除と新ルール作成として表示します。該当差分がないカテゴリの確認は省略します。
 
@@ -120,12 +126,31 @@ APIにもMasterと同じnative条件がある場合は、作成・削除せず�
 | `plan` | 実フィルタから差分計画を保存 | なし | `... deployer plan` |
 | `apply` | 保存された`plan.json`を厳格に適用 | あり | `... deployer apply --approve HASH --allow-removals` |
 | `verify` | 実フィルタとMasterの一致を確認 | なし | `... deployer verify` |
+| `reclassify` | メール再分類の計画・適用・再開 | 専用の対話承認後のみ | `... deployer reclassify --plan-only` |
+| `restore-labels` | 指定実行のユーザーラベルを復元・再開 | 専用の対話承認後のみ | `... deployer restore-labels --run-id RUN_ID` |
+
+### メールの計画・再開・復元
+
+```bash
+# 読取り計画だけを作成。表示されたrun-idとバックアップ先を保持する
+docker compose run --rm --service-ports deployer reclassify --plan-only
+# 固定済み計画を照合し、メール専用の承認後に適用・再開する
+docker compose run --rm --service-ports deployer reclassify --resume RUN_ID
+# 当該実行で変更したと照合できるメールを復元。中断時も同じコマンドで再開
+docker compose run --rm --service-ports deployer restore-labels --run-id RUN_ID
+```
+
+`run`・`reclassify`・`restore-labels`の`--message-batch-size`は1〜1000、既定50メッセージです。`--max-message-batches N`はNバッチの読戻し後に保留状態で止めます。フィルタ用の`--batch-size`・`--max-batches`とは独立しています。`reclassify`では`--target`でMasterを選べますが、`--resume`では保存済みMaster・検索結果を使います。
+
+メール用OAuthは従来スコープに`gmail.modify`を追加し、既定で`local-dir/message_token.json`に保存します。配備用`token.json`は保持します。`--message-token PATH`で専用トークンの場所を指定できます。権限不足なら対話認証をやり直し、必要スコープとアカウントの照合が成功するまで既存ファイルを置き換えません。メール用の初回認証にも`--service-ports`を使用してください。
+
+未完了の再分類・復元があると、`run`は新しいフィルタ配備より先に保留状態を案内し、固定済み計画を照合・再開します。`local/messages_pending.json`と実行別バックアップ・進捗を保持してください。別Masterへの自動差替え、バッチ全体の自動再送、競合の強制上書きはしません。復元時は現在のシステム状態を保持しますが、対象外フォルダへの移動、ユーザーラベルの外部変更、ラベル定義の変更・消失は停止理由になります。
 
 ### `run`：推奨
 
 - `--target PATH`：バージョン自動選択を使わず、対象Master XMLを明示。
 - `--batch-size N`：削除・追加をまとめるHTTPバッチ件数。**1〜25、既定1**。1で開始した計画は逐次処理になります。
-- `-v`, `--verbose`：フィルタ単位の処理結果や照合状況、API読取・削除・追加と全6フェーズの開始/終了時刻・所要秒数、API種類別集計を表示します。詳細は下記「時間とAPI試行数の読み方」を参照してください。
+- `-v`, `--verbose`：フィルタ単位の処理結果や照合状況、API読取・削除・追加と全6フェーズの開始/終了時刻・所要秒数、API種類別集計を表示します。再分類の案内以降は配備区間と分けて計測します。詳細は下記「時間とAPI試行数の読み方」を参照してください。
 - `--expected-email ADDRESS`：`.env`の`GMAIL_EXPECTED_EMAIL`より優先するアカウント照合先。
 - `--local-dir PATH`：Masterと配備記録の保存フォルダ。既定`/app/local`（Docker内）。
 - `--client-secrets PATH`：OAuth DesktopクライアントJSON。既定`/app/local/credentials.json`。
@@ -162,7 +187,7 @@ APIにもMasterと同じnative条件がある場合は、作成・削除せず�
 
 `run`と`apply`は通常表示でも既存の進捗に加えて、終了時に全体時間・承認入力待ち・その待ちを除いた時間・配備区間・終了理由を1行表示します。変更不要、承認辞退、上限指定による途中終了、例外やCtrl-Cによる停止でも集計します。進捗は従来どおり「応答確認済み」と「全件照合済み」を区別します。未到達のフェーズには計測値を作りません。
 
-`-v`では`run`の6フェーズ（XML検証、認証、現行設定取得、差分照合、対話承認、配備・読戻し）と、`apply`の3フェーズ（計画読込み、認証、配備・読戻し）の開始・終了時刻をUTCオフセット付きISO 8601で表示します。所要時間はmonotonic時計で測るため、壁時計の補正の影響を受けません。Docker内がUTCなら時刻は`+00:00`になります。承認入力待ちはグループ承認と最終承認の`input()`待機の累積で、OAuthブラウザ操作・バックオフ・API読戻し待ちは含みません。配備区間は配備フェーズ全体で、API読戻しやジャーナル保存、最終結果の整理も含みます。全体・フェーズ・API時間は重なる観測なので足し合わせないでください。
+`-v`では`run`の配備までの6フェーズ（XML検証、認証、現行設定取得、差分照合、対話承認、配備・読戻し）と、`apply`の3フェーズ（計画読込み、認証、配備・読戻し）の開始・終了時刻をUTCオフセット付きISO 8601で表示します。所要時間はmonotonic時計で測るため、壁時計の補正の影響を受けません。Docker内がUTCなら時刻は`+00:00`になります。承認入力待ちはグループ承認・最終承認・再分類の準備確認・メール更新承認の`input()`待機の累積で、OAuthブラウザ操作・バックオフ・API読戻し待ちは含みません。配備区間は配備フェーズ全体で、API読戻しやジャーナル保存、最終結果の整理も含みます。全体・フェーズ・API時間は重なる観測なので足し合わせないでください。
 
 `-v`の`[API集計]`は固定の種類（`labels.list/create`、`filters.list/create/delete`、`filters.batch.create/delete`）ごとに、試行数・成功・失敗/中断・合計/平均/最大秒数を表示します。単独要求はSDK呼出しの試行ごとに計測し、再試行も別に数えます。通信失敗後に読戻しで反映済みと判明した操作でも、その通信試行は失敗のままです。論理的な配備成功数は配備結果・進捗を参照してください。SDK呼出しには要求準備や送信前の認証更新が含まれることがあり、API試行数は通信線上での送信パケット数ではありません。OAuth APIはこのGmail API集計に含めません。
 

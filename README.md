@@ -87,13 +87,17 @@ Action/DeleteとTrashはそれぞれ`[y/N]`で承認または見送れます。�
 
 ## 条件の表記差と計画の互換性
 
+Masterの条件をそのまま反映し、ツールの変換が生む不要な差分を避けるため、XMLの`from`・`subject`をAPIの同名フィールドへ保持します。fromのOR式・subjectの中括弧式も元の欄に残し、既存の受理・拒否条件を維持します。`hasTheWord`への括弧追加は従来どおりです。詳細は[nativeフィールド保持の仕様](docs/issue-1-native-fields-proposal.md)を参照してください。
+
 新規の比較では、`query`全体が単純な送信者ORである場合に限り、`from:a@example.invalid OR from:b@example.invalid`と`{from:a@example.invalid from:b@example.invalid}`を同じ表現へ揃えます。その式全体を包む丸括弧も対象です。別に、`subject`フィールド内の連続したASCIIスペースを一つにします。アドレスの許可範囲など、全文一致の条件は[合意仕様](docs/issue-1-condition-equivalence-proposal.md)を参照してください。
 
 `from`・`to`・`subject`と`query`の間の移動、任意の検索式・否定・OR項の並べ替え、Trash条件の外側括弧は対象外です。これらの差は承認対象に残し、該当する場合に「同等性未確認」と表示します。同じ条件でもactionが違うルールは区別し、複数IDの件数も維持します。Master内に正規化後の重複があれば、配備前に停止します。
 
-表記を揃えたことで一致数が増えた場合は「表記を統一して一致したルール: N件（変更不要）」と表示します。同等なルールに削除・追加は送信しません。新規計画時の`run -v`とローカル計画には変換前・変換後・理由を記録します。変更不要の`run`でも`local/run_plan.json`に診断を保存します。この情報は条件原文を含むため、計画・進捗ログと同様に公開しないでください。
+APIにもMasterと同じnative条件がある場合は、作成・削除せず元のIDを保ちます。一方、以前にqueryへ移して作成したフィルタは、Masterがfrom/subject欄を使う場合に追加・削除差分が増えることがあります。この差は同等と推定せず、通常どおり内容を示して承認を求めます。Trashの括弧差を含め、任意の表現差を解消するものではありません。
 
-新規計画は`gmail-filters-deploy-plan/v5`と`normalization_version: query-v1`を保持し、グループ選択後も方式は変わりません。既存のv3/v4計画は従来の条件解釈で再開し、承認済みdigestや計画を自動移行しません。既存journalは従来の意味を保って進捗だけを更新します。未知のschema/versionは認証・変更前に停止します。独立した`validate`・`plan`・`verify`は新方式を使用するので、旧保留計画の再開には従来どおり`run`またはその計画の`apply`を使用してください。
+同じXML変換方式の下で表記を揃えたことで一致数が増えた場合は「表記を統一して一致したルール: N件（変更不要）」と表示します。nativeフィールド保持による比較の変化はこの件数に含めず、新規計画時の`run -v`とローカル計画に別の監査として記録します。詳細表示では、XML変換の旧条件・今回条件と、正規化の変換前・変換後・理由を区別できます。変更不要の`run`でも`local/run_plan.json`に診断を保存します。この情報は条件原文を含むため、計画・進捗ログと同様に公開しないでください。
+
+新規計画は`gmail-filters-deploy-plan/v6`、`compilation_version: xml-fields-v1`、`normalization_version: query-v1`を保持し、グループ選択後も方式は変わりません。既存v3/v4は旧XML変換＋legacy正規化、既存v5は旧XML変換＋query-v1正規化で再開します。承認済みdigestや計画を自動移行せず、journalは元の意味を保って進捗だけを更新します。未知・欠落・注入されたschema/versionの組合せはXMLコンパイル・認証前に停止します。独立した`validate`・`plan`・`verify`は新方式を使用するので、旧保留計画の再開には従来どおり`run`またはその計画の`apply`を使用してください。
 
 ## 削除対象の事前検証と一部未適用
 

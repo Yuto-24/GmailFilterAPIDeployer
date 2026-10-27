@@ -3,7 +3,7 @@
 
 Runs fully offline for `validate` and `diff-xml`.
 `plan`, `apply`, `verify` require a locally authenticated Gmail API session.
-No action touches individual messages; Action/Delete rules are immutable.
+Message reclassification is separately approved; Action/Delete never deletes mail.
 """
 from __future__ import annotations
 
@@ -59,7 +59,8 @@ class DeploymentError(Exception):
 # Only these fixed categories are aggregated; labels, IDs and rule content never
 # become metric keys. Timings are overlapping views, not additive totals.
 API_KINDS = ("labels.list", "filters.list", "labels.create", "filters.create", "filters.delete",
-             "filters.batch.create", "filters.batch.delete")
+             "filters.batch.create", "filters.batch.delete", "messages.list", "messages.get",
+             "messages.batchModify", "history.list", "getProfile")
 OBSERVATION = ContextVar("deployment_observation", default=None)
 
 
@@ -111,7 +112,7 @@ class Observation:
     def report(self):
         """Print command totals and optional overlapping API and batch-response details."""
         total = time.perf_counter() - self.started
-        title = "run全体（対話確認を含む）" if self.command == "run" else "apply全体"
+        title = "run全体（対話確認を含む）" if self.command == "run" else self.command + "全体"
         print(f"{timestamp_prefix()}[計測] {title}: {total:.2f}s / "
               f"承認入力待ち: {self.approval_wait:.2f}s / "
               f"承認入力待ち除外: {max(0.0, total - self.approval_wait):.2f}s / "
@@ -782,7 +783,7 @@ class SingleAttemptHttp:
         self.session.close()
 
 
-def get_client(client_secrets: Path, token_path: Path, allow_auth=True):
+def get_client(client_secrets: Path, token_path: Path, allow_auth=True, *, scopes=None, expected_email=None):
     try:
         from google.auth.transport.requests import Request
         from google.oauth2.credentials import Credentials
@@ -791,14 +792,18 @@ def get_client(client_secrets: Path, token_path: Path, allow_auth=True):
     except ImportError as e:
         raise DeploymentError("依存ライブラリが未インストールです: pip install -r requirements.txt") from e
     creds = None
+    required = scopes if scopes is not None else SCOPES
     if token_path.exists():
-        creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+        creds = Credentials.from_authorized_user_file(str(token_path), None if scopes is not None else SCOPES)
+    if scopes is not None and creds and not creds.has_scopes(required):
+        creds = None  # Keep the existing file until a verified replacement is ready.
+    changed = False
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         elif allow_auth:
             demand(client_secrets.exists(), f"Google OAuth DesktopクライアントJSONが必要: {client_secrets}")
-            flow = InstalledAppFlow.from_client_secrets_file(str(client_secrets), SCOPES)
+            flow = InstalledAppFlow.from_client_secrets_file(str(client_secrets), required)
             # Docker: print the URL, bind inside the container, and publish a
             # fixed loopback port on the host. Local (non-Docker) defaults stay unchanged.
             host = os.environ.get("GMAIL_OAUTH_HOST", "localhost")
@@ -812,8 +817,14 @@ def get_client(client_secrets: Path, token_path: Path, allow_auth=True):
             )
         else:
             demand(False, "認証が必要。先に plan を実行してください")
+        changed = True
+    if scopes is not None:
+        granted = creds.granted_scopes if creds.granted_scopes is not None else creds.scopes
+        demand(granted is not None and set(required) <= set(granted), "メール操作用OAuth権限が不足しています")
+        demand(expected_email and account_email(creds) == expected_email.lower(), "メール操作用OAuthアカウントが一致しません")
+    if changed:
         token_path.parent.mkdir(parents=True, exist_ok=True)
-        token_path.write_text(creds.to_json(), encoding="utf-8")
+        save_json(token_path, json.loads(creds.to_json()))
         try:
             token_path.chmod(0o600)
         except OSError:
@@ -2040,7 +2051,7 @@ def confirm_interactive(prompt: str = "上記の変更をGmailに反映します
             if observation is not None:
                 observation.approval_wait += time.perf_counter() - started
     except (EOFError, KeyboardInterrupt):
-        print("\nキャンセルしました。Gmailは変更していません。")
+        print("\nキャンセルしました。この確認での追加の変更は行いません。")
         return False
     return answer in {"y", "yes"}
 
@@ -2075,30 +2086,10 @@ def cmd_run(args):
     A pending approved plan is resumed rather than replanning from a partial
     live state. Separate per-plan journals allow indefinitely many releases.
     """
-    @contextmanager
-    def exclusive_lock(path: Path):
-        """Prevent concurrent run commands while the local plan and journal are in use."""
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open('a+b') as lockfile:
-            try:
-                import fcntl
-                fcntl.flock(lockfile.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as exc:
-                raise DeploymentError("別のrunが進行中です。二重実行を防ぐため停止しました") from exc
-            except ImportError:
-                # Docker/Linux is the reference runtime; Windows native falls
-                # back to API state verification and must not be used concurrently.
-                pass
-            try:
-                yield
-            finally:
-                try:
-                    import fcntl
-                    fcntl.flock(lockfile.fileno(), fcntl.LOCK_UN)
-                except ImportError:
-                    pass
-
-    with exclusive_lock(args.local_dir / 'run.lock'):
+    import gmail_message_reclassifier as messages
+    with messages.exclusive_lock(args.local_dir):
+        if messages.resume_before_deploy(args):
+            return
         pending_file = args.local_dir / 'run_pending.json'
         pending_plan = json.loads(pending_file.read_text(encoding='utf-8')) if pending_file.exists() else None
         compilation, normalization = (plan_modes(pending_plan) if pending_plan is not None else
@@ -2148,6 +2139,7 @@ def cmd_run(args):
                 print(f"前回の配備は既に反映済みです。MasterとAPI一致: {len(old_target)}件", flush=True)
                 pending_file.unlink()
                 observation_outcome("前回配備の反映済みを照合")
+                messages.offer_after_deploy(args, target_path, current)
                 return
             print(f"前回の中断計画を検出しました（追加済 {a_done}/{len(plan['add'])}、削除済 {r_done}/{len(plan['remove'])}）。")
         else:
@@ -2159,6 +2151,7 @@ def cmd_run(args):
                     save_json(plan_file, plan)  # Preserve the audit even when no writes are needed.
                 print(f"変更不要：{acct} の{len(target)}フィルタが最新Masterに一致しています。", flush=True)
                 observation_outcome("変更不要")
+                messages.offer_after_deploy(args, target_path, current)
                 return
             save_json(plan_file, plan)
         if args.verbose:
@@ -2249,6 +2242,7 @@ def cmd_run(args):
         else:
             print("結果: Master XMLと完全一致しました。", flush=True)
         print("Gmail UIのfresh exportと新着メール分類の確認は別途必要です。", flush=True)
+        messages.offer_after_deploy(args, target_path, actual)
 
 
 def resolve_expected_email(cli_email: str | None) -> str:
@@ -2295,25 +2289,48 @@ def main(argv=None):
     p.add_argument("--target", type=Path, help="指定しなければ最新版を自動選択")
     p.add_argument("--out", type=Path, default=default_local / "verify.json")
     p.set_defaults(func=cmd_verify)
-    for name in ("validate", "plan", "apply", "verify", "run"):
+    import gmail_message_reclassifier as messages
+    p = sub.add_parser("reclassify", help="既存メールのユーザーラベル再分類（専用対話承認）")
+    p.add_argument("--target", type=Path)
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--plan-only", action="store_true", help="完全なバックアップ・計画の作成のみ")
+    group.add_argument("--resume", help="固定済みメール計画のrun-id")
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.set_defaults(func=messages.command)
+    p = sub.add_parser("restore-labels", help="指定run-idで変更したユーザーラベルをバックアップから復元")
+    p.add_argument("--run-id", required=True)
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.set_defaults(func=messages.command)
+    for name in ("validate", "plan", "apply", "verify", "run", "reclassify", "restore-labels"):
         sub.choices[name].add_argument("--local-dir", type=Path, default=default_local,
                                        help="Master XML保存フォルダ。既定はlocal/")
-    for name in ("plan", "apply", "verify", "run"):
+    for name in ("plan", "apply", "verify", "run", "reclassify", "restore-labels"):
         p = sub.choices[name]
         p.add_argument("--expected-email", help="対象Gmailアドレス。省略時はGMAIL_EXPECTED_EMAILを使用")
         p.add_argument("--client-secrets", type=Path, default=default_local / "credentials.json")
         p.add_argument("--token", type=Path, default=default_local / "token.json")
+    for name in ("run", "reclassify", "restore-labels"):
+        p = sub.choices[name]
+        p.add_argument("--message-token", type=Path, help="メール専用OAuthトークン（既定: local-dir/message_token.json）")
+        p.add_argument("--message-batch-size", type=int, default=50, help="メール更新件数: 1〜1000、既定50")
+        p.add_argument("--max-message-batches", type=int, help="指定バッチ数のメール更新・読戻し後に停止")
     for name in ("run", "apply"):
         sub.choices[name].add_argument("--max-batches", type=int,
                                        help="指定数のバッチを照合後、保留計画を保持して終了（既定は全件）")
     args = ap.parse_args(argv)
     try:
-        with observe_command(args.cmd, args.verbose) if args.cmd in ("run", "apply") else nullcontext():
+        with observe_command(args.cmd, args.verbose) if args.cmd in ("run", "apply", "reclassify", "restore-labels") else nullcontext():
             max_batches = getattr(args, "max_batches", None)
             demand(max_batches is None or max_batches > 0, "max-batchesは1以上で指定してください")
-            if args.cmd in ("plan", "apply", "verify", "run"):
+            if args.cmd in ("plan", "apply", "verify", "run", "reclassify", "restore-labels"):
                 args.expected_email = resolve_expected_email(args.expected_email)
-            args.func(args)
+            if hasattr(args, "message_batch_size"):
+                demand(1 <= args.message_batch_size <= 1000, "message-batch-sizeは1〜1000です")
+                demand(args.max_message_batches is None or args.max_message_batches > 0, "max-message-batchesは1以上です")
+            with messages.exclusive_lock(args.local_dir) if args.cmd in ("apply", "reclassify", "restore-labels") else nullcontext():
+                if args.cmd == "apply":
+                    demand(messages.pending(args.local_dir) is None, "メール更新が未完了です。先に再開・復元してください")
+                args.func(args)
     except DeploymentError as exc:
         print("STOP: " + str(exc), file=sys.stderr)
         return 2
@@ -2324,4 +2341,6 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    # The message module shares exceptions, observation context and helpers with this CLI instance.
+    sys.modules["gmail_filter_deployer"] = sys.modules[__name__]
     sys.exit(main())

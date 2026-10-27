@@ -4,6 +4,7 @@ local
 examples
 **/credentials.json
 **/token.json
+**/message_token.json
 **/*secret*.json
 *.xml
 .env

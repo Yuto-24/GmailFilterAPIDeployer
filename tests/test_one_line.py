@@ -525,7 +525,8 @@ class TestOneLine(unittest.TestCase):
 
     def test_apply_verbose_parser(self):
         with patch.object(d,'cmd_apply') as action:
-            self.assertEqual(d.main(['apply','--expected-email','demo@example.invalid','--approve','digest','-v']),0)
+            self.assertEqual(d.main(['apply','--expected-email','demo@example.invalid','--approve','digest','-v',
+                                    '--local-dir',str(self.local)]),0)
             self.assertTrue(action.call_args.args[0].verbose)
 
     def test_no_account_pin_fails_closed(self):

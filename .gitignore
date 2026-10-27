@@ -5,6 +5,7 @@ local/
 examples/mailFilters_*.xml
 **/credentials.json
 **/token.json
+**/message_token.json
 **/*secret*.json
 *.zip
 .venv/

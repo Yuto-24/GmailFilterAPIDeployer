@@ -104,8 +104,8 @@ class CriteriaTests(unittest.TestCase):
         ]
         for before, after in examples:
             with self.subTest(before=before):
-                self.assertEqual(tuple(map(len, d.delta([d.canonical_template(before)],
-                                                       [d.canonical_template(after)]))), (1, 1))
+                self.assertEqual(tuple(map(len, d.delta([d.canonical_template(before, normalization="query-v1")],
+                                                       [d.canonical_template(after, normalization="query-v1")]))), (1, 1))
 
 
 class NormalizedPlanTests(unittest.TestCase):
@@ -133,7 +133,7 @@ class NormalizedPlanTests(unittest.TestCase):
         client = raw_client([rule({"query": BRACES, "subject": "meeting reminder"})], self.log)
         plan, rows = self.plan(client)
         self.assertEqual((plan["add"], plan["remove"], plan["normalization_matched"]), ([], [], 1))
-        self.assertEqual(plan["schema"], "gmail-filters-deploy-plan/v6")
+        self.assertEqual(plan["schema"], "gmail-filters-deploy-plan/v7")
         note = plan["normalization_audit"][0]
         self.assertEqual((note["source"], note["entry"]), ("xml", 1))
         self.assertEqual(note["reasons"], ["query_sender_or", "subject_ascii_spaces"])
@@ -165,7 +165,7 @@ class NormalizedPlanTests(unittest.TestCase):
         self.assertEqual(plan["normalization_matched"], 0)
         self.assertEqual((len(plan["add"]), len(plan["remove"])), (0, 1))
         selected = d.select_plan_groups(plan, ["other"], current=rows)
-        self.assertEqual(selected["schema"], "gmail-filters-deploy-plan/v6")
+        self.assertEqual(selected["schema"], "gmail-filters-deploy-plan/v7")
         self.assertEqual(selected["skipped_deletions"][0]["reason"], "duplicate_matches")
         client = raw_client([rule({"query": OR}, "Type/Other")], self.log)
         plan, _ = self.plan(client)

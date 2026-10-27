@@ -1,4 +1,4 @@
-"""Synthetic XML mapping, v6 audit boundaries, and frozen pre-change v5 resumes."""
+"""Synthetic XML mapping, versioned audit boundaries, and frozen pre-change v5 resumes."""
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from copy import deepcopy
 from io import StringIO
@@ -35,7 +35,7 @@ class NativeCompilerTests(unittest.TestCase):
             "negatedQuery": '"invoice  notice"'})
         self.assertEqual(legacy["criteria"]["query"],
                          QUERY_SENDERS + " subject:" + SUBJECT + " ((in:spam {phishing}))")
-        self.assertEqual(d.canonical_template(native)["criteria"], native["criteria"])
+        self.assertEqual(d.canonical_template(native, normalization="query-v1")["criteria"], native["criteria"])
 
     def test_rejected_forms_remain_rejected_with_the_same_error(self):
         """Preserve the existing compiler's rejected input domain in both modes."""
@@ -53,7 +53,7 @@ class NativeCompilerTests(unittest.TestCase):
                 self.assertEqual(str(old.exception), str(new.exception))
 
     def test_has_the_word_and_trash_brackets_do_not_change(self):
-        """Retain every existing hasTheWord wrapper, including the unresolved Trash example."""
+        """Retain compiler wrappers and preserve the pre-query-v2 interpretation."""
         for text in ("in:spam {phishing}", "(in:spam {phishing})", "((in:spam {phishing}))",
                      "in:spam(phishing)", '"two  words"', "-invoice OR reminder"):
             with self.subTest(text=text):
@@ -63,7 +63,7 @@ class NativeCompilerTests(unittest.TestCase):
                 self.assertEqual(new, old)
                 self.assertEqual(new["criteria"], {"query": "(" + text + ")"})
         compiled = d.canonical_template(d.build_template(
-            {"hasTheWord": "(in:spam {phishing})", "shouldTrash": "true"}))
+            {"hasTheWord": "(in:spam {phishing})", "shouldTrash": "true"}), normalization="query-v1")
         live = {**compiled, "criteria": {"query": "(in:spam {phishing})"}}
         self.assertEqual(tuple(map(len, d.delta([live], [compiled]))), (1, 1))
 
@@ -118,8 +118,8 @@ class NativePlanTests(unittest.TestCase):
             self.assertEqual(d.main(self.run_args()), 0)
         self.assertEqual(client.filters, original)
         saved = json.loads((self.local / "run_plan.json").read_text())
-        self.assertEqual(d.plan_modes(saved), ("xml-fields-v1", "query-v1"))
-        self.assertEqual(saved["schema"], "gmail-filters-deploy-plan/v6")
+        self.assertEqual(d.plan_modes(saved), ("xml-fields-v1", "query-v2"))
+        self.assertEqual(saved["schema"], "gmail-filters-deploy-plan/v7")
         self.assertEqual((saved["add"], saved["remove"], saved["normalization_matched"]), ([], [], 0))
         self.assertEqual(saved["normalization_audit"], [])
         self.assertEqual(len(saved["compilation_audit"]), 2)
@@ -230,7 +230,7 @@ class NativePlanTests(unittest.TestCase):
         self.assertEqual(payloads[0]["criteria"], {"from": SENDERS, "subject": SUBJECT, "query": '("two words")'})
         self.assertEqual(set(payloads[0]), {"criteria", "action"})
         saved = json.loads((self.local / "run_plan.json").read_text())
-        self.assertEqual(saved["schema"], "gmail-filters-deploy-plan/v6")
+        self.assertEqual(saved["schema"], "gmail-filters-deploy-plan/v7")
         self.assertEqual(saved["selected_groups"], ["other"])
         live = [row["filter"] for row in d.api_fetch(client)[0]]
         self.assertIn(baseline[1], live)

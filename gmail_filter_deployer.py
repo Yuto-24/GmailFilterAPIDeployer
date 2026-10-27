@@ -40,11 +40,14 @@ KNOWN = {
     "shouldTrash", "sizeOperator", "sizeUnit",
 }
 FILTER_LIMIT = 1000
-CURRENT_NORMALIZATION = "query-v1"
+QUERY_V1_NORMALIZATION = "query-v1"
+CURRENT_NORMALIZATION = "query-v2"
+SUPPORTED_NORMALIZATIONS = ("legacy", QUERY_V1_NORMALIZATION, CURRENT_NORMALIZATION)
 CURRENT_COMPILATION = "xml-fields-v1"
 LEGACY_PLAN_SCHEMAS = ("gmail-filters-deploy-plan/v3", "gmail-filters-deploy-plan/v4")
 QUERY_V1_PLAN_SCHEMA = "gmail-filters-deploy-plan/v5"
-CURRENT_PLAN_SCHEMA = "gmail-filters-deploy-plan/v6"
+NATIVE_V1_PLAN_SCHEMA = "gmail-filters-deploy-plan/v6"
+CURRENT_PLAN_SCHEMA = "gmail-filters-deploy-plan/v7"
 SENDER_ADDRESS = r"[A-Za-z0-9]+(?:[._+-][A-Za-z0-9]+)*@(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,63}"
 FROM_ATOM = "from:" + SENDER_ADDRESS
 
@@ -548,9 +551,14 @@ def plan_modes(plan: dict) -> tuple[str, str]:
                "旧計画に解釈versionが追加されています")
         return "legacy", "legacy"
     if plan.get("schema") == QUERY_V1_PLAN_SCHEMA:
-        demand(plan.get("normalization_version") == CURRENT_NORMALIZATION and
+        demand(plan.get("normalization_version") == QUERY_V1_NORMALIZATION and
                "compilation_version" not in plan, "v5計画の正規化/コンパイルversionが不正です")
-        return "legacy", CURRENT_NORMALIZATION
+        return "legacy", QUERY_V1_NORMALIZATION
+    if plan.get("schema") == NATIVE_V1_PLAN_SCHEMA:
+        demand(plan.get("normalization_version") == QUERY_V1_NORMALIZATION and
+               plan.get("compilation_version") == CURRENT_COMPILATION,
+               "v6計画の正規化/コンパイルversionが不正です")
+        return CURRENT_COMPILATION, QUERY_V1_NORMALIZATION
     demand(plan.get("schema") == CURRENT_PLAN_SCHEMA and
            plan.get("normalization_version") == CURRENT_NORMALIZATION and
            plan.get("compilation_version") == CURRENT_COMPILATION,
@@ -563,9 +571,15 @@ def normalization_for_plan(plan: dict) -> str:
     return plan_modes(plan)[1]
 
 
+def simple_spam_query(body: str) -> bool:
+    """Recognize one unwrapped ASCII spam query, excluding standalone operator words."""
+    match = re.fullmatch(r"in:spam \{([A-Za-z0-9]+(?: [A-Za-z0-9]+)*)\}", body)
+    return bool(match and not {"AND", "OR", "AROUND", "NOT"}.intersection(match.group(1).split(" ")))
+
+
 def normalize_criteria(criteria: dict, *, normalization: str) -> tuple[dict, list[str]]:
-    """Normalize only whole sender disjunctions and ASCII spaces in native subject."""
-    demand(normalization in ("legacy", CURRENT_NORMALIZATION), "未知の正規化方式です")
+    """Apply pinned notation rules; only query-v2 also normalizes narrow spam wrappers."""
+    demand(normalization in SUPPORTED_NORMALIZATIONS, "未知の正規化方式です")
     result = dict(criteria)
     reasons = []
     if normalization == "legacy":
@@ -577,7 +591,11 @@ def normalize_criteria(criteria: dict, *, normalization: str) -> tuple[dict, lis
         # string to match the small grammar. No partial rewrite survives failure.
         while body.startswith("(") and body.endswith(")"):
             body = body[1:-1]
-        if re.fullmatch(FROM_ATOM + r"(?: OR " + FROM_ATOM + r")+", body):
+        reason = "query_sender_or"
+        if normalization == CURRENT_NORMALIZATION and simple_spam_query(body):
+            replacement = "(" + body + ")"
+            reason = "query_spam_outer_parentheses"
+        elif re.fullmatch(FROM_ATOM + r"(?: OR " + FROM_ATOM + r")+", body):
             replacement = "{" + " ".join(body.split(" OR ")) + "}"
         elif re.fullmatch(r"\{" + FROM_ATOM + r"(?: " + FROM_ATOM + r")+\}", body):
             replacement = body
@@ -585,7 +603,7 @@ def normalize_criteria(criteria: dict, *, normalization: str) -> tuple[dict, lis
             replacement = query
         if replacement != query:
             result["query"] = replacement
-            reasons.append("query_sender_or")
+            reasons.append(reason)
     subject = result.get("subject")
     if isinstance(subject, str):
         replacement = re.sub(" {2,}", " ", subject)
@@ -624,7 +642,7 @@ def compile_xml(path: Path, *, compilation=CURRENT_COMPILATION,
                 normalization=CURRENT_NORMALIZATION, audit=None, compilation_audit=None) -> list[dict]:
     """Compile with pinned policies, keeping mapping provenance separate from normalization."""
     demand(compilation in ("legacy", CURRENT_COMPILATION), "未知のXMLコンパイル方式です")
-    demand(normalization in ("legacy", CURRENT_NORMALIZATION), "未知の正規化方式です")
+    demand(normalization in SUPPORTED_NORMALIZATIONS, "未知の正規化方式です")
     entries = atom_entries(path)
     check_xml_rules(entries)
     out = []
@@ -848,7 +866,7 @@ def filters_with_known_labels(client, labels_by_name: dict[str, str], *, verbose
 def api_fetch(client, *, verbose: bool = False, retry_reads: bool = True,
               normalization=CURRENT_NORMALIZATION) -> tuple[list[dict], dict[str, str]]:
     """Read Gmail settings once per resource and normalize in the selected mode."""
-    demand(normalization in ("legacy", CURRENT_NORMALIZATION), "未知の正規化方式です")
+    demand(normalization in SUPPORTED_NORMALIZATIONS, "未知の正規化方式です")
     labels = read_operation(
         "Gmail labels.list", lambda: client.users().labels().list(userId="me").execute(num_retries=0),
         verbose, retry=retry_reads).get("labels", [])
@@ -949,7 +967,8 @@ def select_plan_groups(plan: dict, selected: list[str],
                        current: list[dict] | None = None) -> dict:
     """Pin a subset of groups to the original live snapshot and XML hash."""
     compilation, normalization = plan_modes(plan)
-    demand(plan.get("schema") in ("gmail-filters-deploy-plan/v3", QUERY_V1_PLAN_SCHEMA, CURRENT_PLAN_SCHEMA) and
+    demand(plan.get("schema") in ("gmail-filters-deploy-plan/v3", QUERY_V1_PLAN_SCHEMA,
+                                 NATIVE_V1_PLAN_SCHEMA, CURRENT_PLAN_SCHEMA) and
            not plan.get("selected_groups"), "新規の差分計画のみ選択できます")
     master = compile_xml(Path(plan["target_path"]), compilation=compilation, normalization=normalization)
     demand(file_hash(plan["target_path"]) == plan["target_sha256"],
@@ -1017,7 +1036,8 @@ def make_plan(base_path: Path | None, target_path: Path, live: list[dict], acct:
               extra_baselines: list[Path] | None = None, *, compilation=CURRENT_COMPILATION,
               normalization=CURRENT_NORMALIZATION, live_rows=None) -> dict:
     """Build a pinned, fully reviewed diff from a live API snapshot by default."""
-    demand((compilation, normalization) in (("legacy", "legacy"), ("legacy", CURRENT_NORMALIZATION),
+    demand((compilation, normalization) in (("legacy", "legacy"), ("legacy", QUERY_V1_NORMALIZATION),
+                                          (CURRENT_COMPILATION, QUERY_V1_NORMALIZATION),
                                           (CURRENT_COMPILATION, CURRENT_NORMALIZATION)),
            "未対応のコンパイル/正規化方式の組合せです")
     audit = []
@@ -1065,7 +1085,8 @@ def make_plan(base_path: Path | None, target_path: Path, live: list[dict], acct:
     existing_labels = set(labels)
     new_labels = sorted(set(x[6:] for t in adds for x in t["action"]["addLabelIds"] if x.startswith("label:")) - existing_labels)
     plan = {
-        "schema": (CURRENT_PLAN_SCHEMA if compilation == CURRENT_COMPILATION else
+        "schema": (CURRENT_PLAN_SCHEMA if normalization == CURRENT_NORMALIZATION else
+                   NATIVE_V1_PLAN_SCHEMA if compilation == CURRENT_COMPILATION else
                    "gmail-filters-deploy-plan/v3" if normalization == "legacy" else QUERY_V1_PLAN_SCHEMA),
         "operation_order": "remove_first",
         "created_utc": datetime.now(timezone.utc).isoformat(),
@@ -1909,7 +1930,8 @@ def format_filter_summary(row: dict) -> str:
 
 def show_normalization_summary(plan: dict, *, verbose=False) -> None:
     """Distinguish field-preserving compilation from established notation equivalence."""
-    if normalization_for_plan(plan) == "legacy":
+    normalization = normalization_for_plan(plan)
+    if normalization == "legacy":
         return
     compilation_audit = plan.get("compilation_audit", [])
     if compilation_audit and verbose:
@@ -1922,7 +1944,10 @@ def show_normalization_summary(plan: dict, *, verbose=False) -> None:
     for row in plan["add"] + plan["remove"]:
         criteria = row["criteria"]
         query = criteria.get("query")
-        if (query and not re.fullmatch(r"\{" + FROM_ATOM + r"(?: " + FROM_ATOM + r")+\}", query)
+        known_query = query and (re.fullmatch(r"\{" + FROM_ATOM + r"(?: " + FROM_ATOM + r")+\}", query)
+            or normalization == CURRENT_NORMALIZATION and query.startswith("(") and query.endswith(")")
+            and simple_spam_query(query[1:-1]))
+        if (query and not known_query
                 or criteria.get("negatedQuery")
                 or " OR " in criteria.get("from", "")
                 or "{" in criteria.get("subject", "")):

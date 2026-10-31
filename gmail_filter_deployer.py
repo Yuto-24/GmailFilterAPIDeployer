@@ -269,12 +269,13 @@ def retry_wait(label: str, attempt: int, exc: Exception, verbose: bool) -> None:
     time.sleep(delay)
 
 
-def read_operation(label: str, call, verbose=False, *, retry=True):
+def read_operation(label: str, call, verbose=False, *, retry=True, transient=None):
+    transient = transient_api_error if transient is None else transient
     for attempt in range(len(API_RETRY_DELAYS_SECONDS) + 1):
         try:
             return timed_operation(label, call, verbose)
         except Exception as exc:
-            if not retry or not transient_api_error(exc):
+            if not retry or not transient(exc):
                 raise
             if attempt == len(API_RETRY_DELAYS_SECONDS):
                 raise DeploymentError(f"{label}: 一時障害（{api_error_code(exc)}）が継続。"

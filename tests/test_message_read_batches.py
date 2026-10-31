@@ -27,6 +27,12 @@ class Batch:
             elif self.client.read_fault == 'transient':
                 self.client.read_fault = None
                 self.callback(mid, None, ApiError(500, 'backendError'))
+            elif self.client.read_fault == 'precondition':
+                self.client.read_fault = None
+                self.callback(mid, None, ApiError(400, 'failedPrecondition'))
+            elif self.client.read_fault == 'mixed_precondition_forbidden':
+                reason = 'failedPrecondition' if mid == 'b' else 'forbidden'
+                self.callback(mid, None, ApiError(400 if mid == 'b' else 403, reason))
             else:
                 self.callback(mid, request.execute(), None)
                 if self.client.read_fault == 'duplicate':
@@ -79,6 +85,67 @@ class MessageReadBatchTests(unittest.TestCase):
         self.assertEqual(len(list(self.api.snapshots(['a','b']))), 2)
         self.assertEqual(self.client.read_batches, [['a','b'], ['a','b']])
         self.assertEqual(self.client.writes, [])
+
+    def test_transient_precondition_get_recovers_without_writes(self):
+        attempts = []
+        def fail_once(kind):
+            if kind == 'messages.get':
+                attempts.append(kind)
+                if len(attempts) == 1:
+                    raise ApiError(400, 'failedPrecondition')
+        self.client.on_request = fail_once
+        api = m.Gmail(self.client)
+        self.assertEqual([mid for mid, _ in api.snapshots(['a'])], ['a'])
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(self.client.writes, [])
+
+    def test_persistent_precondition_get_stops_after_three_attempts(self):
+        def fail(kind):
+            if kind == 'messages.get':
+                raise ApiError(400, 'failedPrecondition')
+        self.client.on_request = fail
+        with self.assertRaises(d.DeploymentError):
+            list(m.Gmail(self.client).snapshots(['a']))
+        self.assertEqual(self.client.calls.count('messages.get'), 3)
+        self.assertEqual(self.client.writes, [])
+
+    def test_other_errors_and_non_message_reads_are_not_reclassified(self):
+        errors = [ApiError(400, 'invalidArgument'), ApiError(401, 'authError'), ApiError(403, 'forbidden')]
+        malformed = ApiError(400, 'failedPrecondition')
+        malformed.content = b'not JSON'
+        errors.append(malformed)
+        for error in errors:
+            with self.subTest(error=error.content):
+                request = fixtures.Req(lambda: (_ for _ in ()).throw(error))
+                with patch.object(request, 'execute', wraps=request.execute) as execute:
+                    with self.assertRaises(type(error)):
+                        m.Gmail(self.client).read('messages.get', request)
+                    self.assertEqual(execute.call_count, 1)
+        error = ApiError(400, 'failedPrecondition')
+        self.assertFalse(d.transient_api_error(error))
+        request = fixtures.Req(lambda: (_ for _ in ()).throw(error))
+        with patch.object(request, 'execute', wraps=request.execute) as execute:
+            with self.assertRaises(ApiError):
+                m.Gmail(self.client).read('labels.list', request)
+            self.assertEqual(execute.call_count, 1)
+
+    def test_inner_precondition_recovers_but_permanent_sibling_stops(self):
+        self.client.read_fault = 'precondition'
+        self.assertEqual([mid for mid, _ in self.api.snapshots(['a','b'])], ['a','b'])
+        self.assertEqual(self.client.read_batches, [['a','b'], ['a','b']])
+        self.client.read_batches.clear()
+        self.client.read_fault = 'mixed_precondition_forbidden'
+        with self.assertRaises(ApiError) as caught:
+            list(self.api.snapshots(['a','b']))
+        self.assertEqual(caught.exception.resp.status, 403)
+        self.assertEqual(self.client.read_batches, [['a','b']])
+        self.assertEqual(self.client.writes, [])
+
+    def test_precondition_write_failure_is_never_retried(self):
+        self.client.write_failure = ApiError(400, 'failedPrecondition')
+        with self.assertRaises(ApiError):
+            self.api.modify(['a'], ['L1'], [])
+        self.assertEqual(len(self.client.writes), 1)
 
     def test_plan_apply_and_restore_with_batched_reads_and_unknown_metadata(self):
         self.client.mail['a']['labelIds'].append('Label_missing')

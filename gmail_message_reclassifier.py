@@ -172,6 +172,19 @@ class UnknownMessageLabels(d.DeploymentError):
         self.row = row
 
 
+def transient_metadata_error(exc):
+    """Allow observed transient preconditions only for minimal message GETs."""
+    if d.transient_api_error(exc):
+        return True
+    if getattr(getattr(exc, "resp", None), "status", None) != 400:
+        return False
+    try:
+        errors = json.loads(exc.content)["error"]["errors"]
+        return bool(errors) and all(row["reason"] == "failedPrecondition" for row in errors)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return False
+
+
 class Gmail:
     """One-attempt writes; bounded read retries, minimal message projections."""
     def __init__(self, client, verbose=False, read_batch_size=1):
@@ -182,7 +195,9 @@ class Gmail:
         self.deadline = None
 
     def read(self, kind, request):
-        return d.read_operation("Gmail " + kind, lambda: request.execute(num_retries=0), self.verbose)
+        transient = transient_metadata_error if kind == "messages.get" else None
+        return d.read_operation("Gmail " + kind, lambda: request.execute(num_retries=0), self.verbose,
+                                transient=transient)
 
     def labels(self):
         rows = self.read("labels.list", self.client.users().labels().list(userId="me")).get("labels", [])
@@ -278,10 +293,13 @@ class Gmail:
                 batch.execute()
                 require(not invalid and seen == set(chunk), "メール読取りバッチの応答が不足・重複しています")
                 if failures:
-                    raise next(iter(failures.values()))
+                    # A permanent sibling error must not be hidden by a retryable one.
+                    raise next((exc for exc in failures.values() if not transient_metadata_error(exc)),
+                               next(iter(failures.values())))
                 return rows
 
-            rows = d.read_operation("Gmail messages.get batch", fetch, self.verbose)
+            rows = d.read_operation("Gmail messages.get batch", fetch, self.verbose,
+                                    transient=transient_metadata_error)
             delay = len(chunk) / 4 - (time.monotonic() - started)
             if delay > 0:
                 time.sleep(delay)

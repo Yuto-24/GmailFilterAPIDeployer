@@ -19,6 +19,8 @@ class Batch:
 
     def execute(self):
         self.client.read_batches.append([mid for mid, _ in self.requests])
+        if hasattr(self.client, 'batch_started_times'):
+            self.client.batch_started_times.append(m.time.monotonic())
         for mid, request in reversed(self.requests):
             if self.client.read_fault == 'missing':
                 continue
@@ -29,6 +31,8 @@ class Batch:
                 self.callback(mid, None, ApiError(500, 'backendError'))
             elif self.client.read_fault == 'precondition':
                 self.client.read_fault = None
+                self.callback(mid, None, ApiError(400, 'failedPrecondition'))
+            elif self.client.read_fault == 'persistent_precondition':
                 self.callback(mid, None, ApiError(400, 'failedPrecondition'))
             elif self.client.read_fault == 'mixed_precondition_forbidden':
                 reason = 'failedPrecondition' if mid == 'b' else 'forbidden'
@@ -146,6 +150,23 @@ class MessageReadBatchTests(unittest.TestCase):
         with self.assertRaises(ApiError):
             self.api.modify(['a'], ['L1'], [])
         self.assertEqual(len(self.client.writes), 1)
+
+    def test_every_failed_fifty_message_attempt_reserves_its_quota_budget(self):
+        self.client.read_fault = 'persistent_precondition'
+        self.client.batch_started_times = []
+        clock = [0.0]
+        def sleep(seconds):
+            clock[0] += seconds
+        with patch.object(m.time, 'monotonic', side_effect=lambda: clock[0]), \
+             patch.object(m.time, 'sleep', side_effect=sleep), \
+             patch.object(d.random, 'uniform', return_value=0):
+            with self.assertRaises(d.DeploymentError):
+                list(m.Gmail(self.client, read_batch_size=50).snapshots([str(i) for i in range(50)]))
+        starts = self.client.batch_started_times
+        self.assertEqual(len(starts), 3)
+        self.assertTrue(all(b - a >= 12.5 for a, b in zip(starts, starts[1:])))
+        self.assertGreaterEqual(clock[0] - starts[-1], 12.5)
+        self.assertEqual(self.client.writes, [])
 
     def test_plan_apply_and_restore_with_batched_reads_and_unknown_metadata(self):
         self.client.mail['a']['labelIds'].append('Label_missing')

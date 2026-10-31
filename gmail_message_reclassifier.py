@@ -274,35 +274,37 @@ class Gmail:
                 yield chunk[0], row
                 continue
             require(len(set(chunk)) == len(chunk), "メール読取りバッチのIDが重複しています")
-            started = time.monotonic()
 
             def fetch():
-                rows, failures, seen, invalid = {}, {}, set(), []
-                def observed(mid, row, error):
-                    if mid not in chunk or mid in seen:
-                        invalid.append(mid)
-                        return
-                    seen.add(mid)
-                    if error is not None:
-                        failures[mid] = error
-                    else:
-                        rows[mid] = row
-                batch = self.client.new_batch_http_request(callback=observed)
-                for mid in chunk:
-                    batch.add(self.message_request(mid), request_id=mid)
-                batch.execute()
-                require(not invalid and seen == set(chunk), "メール読取りバッチの応答が不足・重複しています")
-                if failures:
-                    # A permanent sibling error must not be hidden by a retryable one.
-                    raise next((exc for exc in failures.values() if not transient_metadata_error(exc)),
-                               next(iter(failures.values())))
-                return rows
+                started = time.monotonic()
+                try:
+                    rows, failures, seen, invalid = {}, {}, set(), []
+                    def observed(mid, row, error):
+                        if mid not in chunk or mid in seen:
+                            invalid.append(mid)
+                            return
+                        seen.add(mid)
+                        if error is not None:
+                            failures[mid] = error
+                        else:
+                            rows[mid] = row
+                    batch = self.client.new_batch_http_request(callback=observed)
+                    for mid in chunk:
+                        batch.add(self.message_request(mid), request_id=mid)
+                    batch.execute()
+                    require(not invalid and seen == set(chunk), "メール読取りバッチの応答が不足・重複しています")
+                    if failures:
+                        # A permanent sibling error must not be hidden by a retryable one.
+                        raise next((exc for exc in failures.values() if not transient_metadata_error(exc)),
+                                   next(iter(failures.values())))
+                    return rows
+                finally:
+                    delay = len(chunk) / 4 - (time.monotonic() - started)
+                    if delay > 0:
+                        time.sleep(delay)
 
             rows = d.read_operation("Gmail messages.get batch", fetch, self.verbose,
                                     transient=transient_metadata_error)
-            delay = len(chunk) / 4 - (time.monotonic() - started)
-            if delay > 0:
-                time.sleep(delay)
             for mid in chunk:
                 yield mid, rows[mid]
 

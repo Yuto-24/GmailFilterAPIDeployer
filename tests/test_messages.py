@@ -164,6 +164,9 @@ class SearchTests(unittest.TestCase):
 
 class MessageTests(unittest.TestCase):
     def setUp(self):
+        sleeper = patch.object(m.time, "sleep")
+        sleeper.start()
+        self.addCleanup(sleeper.stop)
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.local = Path(tmp.name)

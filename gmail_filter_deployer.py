@@ -2117,6 +2117,8 @@ def cmd_run(args):
     """
     import gmail_message_reclassifier as messages
     with messages.exclusive_lock(args.local_dir):
+        if not messages.authorize_run(args):
+            return
         if messages.resume_before_deploy(args):
             return
         pending_file = args.local_dir / 'run_pending.json'
@@ -2306,6 +2308,8 @@ def main(argv=None):
     p.add_argument("--target", type=Path, help="任意: デフォルトは最新Masterを自動選択")
     p.add_argument("--batch-size", type=int, default=1, help="削除・追加のHTTPバッチ件数。1〜25、既定1。1は逐次処理")
     p.add_argument("-v", "--verbose", action="store_true", help="フィルタ単位の処理・API照合の詳細を表示")
+    p.add_argument("--reclassify-existing", action="store_true",
+                   help="起動時に既存メールのラベル置換を明示承認し、配備・照合後にバックアップと再分類を自動実行")
     p.set_defaults(func=cmd_run)
     p = sub.add_parser("validate", help="オフライン: 最新Master XMLを検証（--baseは任意）")
     p.add_argument("--base", type=Path, help="任意の厳格な比較元XML")
@@ -2350,10 +2354,17 @@ def main(argv=None):
         p.add_argument("--expected-email", help="対象Gmailアドレス。省略時はGMAIL_EXPECTED_EMAILを使用")
         p.add_argument("--client-secrets", type=Path, default=default_local / "credentials.json")
         p.add_argument("--token", type=Path, default=default_local / "token.json")
+    for name in ("run", "reclassify"):
+        sub.choices[name].add_argument("--skip-unknown-message-labels", action="store_true",
+            help="計画時にラベル一覧にないIDを持つメールを記録・保留し、確認できるメールを処理（保留ありは終了コード4）")
     for name in ("run", "reclassify", "restore-labels"):
         p = sub.choices[name]
         p.add_argument("--message-token", type=Path, help="メール専用OAuthトークン（既定: local-dir/message_token.json）")
+        p.add_argument("--message-read-batch-size", type=int, default=1,
+                       help="最小メタデータ読取りのHTTPバッチ件数: 1〜50、既定1。更新バッチとは独立")
         p.add_argument("--message-batch-size", type=int, default=50, help="メール更新件数: 1〜1000、既定50")
+        p.add_argument("--max-message-seconds", type=float,
+                       help="起動からのメール処理時間の目安。計画完成後に確認し、適用は読戻しの区切りで保留")
         p.add_argument("--max-message-batches", type=int, help="指定バッチ数のメール更新・読戻し後に停止")
     for name in ("run", "apply"):
         sub.choices[name].add_argument("--defer-unconfirmed", action="store_true",
@@ -2370,8 +2381,14 @@ def main(argv=None):
             if args.cmd in ("plan", "apply", "verify", "run", "reclassify", "restore-labels"):
                 args.expected_email = resolve_expected_email(args.expected_email)
             if hasattr(args, "message_batch_size"):
+                demand(1 <= args.message_read_batch_size <= 50, "message-read-batch-sizeは1〜50です")
                 demand(1 <= args.message_batch_size <= 1000, "message-batch-sizeは1〜1000です")
                 demand(args.max_message_batches is None or args.max_message_batches > 0, "max-message-batchesは1以上です")
+                if args.max_message_seconds is not None:
+                    import math
+                    demand(math.isfinite(args.max_message_seconds) and args.max_message_seconds > 0,
+                           "max-message-secondsは有限の正数です")
+                    args._message_deadline = time.monotonic() + args.max_message_seconds
             with messages.exclusive_lock(args.local_dir) if args.cmd in ("apply", "reclassify", "restore-labels") else nullcontext():
                 if args.cmd == "apply":
                     demand(messages.pending(args.local_dir) is None, "メール更新が未完了です。先に再開・復元してください")

@@ -58,7 +58,7 @@ class DeploymentError(Exception):
 
 # Only these fixed categories are aggregated; labels, IDs and rule content never
 # become metric keys. Timings are overlapping views, not additive totals.
-API_KINDS = ("labels.list", "filters.list", "labels.create", "filters.create", "filters.delete",
+API_KINDS = ("labels.list", "filters.list", "filters.get", "labels.create", "filters.create", "filters.delete",
              "filters.batch.create", "filters.batch.delete", "messages.list", "messages.get",
              "messages.batchModify", "history.list", "getProfile")
 OBSERVATION = ContextVar("deployment_observation", default=None)
@@ -1239,6 +1239,9 @@ def batch_progress(base, plan, current, log, labels=None):
         demand(prior.get("plan_digest") == plan["approval_digest"],
                "配備ログに別の計画が記録されています")
     checkpoint = prior.get("batch_checkpoint")
+    if checkpoint is not None and checkpoint.get("schema") == 2:
+        import gmail_filter_deferred as deferred
+        return deferred.progress(plan, prior, current, labels if labels is not None else checkpoint["labels"])
     if checkpoint is None:
         a, r = detect_position(base, plan, [row["filter"] for row in current])
         return set(range(a)), set(range(r))
@@ -1689,6 +1692,14 @@ def perform_batched(client, plan, base, target, current, labels, log, batch_size
     return {"rows": current, "labels": labels}
 
 
+def validate_continuation_switch(log, requested):
+    """Do not inherit a legacy in-flight deletion inferred only from list absence."""
+    if requested and log.exists():
+        cp = json.loads(log.read_text()).get("batch_checkpoint", {})
+        demand(not cp.get("pending") or cp.get("schema") == 2,
+               "旧モードの送信中操作が未確定です。進捗を保持し、旧モードで照合してから切り替えてください")
+
+
 def validate_batch_limit(log, batch_size, max_batches):
     prior = json.loads(log.read_text(encoding="utf-8")) if log.exists() else {}
     demand(max_batches is None or max_batches > 0, "max-batchesは1以上で指定してください")
@@ -1716,10 +1727,16 @@ def validate_before_final_approval(plan: dict, expected_email: str, log: Path,
            f"配備途中の最大件数{peak}件がGmailの上限{FILTER_LIMIT}件を超えます")
     added, removed = batch_progress(base, plan, current, log)
     # Every *remaining* deletion must refer to exactly one current filter ID.
+    validation_rows = current
+    if log.exists():
+        checkpoint = json.loads(log.read_text()).get("batch_checkpoint", {})
+        if checkpoint.get("schema") == 2:
+            demand(batch_size == 1, "保留継続モードは--batch-size 1専用です")
+            validation_rows = checkpoint["rows"]
     for i, rule in enumerate(plan["remove"]):
         if i in removed:
             continue
-        matching = [x for x in current if x["filter"] == rule]
+        matching = [x for x in validation_rows if x["filter"] == rule]
         demand(len(matching) == 1 and isinstance(matching[0].get("id"), str)
                and matching[0]["id"].strip(),
                f"削除対象が最終承認前に一意でなくなりました: "
@@ -1738,7 +1755,7 @@ def validate_before_final_approval(plan: dict, expected_email: str, log: Path,
 
 
 def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_size=1, verbose=False,
-            max_batches=None, readback_interval=50):
+            max_batches=None, readback_interval=50, defer_unconfirmed=False):
     """Validate the approved plan and resume deployment using its pinned interpretation."""
     normalization = normalization_for_plan(plan)
     demand(expected.lower() == plan["account"].lower(), "対象アカウントが承認計画と不一致")
@@ -1755,7 +1772,15 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
     peak = max(len(base), len(target)) if order == "remove_first" else len(base) + len(plan["add"])
     demand(peak <= FILTER_LIMIT,
            f"配備中の最大フィルタ数{peak}件がGmail上限{FILTER_LIMIT}件を超えます")
+    validate_continuation_switch(log, defer_unconfirmed)
+    prior = json.loads(log.read_text()) if log.exists() else {}
+    continuation = defer_unconfirmed or prior.get("batch_checkpoint", {}).get("schema") == 2
+    demand(not continuation or batch_size == 1, "保留継続モードは--batch-size 1専用です")
     current, labels = fetch_for_deploy(client, verbose=verbose, normalization=normalization)
+    if continuation:
+        import gmail_filter_deferred as deferred
+        return deferred.perform(client, plan, current, labels, log, verbose=verbose,
+                                max_batches=max_batches, readback_interval=readback_interval)
     return perform_batched(client, plan, base, target, current, labels, log, batch_size, verbose,
                            max_batches, readback_interval)
 
@@ -1908,7 +1933,11 @@ def cmd_apply(args):
            f"旧フィルタ{len(plan['remove'])}件の削除予定があります。plan.jsonを確認し、承認する場合だけ--allow-removalsを指定してください")
     start_phase("[3/3] 承認済み計画の配備・API読戻し", deployment=True)
     result = perform(client, plan, acct, args.approve, args.log, args.batch_size, verbose=args.verbose,
-                     max_batches=getattr(args, "max_batches", None))
+                     max_batches=getattr(args, "max_batches", None),
+                     defer_unconfirmed=getattr(args, "defer_unconfirmed", False))
+    if isinstance(result, dict) and result.get("verified") is False:
+        args.exit_code = 4
+        observation_outcome("一部完了（保留を保持）")
     if result is False:
         observation_outcome("途中終了（保留計画を保持）")
 
@@ -2088,12 +2117,17 @@ def cmd_run(args):
     """
     import gmail_message_reclassifier as messages
     with messages.exclusive_lock(args.local_dir):
+        if not messages.authorize_run(args):
+            return
         if messages.resume_before_deploy(args):
             return
         pending_file = args.local_dir / 'run_pending.json'
         pending_plan = json.loads(pending_file.read_text(encoding='utf-8')) if pending_file.exists() else None
         compilation, normalization = (plan_modes(pending_plan) if pending_plan is not None else
                                       (CURRENT_COMPILATION, CURRENT_NORMALIZATION))
+        if pending_plan is not None:
+            validate_continuation_switch(args.local_dir / 'logs' / (pending_plan['approval_digest'] + '.json'),
+                                         getattr(args, 'defer_unconfirmed', False))
         start_phase("[1/6] 最新Master XMLを選択・検証")
         print("[1/6] 最新Master XMLを選択・検証中...", flush=True)
         target_path = select_master(args.local_dir, args.target)
@@ -2126,8 +2160,12 @@ def cmd_run(args):
             journal = args.local_dir / 'logs' / (plan['approval_digest'] + '.json')
             added, removed = batch_progress(base, plan, current, journal, labels)
             a_done, r_done = len(added), len(removed)
-            if a_done == len(plan['add']) and r_done == len(plan['remove']):
-                state = json.loads(journal.read_text(encoding='utf-8')) if journal.exists() else {
+            prior_state = json.loads(journal.read_text(encoding='utf-8')) if journal.exists() else {}
+            if (a_done == len(plan['add']) and r_done == len(plan['remove'])
+                    and counter(live) == counter(old_target)
+                    and (prior_state.get('batch_checkpoint', {}).get('schema') != 2
+                         or prior_state.get('verified') is True)):
+                state = prior_state or {
                     "account": acct, "plan_digest": plan['approval_digest'], "events": []}
                 state.update(verified=True, completed_add=a_done, completed_remove=r_done,
                              acknowledged_add=a_done, acknowledged_remove=r_done)
@@ -2214,10 +2252,15 @@ def cmd_run(args):
             "承認済み計画の配備（削除・追加・検証）",
             lambda: perform(client, plan, acct, plan['approval_digest'],
                             journal, args.batch_size, verbose=args.verbose,
-                            max_batches=getattr(args, "max_batches", None)),
+                            max_batches=getattr(args, "max_batches", None),
+                            defer_unconfirmed=getattr(args, "defer_unconfirmed", False)),
             args.verbose)
         if result is False:
             observation_outcome("途中終了（保留計画を保持）")
+            return
+        if isinstance(result, dict) and result.get("verified") is False:
+            args.exit_code = 4
+            observation_outcome("一部完了（保留計画を保持）")
             return
         pending_file.unlink()
         # perform's final confirmed snapshot already includes skipped rules.
@@ -2265,6 +2308,8 @@ def main(argv=None):
     p.add_argument("--target", type=Path, help="任意: デフォルトは最新Masterを自動選択")
     p.add_argument("--batch-size", type=int, default=1, help="削除・追加のHTTPバッチ件数。1〜25、既定1。1は逐次処理")
     p.add_argument("-v", "--verbose", action="store_true", help="フィルタ単位の処理・API照合の詳細を表示")
+    p.add_argument("--reclassify-existing", action="store_true",
+                   help="起動時に既存メールのラベル置換を明示承認し、配備・照合後にバックアップと再分類を自動実行")
     p.set_defaults(func=cmd_run)
     p = sub.add_parser("validate", help="オフライン: 最新Master XMLを検証（--baseは任意）")
     p.add_argument("--base", type=Path, help="任意の厳格な比較元XML")
@@ -2309,24 +2354,41 @@ def main(argv=None):
         p.add_argument("--expected-email", help="対象Gmailアドレス。省略時はGMAIL_EXPECTED_EMAILを使用")
         p.add_argument("--client-secrets", type=Path, default=default_local / "credentials.json")
         p.add_argument("--token", type=Path, default=default_local / "token.json")
+    for name in ("run", "reclassify"):
+        sub.choices[name].add_argument("--skip-unknown-message-labels", action="store_true",
+            help="計画時にラベル一覧にないIDを持つメールを記録・保留し、確認できるメールを処理（保留ありは終了コード4）")
     for name in ("run", "reclassify", "restore-labels"):
         p = sub.choices[name]
         p.add_argument("--message-token", type=Path, help="メール専用OAuthトークン（既定: local-dir/message_token.json）")
+        p.add_argument("--message-read-batch-size", type=int, default=1,
+                       help="最小メタデータ読取りのHTTPバッチ件数: 1〜50、既定1。更新バッチとは独立")
         p.add_argument("--message-batch-size", type=int, default=50, help="メール更新件数: 1〜1000、既定50")
+        p.add_argument("--max-message-seconds", type=float,
+                       help="起動からのメール処理時間の目安。計画完成後に確認し、適用は読戻しの区切りで保留")
         p.add_argument("--max-message-batches", type=int, help="指定バッチ数のメール更新・読戻し後に停止")
     for name in ("run", "apply"):
+        sub.choices[name].add_argument("--defer-unconfirmed", action="store_true",
+            help="未確定操作を保留して確認できる独立操作を継続（単独HTTP専用）")
         sub.choices[name].add_argument("--max-batches", type=int,
                                        help="指定数のバッチを照合後、保留計画を保持して終了（既定は全件）")
     args = ap.parse_args(argv)
     try:
         with observe_command(args.cmd, args.verbose) if args.cmd in ("run", "apply", "reclassify", "restore-labels") else nullcontext():
+            demand(not getattr(args, "defer_unconfirmed", False) or args.batch_size == 1,
+                   "保留継続モードは--batch-size 1専用です")
             max_batches = getattr(args, "max_batches", None)
             demand(max_batches is None or max_batches > 0, "max-batchesは1以上で指定してください")
             if args.cmd in ("plan", "apply", "verify", "run", "reclassify", "restore-labels"):
                 args.expected_email = resolve_expected_email(args.expected_email)
             if hasattr(args, "message_batch_size"):
+                demand(1 <= args.message_read_batch_size <= 50, "message-read-batch-sizeは1〜50です")
                 demand(1 <= args.message_batch_size <= 1000, "message-batch-sizeは1〜1000です")
                 demand(args.max_message_batches is None or args.max_message_batches > 0, "max-message-batchesは1以上です")
+                if args.max_message_seconds is not None:
+                    import math
+                    demand(math.isfinite(args.max_message_seconds) and args.max_message_seconds > 0,
+                           "max-message-secondsは有限の正数です")
+                    args._message_deadline = time.monotonic() + args.max_message_seconds
             with messages.exclusive_lock(args.local_dir) if args.cmd in ("apply", "reclassify", "restore-labels") else nullcontext():
                 if args.cmd == "apply":
                     demand(messages.pending(args.local_dir) is None, "メール更新が未完了です。先に再開・復元してください")
@@ -2337,7 +2399,7 @@ def main(argv=None):
     except Exception as exc:
         print("STOP: 予期しないエラーです。途中まで反映された可能性があります。planを再実行せず状態照合してください: " + str(exc), file=sys.stderr)
         return 3
-    return 0
+    return getattr(args, "exit_code", 0)
 
 
 if __name__ == "__main__":

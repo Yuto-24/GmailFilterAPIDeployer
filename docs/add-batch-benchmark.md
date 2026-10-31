@@ -1,18 +1,12 @@
 # Filter ADD batch experiment (#12)
 
-This is a separate, explicitly authorized live experiment, not a deployment.
-It uses the one-send transport from #9. The reconciliation interval decision
-in #11 is independent of this experiment. Results and the deployment decision
-are recorded in [the experiment report](reports/2026-10-26-filter-add-batch.md).
+これは通常の配備とは別に、明示的な承認のもとで行う実機試験です。
+送信には #9 の1回送信トランスポートを使用します。#11 における全件照合間隔の決定はこの試験とは独立しています。実測結果と配備方式の判断は[実験報告](reports/2026-10-26-filter-add-batch.md)に記録しています。
 
-Do not edit Gmail filters or labels through another client during a trial.
-The script holds `local/run.lock`, pins the account using `GMAIL_EXPECTED_EMAIL`,
-and refuses an existing deployment or unfinished trial. Each temporary rule
-requires and excludes the same unique Message-ID predicate, with STARRED as
-the action. It cannot match a message. Existing filters and Master XML are
-never selected for writes.
+試験中は別クライアントからGmailのフィルタやラベルを編集しないでください。
+スクリプトは`local/run.lock`を保持し、`GMAIL_EXPECTED_EMAIL`でアカウントを固定します。進行中の配備や未完了の試験がある場合は実行を拒否します。各一時ルールは同一の一意なMessage-ID条件を必須条件と除外条件の両方に指定し、処理としてSTARREDを付与するため、どのメールにも一致しません。既存のフィルタやMaster XMLが書き込み対象に選ばれることはありません。
 
-Build the current image first, then run the sequential baseline:
+最初に現在のイメージをビルドし、基準となる逐次送信を実行します。
 
 ```bash
 docker compose build deployer
@@ -21,30 +15,16 @@ docker compose run --rm --no-deps --entrypoint python \
   /app/scripts/benchmark_filter_add.py --batch-size 1 --count 2
 ```
 
-After the summary says `restored: true`, run the same command with
-`--batch-size 2 --count 2`. Compare `send_s` per applied filter separately
-from `readbacks_s` and cleanup. Increase to `--batch-size 5 --count 5`, then
-10 under a separately authorized comparison plan. Normally require reliable
-responses and improving per-item time before expanding; the recorded 5/10 trials
-were explicitly authorized to check whether size two was representative. Exact
-restoration remains mandatory before every next trial. Do not automatically
-increase batch size based only on fewer HTTP requests. These are small samples,
-not a general throughput guarantee.
+- サマリに`restored: true`と表示されたことを確認したら、同じコマンドを`--batch-size 2 --count 2`で実行します。適用されたフィルタ1件あたりの`send_s`を、`readbacks_s`および削除時間と分けて比較します。
+- 別途承認された比較計画のもとで`--batch-size 5 --count 5`、次に10へと増やします。通常は応答の信頼性と1件あたり所要時間の改善を確認してから拡大します。記録済みの5件・10件の試行は、2件の結果が代表的かどうかを確認するために明示的な承認を得て実施したものです。
+- 次の試行へ進む前には、毎回必ず元の状態への完全復元を確認してください。HTTPリクエスト数が減ることだけを理由にバッチサイズを自動で増やさないでください。これらは少量のサンプルであり、一般的なスループットを保証するものではありません。
 
-Each create intent and response, cleanup intent and response, full baseline,
-and readback timings are saved privately in `local/add_batch_trial_pending.json`.
-Completed evidence is archived under `local/add_batch_trials/`. Do not upload
-these files: they include the account and existing filter settings. The stdout
-summary excludes those fields and filter IDs.
+各試行の作成intentと応答、削除intentと応答、開始時の全設定、および読み戻し時間は`local/add_batch_trial_pending.json`に非公開で保存されます。完了した記録は`local/add_batch_trials/`配下にアーカイブされます。これらのファイルにはアカウントと既存のフィルタ設定が含まれるため、アップロードしないでください。stdoutのサマリからはそれらの項目とフィルタIDを除外しています。
 
-If interrupted or cleanup fails, run the same command with `--cleanup` only.
-Recovery reads the actual state before deciding which owned IDs still exist;
-it never sends additional creates. Unexpected drift stops cleanup for inspection.
-Do not remove or edit a pending journal to bypass the check. Readback errors
-leave the journal intact for a later cleanup attempt. Complete restoration
-means the baseline IDs, criteria, actions and label metadata match exactly.
+中断した場合や削除処理が失敗した場合は、同じコマンドに`--cleanup`だけを付けて実行してください。
+復旧処理は実際の状態を読み取ってから、試験で作成したどのIDが残っているかを判定し、追加の作成リクエストは一切送りません。予期しない外部変更があれば調査のため削除を停止します。チェックを回避するために保留中のジャーナルを削除・編集しないでください。読み戻しエラーが起きた場合は、後で再度削除を試みられるようジャーナルをそのまま残します。開始時のID、criteria、action、ラベル定義がすべて一致した時点で完全復元となります。
 
-Offline verification:
+オフライン検証:
 
 ```bash
 python3 -m unittest discover -s tests -p test_add_benchmark.py -v

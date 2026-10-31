@@ -1692,6 +1692,14 @@ def perform_batched(client, plan, base, target, current, labels, log, batch_size
     return {"rows": current, "labels": labels}
 
 
+def validate_continuation_switch(log, requested):
+    """Do not inherit a legacy in-flight deletion inferred only from list absence."""
+    if requested and log.exists():
+        cp = json.loads(log.read_text()).get("batch_checkpoint", {})
+        demand(not cp.get("pending") or cp.get("schema") == 2,
+               "旧モードの送信中操作が未確定です。進捗を保持し、旧モードで照合してから切り替えてください")
+
+
 def validate_batch_limit(log, batch_size, max_batches):
     prior = json.loads(log.read_text(encoding="utf-8")) if log.exists() else {}
     demand(max_batches is None or max_batches > 0, "max-batchesは1以上で指定してください")
@@ -1764,6 +1772,7 @@ def perform(client, plan: dict, expected: str, digest: str, log: Path, batch_siz
     peak = max(len(base), len(target)) if order == "remove_first" else len(base) + len(plan["add"])
     demand(peak <= FILTER_LIMIT,
            f"配備中の最大フィルタ数{peak}件がGmail上限{FILTER_LIMIT}件を超えます")
+    validate_continuation_switch(log, defer_unconfirmed)
     prior = json.loads(log.read_text()) if log.exists() else {}
     continuation = defer_unconfirmed or prior.get("batch_checkpoint", {}).get("schema") == 2
     demand(not continuation or batch_size == 1, "保留継続モードは--batch-size 1専用です")
@@ -2114,6 +2123,9 @@ def cmd_run(args):
         pending_plan = json.loads(pending_file.read_text(encoding='utf-8')) if pending_file.exists() else None
         compilation, normalization = (plan_modes(pending_plan) if pending_plan is not None else
                                       (CURRENT_COMPILATION, CURRENT_NORMALIZATION))
+        if pending_plan is not None:
+            validate_continuation_switch(args.local_dir / 'logs' / (pending_plan['approval_digest'] + '.json'),
+                                         getattr(args, 'defer_unconfirmed', False))
         start_phase("[1/6] 最新Master XMLを選択・検証")
         print("[1/6] 最新Master XMLを選択・検証中...", flush=True)
         target_path = select_master(args.local_dir, args.target)
@@ -2146,9 +2158,12 @@ def cmd_run(args):
             journal = args.local_dir / 'logs' / (plan['approval_digest'] + '.json')
             added, removed = batch_progress(base, plan, current, journal, labels)
             a_done, r_done = len(added), len(removed)
+            prior_state = json.loads(journal.read_text(encoding='utf-8')) if journal.exists() else {}
             if (a_done == len(plan['add']) and r_done == len(plan['remove'])
-                    and counter(live) == counter(old_target)):
-                state = json.loads(journal.read_text(encoding='utf-8')) if journal.exists() else {
+                    and counter(live) == counter(old_target)
+                    and (prior_state.get('batch_checkpoint', {}).get('schema') != 2
+                         or prior_state.get('verified') is True)):
+                state = prior_state or {
                     "account": acct, "plan_digest": plan['approval_digest'], "events": []}
                 state.update(verified=True, completed_add=a_done, completed_remove=r_done,
                              acknowledged_add=a_done, acknowledged_remove=r_done)

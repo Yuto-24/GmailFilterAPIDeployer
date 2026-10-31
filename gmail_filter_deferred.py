@@ -15,6 +15,13 @@ def api_failure(exc):
     return isinstance(getattr(getattr(exc, 'resp', None), 'status', None), int) or d.transient_api_error(exc)
 
 
+def require_access(exc):
+    """Authentication and account-wide permission failures cannot be isolated to one rule."""
+    status = getattr(getattr(exc, 'resp', None), 'status', None)
+    d.demand(status != 401 and (status != 403 or d.transient_api_error(exc)),
+             'Gmailの認証・権限を確認できないため停止します。保留計画とログを保持してください')
+
+
 def key(operation):
     """Identify an approved operation independently of its execution order."""
     return f"{operation['kind']}:{operation['step']}"
@@ -52,6 +59,11 @@ def validate(plan, state):
     labels = cp['labels']
     d.demand(isinstance(labels, dict) and len(set(labels.values())) == len(labels)
              and all(isinstance(v, str) and v.strip() for v in labels.values()), '継続モードのラベルIDが不正です')
+    d.demand(len(set(cp.get('removed_ids', {}).values())) == len(cp.get('removed_ids', {})),
+             '削除済みIDの操作番号が重複しています')
+    for fid, step in cp.get('removed_ids', {}).items():
+        d.demand(isinstance(fid, str) and fid not in identified and type(step) is int
+                 and step in cp['remove'], '削除済みIDの記録が不正です')
     for name, op in operations(cp).items():
         kind, step = op.get('kind'), op.get('step')
         d.demand(name == key(op) and op.get('status') in ('unknown', 'failed', 'blocked')
@@ -89,7 +101,10 @@ def reconcile(plan, state, rows, labels, direct=None):
     cp['labels'] = expected_labels
     available = set(actual) & set(before)
     d.demand(all(actual[fid] == before[fid] for fid in available), '既存フィルタのID・内容が変わりました')
-    for fid in set(actual) - set(before):
+    removed_ids = cp.setdefault('removed_ids', {})
+    lagging = {fid for fid in set(actual) - set(before)
+               if fid in removed_ids and actual[fid] == plan['remove'][removed_ids[fid]]}
+    for fid in set(actual) - set(before) - lagging:
         matches = [op for op in held.values() if op['kind'] == 'add' and op['attempted']
                    and plan['add'][op['step']] == actual[fid]]
         d.demand(len(matches) == 1, '予定外・重複したフィルタ追加を検出しました')
@@ -108,6 +123,7 @@ def reconcile(plan, state, rows, labels, direct=None):
             d.demand(len(matches) == 1, '未送信のフィルタ削除・外部変更を検出しました')
             op = matches[0]
             cp['remove'].append(op['step'])
+            removed_ids[fid] = op['step']
             cp['rows'] = [row for row in cp['rows'] if row.get('id') != fid]
             del before[fid]
             del held[key(op)]
@@ -119,10 +135,11 @@ def reconcile(plan, state, rows, labels, direct=None):
             op['status'] = 'failed'  # Present with the original ID/content: retry only on next approved run.
     cp['deferred'] = held
     cp['available_ids'] = sorted(available)
-    cp['unconfirmed_ids'] = sorted(set(before) - available)
+    cp['lagging_removed_ids'] = sorted(lagging)
+    cp['unconfirmed_ids'] = sorted((set(before) - available) | lagging)
     cp['add'].sort()
     cp['remove'].sort()
-    full = actual == before
+    full = actual == before and not lagging
     cp['readback_confirmed'] = full
     result.update(acknowledged_add=len(cp['add']), acknowledged_remove=len(cp['remove']), verified=False)
     if full:
@@ -176,6 +193,7 @@ def perform(client, plan, current, labels, log, *, verbose=False, max_batches=No
             if getattr(getattr(exc, 'resp', None), 'status', None) == 404:
                 return True, None
             event('deferred_get_error', id=fid, error=d.api_error_details(exc))
+            require_access(exc)
             return False, None
         d.demand(raw.get('id') == fid, '個別取得の応答IDが一致しません')
         names = {value: name for name, value in state['batch_checkpoint']['labels'].items()}
@@ -193,6 +211,7 @@ def perform(client, plan, current, labels, log, *, verbose=False, max_batches=No
                 if not api_failure(exc):
                     raise
                 event('deferred_read_error', error=d.api_error_details(exc), attempt=attempt + 1)
+                require_access(exc)
                 state['batch_checkpoint']['available_ids'] = []
                 state['batch_checkpoint']['read_available'] = False
                 state['batch_checkpoint']['readback_confirmed'] = False
@@ -219,6 +238,8 @@ def perform(client, plan, current, labels, log, *, verbose=False, max_batches=No
                 print(f'{d.timestamp_prefix()}一覧が未確定のため{DELAYS[attempt]}秒待って再取得します。', flush=True)
                 d.time.sleep(DELAYS[attempt])
         since_readback = 0
+        d.demand(not state['batch_checkpoint'].get('lagging_removed_ids'),
+                 '削除成功済みのIDが再取得後も残っています。外部変更の可能性があるため停止します')
         event('deferred_readback', unconfirmed_ids=state['batch_checkpoint'].get('unconfirmed_ids', []))
 
     def hold(op, reason):
@@ -250,10 +271,12 @@ def perform(client, plan, current, labels, log, *, verbose=False, max_batches=No
             cp['deferred'][key(op)] = intent
             cp['pending'] = None
             event('deferred_write_error', operation=key(op), error=intent['error'])
+            require_access(exc)
             print(f"保留: {key(op)} / {d.api_error_code(exc)}。同じ操作はこの起動中に再送しません。", flush=True)
             readback()
             return
         if op['kind'] == 'remove':
+            cp.setdefault('removed_ids', {})[op['id']] = op['step']
             cp['remove'].append(op['step'])
             cp['rows'] = [r for r in cp['rows'] if r.get('id') != op['id']]
             cp['available_ids'] = [fid for fid in cp['available_ids'] if fid != op['id']]
@@ -282,7 +305,7 @@ def perform(client, plan, current, labels, log, *, verbose=False, max_batches=No
 
     save()
     # Missing IDs from an interrupted DELETE need direct evidence before resume can skip that operation.
-    if state['batch_checkpoint']['deferred']:
+    if state['batch_checkpoint']['deferred'] or state['batch_checkpoint'].get('unconfirmed_ids'):
         readback()
     first, second = (('remove', 'add') if plan.get('operation_order', 'add_first') == 'remove_first' else ('add', 'remove'))
     for kind in (first, second):

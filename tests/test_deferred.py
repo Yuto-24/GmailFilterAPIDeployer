@@ -463,3 +463,111 @@ class DeferredTests(unittest.TestCase):
         # Start, removal phase end, 50 added, phase end/final (no unverified success).
         self.assertEqual(reads[:3], [4, 1, 51])
         self.assertTrue(self.state()['verified'])
+
+    def test_authentication_or_account_permission_failure_stops_other_writes(self):
+        for status, reason in ((401, 'authError'), (403, 'domainPolicy')):
+            with self.subTest(status=status):
+                self.setUp()
+                calls = []
+                def create(fake, **opts):
+                    def send():
+                        calls.append(opts)
+                        raise ApiError(status, reason)
+                    return Req(send)
+                with patch.object(FakeFilters, 'create', new=create):
+                    with self.assertRaisesRegex(d.DeploymentError, '認証・権限'):
+                        self.run_plan()
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(self.state()['batch_checkpoint']['deferred']['add:0']['status'], 'failed')
+
+    def test_legacy_inflight_intent_cannot_be_promoted_by_list_absence(self):
+        self.seed()
+        state = self.state()
+        cp = state['batch_checkpoint']
+        cp['schema'] = 1
+        cp['pending'] = {'kind': 'remove', 'steps': [0], 'ids': {'0': next(
+            r['id'] for r in self.rows if r['filter'] == self.plan['remove'][0])}, 'successes': {}, 'errors': {}}
+        d.save_json(self.log, state)
+        before = self.log.read_bytes()
+        with patch.object(d, 'fetch_for_deploy', side_effect=AssertionError('no API')):
+            with self.assertRaisesRegex(d.DeploymentError, '旧モードの送信中'):
+                self.run_plan()
+        self.assertEqual(before, self.log.read_bytes())
+        argv = ['run', '--local-dir', str(self.root), '--expected-email', self.plan['account'], '--defer-unconfirmed']
+        with patch.object(d, 'get_client', side_effect=AssertionError('no OAuth')), redirect_stderr(self.output):
+            self.assertEqual(d.main(argv), 2)
+        self.assertEqual(before, self.log.read_bytes())
+
+    def test_run_after_final_ack_crash_still_waits_before_final_verification(self):
+        self.complete(self.run_plan())
+        state = self.state()
+        state['verified'] = False
+        state['batch_checkpoint']['readback_confirmed'] = False
+        d.save_json(self.log, state)
+        self.sleep.reset_mock()
+        argv = ['run', '--local-dir', str(self.root), '--expected-email', self.plan['account']]
+        with patch.object(d, 'get_client', return_value=(self.client, object())), \
+             patch.object(d, 'account_email', return_value=self.plan['account']), \
+             patch.object(d, 'confirm_interactive', return_value=True), \
+             patch('gmail_message_reclassifier.offer_after_deploy'), redirect_stderr(self.output):
+            self.assertEqual(d.main(argv), 0, self.output.getvalue())
+        self.sleep.assert_called_once_with(30)
+        self.assertFalse(self.pending.exists())
+        self.assertTrue(self.state()['verified'])
+
+    def test_stale_successful_delete_is_retried_then_disappears(self):
+        original_list = FakeFilters.list
+        original_delete = FakeFilters.delete
+        removed = []
+        glitches = []
+        def delete(fake, **opts):
+            old = deepcopy(fake.p.filters[opts['id']])
+            req = original_delete(fake, **opts)
+            def send():
+                result = req.execute()
+                removed.append(old)
+                return result
+            return Req(send)
+        def listing(fake, **opts):
+            req = original_list(fake, **opts)
+            def read():
+                result = req.execute()
+                if len(removed) == 3 and not glitches:
+                    glitches.append(True)
+                    result['filter'].append(removed[0])
+                return result
+            return Req(read)
+        self.start(patch.object(FakeFilters, 'delete', new=delete))
+        self.start(patch.object(FakeFilters, 'list', new=listing))
+        self.complete(self.run_plan())
+        self.assertTrue(glitches)
+        self.assertEqual(len(self.state()['batch_checkpoint']['removed_ids']), 3)
+        self.assertGreaterEqual([c.args[0] for c in self.sleep.call_args_list].count(30), 2)
+
+    def test_persistent_return_of_successfully_deleted_id_stops_after_bounded_reads(self):
+        original_list = FakeFilters.list
+        original_delete = FakeFilters.delete
+        removed = []
+        def delete(fake, **opts):
+            old = deepcopy(fake.p.filters[opts['id']])
+            req = original_delete(fake, **opts)
+            def send():
+                result = req.execute()
+                removed.append(old)
+                return result
+            return Req(send)
+        def listing(fake, **opts):
+            req = original_list(fake, **opts)
+            def read():
+                result = req.execute()
+                if removed:
+                    result['filter'].append(removed[0])
+                return result
+            return Req(read)
+        self.start(patch.object(FakeFilters, 'delete', new=delete))
+        self.start(patch.object(FakeFilters, 'list', new=listing))
+        with self.assertRaisesRegex(d.DeploymentError, '削除成功済みのID'):
+            self.run_plan()
+        self.assertEqual(self.client.n, len(self.base))
+        self.assertEqual([c.args[0] for c in self.sleep.call_args_list], [30, 60])
+        self.assertFalse(self.state()['verified'])

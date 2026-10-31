@@ -129,6 +129,18 @@ APIにもMasterと同じnative条件がある場合は、作成・削除せず�
 | `reclassify` | メール再分類の計画・適用・再開 | 専用の対話承認後のみ | `... deployer reclassify --plan-only` |
 | `restore-labels` | 指定実行のユーザーラベルを復元・再開 | 専用の対話承認後のみ | `... deployer restore-labels --run-id RUN_ID` |
 
+### 配備後の過去メール再分類を自動実行
+
+```bash
+docker compose run --rm --service-ports deployer run --reclassify-existing --skip-unknown-message-labels
+```
+
+`--reclassify-existing`では、起動時に対象アカウント・Master・手動分を含むユーザーラベルの置換範囲を確認し、メール用OAuthを先に完了します。フィルタの配備・Master照合後、バックアップ、検索、再分類と読戻しまで自動で続けます。メール処理直前の追加承認は不要です。既存のフィルタ差分・Action/Delete・Trashの承認は従来どおり必要です。指定しなければ従来の準備確認とメール更新の個別承認を使います。復元は一括承認の対象外です。
+
+`--skip-unknown-message-labels`は`run`・`reclassify`で使用できます。計画時の正常な最小メタデータに、ラベル一覧に存在しないIDが含まれるメールだけを保留します。保留IDと元のメタデータはハッシュ付き計画DBの`deferred`表に保存し、そのメールは一切更新しません。確認できた対象の処理後も全件完了とはせず、終了コード4・`complete=false`・`eligible_verified=true`で部分完了を示します。送信済み操作の不明状態がなければ`messages_pending.json`は解消します。保留分はラベルの不整合が解消した後、新しい読取り計画で確認します。通信失敗、不正なメタデータ、計画後の外部変更は停止します。保留機能を使う計画はv2となり、旧版では再開できません。指定しない場合は従来どおり未知のラベルでも停止し、計画はv1です。
+
+対象メールの列挙と複数回の照合が必要なため、メール数によっては3時間を超えることがあります。処理中は既存メールの既読状態・ラベルを他のクライアントで変更すると、外部変更として停止する場合があります。
+
 ### メールの計画・再開・復元
 
 ```bash

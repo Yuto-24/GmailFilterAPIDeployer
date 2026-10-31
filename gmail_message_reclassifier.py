@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections import Counter
 from contextlib import contextmanager
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -19,7 +20,9 @@ import uuid
 import gmail_filter_deployer as d
 
 SCHEMA = "gmail-message-reclassification/v1"
+DEFERRED_SCHEMA = "gmail-message-reclassification/v2"
 SEARCH_VERSION = "message-search/v1"
+RUN_AUTHORIZATION_POLICY = "replace-eligible-user-labels/v1"
 EXCLUDED = frozenset({"SENT", "DRAFT", "SPAM", "TRASH", "CHAT"})
 SYSTEM_IDS = EXCLUDED | {"INBOX", "UNREAD", "STARRED", "IMPORTANT", "DRAFTS", "ALL"}
 PENDING = "messages_pending.json"
@@ -156,6 +159,13 @@ def user_rules(templates):
     return [t for t in templates if any(x.startswith("label:") for x in t["action"]["addLabelIds"])]
 
 
+class UnknownMessageLabels(d.DeploymentError):
+    """Well-formed metadata with label IDs absent from the saved catalog."""
+    def __init__(self, row):
+        super().__init__("メッセージにラベル一覧にないIDがあります")
+        self.row = row
+
+
 class Gmail:
     """One-attempt writes; bounded read retries, minimal message projections."""
     def __init__(self, client, verbose=False):
@@ -204,8 +214,10 @@ class Gmail:
             userId="me", id=mid, format="minimal", fields="id,threadId,labelIds,historyId"))
         lids = row.get("labelIds", [])
         require(row.get("id") == mid and isinstance(row.get("threadId"), str) and
-                isinstance(lids, list) and all(isinstance(x, str) and x in labels for x in lids)
+                isinstance(lids, list) and all(isinstance(x, str) and x for x in lids)
                 and len(lids) == len(set(lids)), "メッセージのID・ラベルが不正です")
+        if set(lids) - labels.keys():
+            raise UnknownMessageLabels(row)
         return {"id": mid, "threadId": row["threadId"], "labelIds": sorted(lids),
                 "historyId": row.get("historyId")}
 
@@ -262,7 +274,7 @@ def connect_db(path, *, readonly=False):
     return db
 
 
-def create_plan(api, local_dir, master, account):
+def create_plan(api, local_dir, master, account, *, skip_unknown_labels=False):
     """Finish and hash a complete snapshot before making it eligible for approval."""
     require(pending(local_dir) is None, "未完了のメール更新があります。先に再開または復元してください")
     require(not (local_dir / "run_pending.json").exists(), "フィルタ配備が未完了です")
@@ -299,6 +311,9 @@ def create_plan(api, local_dir, master, account):
             CREATE TABLE matches(rule INTEGER, message TEXT, PRIMARY KEY(rule,message));
             CREATE TABLE desired_labels(message TEXT, label TEXT, PRIMARY KEY(message,label));
         """)
+        if skip_unknown_labels:
+            db.execute("CREATE TABLE deferred(id TEXT PRIMARY KEY, metadata TEXT NOT NULL)")
+        deferred = 0
         start = api.history_start()
         first_ids = set(api.ids())
         added, changed = api.changes(start)
@@ -306,7 +321,14 @@ def create_plan(api, local_dir, master, account):
         initial_ids = first_ids - added
         excluded = 0
         for n, mid in enumerate(sorted(initial_ids), 1):
-            row = api.message(mid, labels)
+            try:
+                row = api.message(mid, labels)
+            except UnknownMessageLabels as exc:
+                if not skip_unknown_labels:
+                    raise
+                db.execute("INSERT INTO deferred VALUES(?,?)", (mid, encode(exc.row)))
+                deferred += 1
+                continue
             if set(row["labelIds"]) & EXCLUDED:
                 excluded += 1
                 continue
@@ -355,6 +377,8 @@ def create_plan(api, local_dir, master, account):
         summary = {"target": len(target_ids), "changed": 0, "unchanged": 0, "unmatched": 0,
                    "multiple": 0, "excluded": excluded, "new_arrivals": len(new_ids),
                    "skipped_rules": len(templates) - len(rules), "unsupported": 0}
+        if skip_unknown_labels:
+            summary["deferred_unknown_labels"] = deferred
         additions, removals = Counter(), Counter()
         for row in db.execute("SELECT * FROM messages"):
             before, after = set(json.loads(row["before_labels"])) & user_ids, set(json.loads(row["desired"]))
@@ -366,7 +390,7 @@ def create_plan(api, local_dir, master, account):
         db.commit()
     finally:
         db.close()
-    manifest = {"schema": SCHEMA, "search_version": SEARCH_VERSION, "run_id": run_id,
+    manifest = {"schema": DEFERRED_SCHEMA if skip_unknown_labels else SCHEMA, "search_version": SEARCH_VERSION, "run_id": run_id,
                 "compilation_version": d.CURRENT_COMPILATION, "normalization_version": d.CURRENT_NORMALIZATION,
                 "account": account, "labels": labels, "history_start": start,
                 "files": {"master.xml": file_digest(copied), "plan.sqlite": file_digest(directory / "plan.sqlite")},
@@ -386,7 +410,7 @@ class Plan:
         require(path.is_file(), "完全なメール計画・バックアップがありません")
         self.manifest = json.loads(path.read_text())
         m = self.manifest
-        require(m.get("schema") == SCHEMA and m.get("search_version") == SEARCH_VERSION,
+        require(m.get("schema") in (SCHEMA, DEFERRED_SCHEMA) and m.get("search_version") == SEARCH_VERSION,
                 "未対応のメール計画versionです")
         require(m.get("compilation_version") == "xml-fields-v1" and m.get("normalization_version") == "query-v2",
                 "未対応のメール計画コンパイル・正規化versionです")
@@ -401,6 +425,19 @@ class Plan:
             require(self.db.execute("PRAGMA integrity_check").fetchone()[0] == "ok", "計画DBが破損しています")
             require(self.db.execute("SELECT count(*) FROM messages").fetchone()[0] == m["summary"]["target"],
                     "バックアップ件数不一致")
+            self.deferred_count = 0
+            if m["schema"] == DEFERRED_SCHEMA:
+                for row in self.db.execute("SELECT * FROM deferred"):
+                    metadata = json.loads(row["metadata"])
+                    lids = metadata.get("labelIds")
+                    require(metadata.get("id") == row["id"] and isinstance(metadata.get("threadId"), str)
+                            and isinstance(lids, list) and all(isinstance(x, str) and x for x in lids)
+                            and len(lids) == len(set(lids)) and set(lids) - m["labels"].keys()
+                            and not self.db.execute("SELECT 1 FROM messages WHERE id=?", (row["id"],)).fetchone(),
+                            "保留メールの記録が不正です")
+                    self.deferred_count += 1
+                require(self.deferred_count == m["summary"].get("deferred_unknown_labels"),
+                        "保留メールの件数不一致")
             self.labels = m["labels"]
             self.users = {lid for lid, row in self.labels.items() if row["type"] == "user"}
             self.rules = [json.loads(row[0]) for row in self.db.execute("SELECT template FROM rules ORDER BY number")]
@@ -536,6 +573,7 @@ class Journal:
     def report(self):
         counts = dict(self.db.execute("SELECT status,count(*) FROM progress GROUP BY status"))
         print("[メール進捗] " + encode({"mode": self.meta("mode"), "verified": self.meta("complete") == "true",
+              "保留（未知のラベル）": self.plan.deferred_count,
               "適用確認済み": counts.get("applied", 0), "未適用": counts.get("new", 0),
               "不明": counts.get("pending", 0) + counts.get("restore_pending", 0),
               "復元確認済み": counts.get("restored", 0),
@@ -598,7 +636,7 @@ def reconcile(api, plan, journal, mode):
         journal.db.commit()
 
 
-def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=None):
+def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=None, authorization=None):
     """Validate, ask once for this invocation, send durable intents, and read back."""
     require(mode in ("apply", "restore"), "メール更新modeが不正です")
     require(1 <= batch_size <= 1000 and (max_batches is None or max_batches > 0), "メールバッチ上限が不正です")
@@ -609,6 +647,13 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
     journal = Journal(plan) if (plan.directory / "progress.sqlite").exists() else None
     try:
         plan.verify_files()
+        if authorization is not None:
+            require(mode == "apply" and isinstance(authorization, dict)
+                    and authorization.get("policy") == RUN_AUTHORIZATION_POLICY
+                    and authorization.get("account") == plan.manifest["account"]
+                    and authorization.get("master_sha256") == plan.manifest["files"]["master.xml"]
+                    and authorization.get("excluded_labels") == sorted(EXCLUDED),
+                    "起動時の既存メール承認が固定計画と一致しません")
         require(mode != "restore" or journal is not None, "変更履歴がないため復元できません")
         require(not journal or mode == "restore" or journal.meta("mode") == "apply",
                 "復元を開始した計画は再分類へ戻せません")
@@ -616,12 +661,12 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
         plan.summary()
         if journal:
             journal.report()
-        if not sys.stdin.isatty():
+        if authorization is None and not sys.stdin.isatty():
             print("対話端末がないため、メールを更新しません。", flush=True)
             d.observation_outcome("メール更新見送り（非対話）")
             return False
         question = "バックアップのユーザーラベルへ復元しますか？" if mode == "restore" else "上記の計画で既存メールのユーザーラベルを置き換えますか？"
-        if not d.confirm_interactive(question + " [y/N]: "):
+        if authorization is None and not d.confirm_interactive(question + " [y/N]: "):
             print("メール更新を見送りました。", flush=True)
             d.observation_outcome("メール更新承認辞退")
             return False
@@ -632,7 +677,10 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
             journal = Journal(plan, create=True)
         journal.set_meta("mode", mode)
         journal.set_meta("complete", "false")
-        journal.event("approval", {"mode": mode, "digest": plan.manifest["digest"]})
+        journal.db.execute("INSERT OR REPLACE INTO meta VALUES('eligible_verified', 'false')")
+        journal.event("approval", {"mode": mode, "digest": plan.manifest["digest"],
+                                  "source": "run_upfront" if authorization is not None else "interactive",
+                                  "authorization": authorization})
         journal.db.commit()
         save(local_dir / PENDING, {"run_id": plan.directory.name, "mode": mode,
                                   "digest": plan.manifest["digest"]})
@@ -691,16 +739,23 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
         expected = {"applied"} if mode == "apply" else {"new", "restored"}
         require(all(row[0] in expected for row in journal.db.execute("SELECT status FROM progress")),
                 "メール更新の未確認進捗が残っています")
-        journal.set_meta("complete", "true")
-        journal.event("verified", {"mode": mode})
+        complete = mode == "restore" or plan.deferred_count == 0
+        journal.set_meta("complete", "true" if complete else "false")
+        journal.db.execute("INSERT OR REPLACE INTO meta VALUES('eligible_verified', 'true')")
+        journal.event("verified", {"mode": mode, "deferred_unknown_labels": plan.deferred_count})
         journal.db.commit()
         (local_dir / PENDING).unlink()
         sync_directory(local_dir)
-        d.observation_outcome("メール復元全件照合済み" if mode == "restore" else "メール再分類全件照合済み")
-        return True
+        if not complete:
+            print(f"既知のラベルを持つ対象メールは照合済み。未知のラベルを持つ{plan.deferred_count}通は未変更で保留です。"
+                  "保留IDは計画DBのdeferred表に保存しました。解消後は新しい計画で確認してください。", flush=True)
+        d.observation_outcome("メール復元全件照合済み" if mode == "restore" else
+                              "メール再分類全件照合済み" if complete else "メール再分類は一部保留（未知のラベル）")
+        return complete
     except BaseException as exc:
         if journal:
             journal.set_meta("complete", "false")
+            journal.db.execute("INSERT OR REPLACE INTO meta VALUES('eligible_verified', 'false')")
             journal.event("stopped", {"error": str(exc), "type": type(exc).__name__})
             journal.db.commit()
         raise
@@ -711,6 +766,11 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
 
 
 def message_client(args):
+    cached = getattr(args, "_message_api", None)
+    if cached is not None:
+        require(getattr(args, "_message_api_account", None) == args.expected_email,
+                "起動時認証のアカウントが変わりました")
+        return cached
     token = getattr(args, "message_token", None) or args.local_dir / "message_token.json"
     require(token.resolve() != args.token.resolve() and token.resolve() != args.client_secrets.resolve(),
             "メール用トークンは配備用トークン・クライアント秘密情報と別のファイルにしてください")
@@ -719,10 +779,48 @@ def message_client(args):
     return Gmail(client, getattr(args, "verbose", False))
 
 
+def authorize_run(args):
+    """Obtain explicit message scope approval and OAuth before a long filter deployment."""
+    if not getattr(args, "reclassify_existing", False):
+        return True
+    require(sys.stdin.isatty(), "既存メールを含む起動時承認には対話端末が必要です")
+    target = d.select_master(args.local_dir, args.target)
+    for rule in user_rules(d.compile_xml(target)):
+        search_spec(rule)
+    digest = d.file_hash(target)
+    active = pending(args.local_dir)
+    if active:
+        require(active["mode"] == "apply", "メール復元が未完了です。再分類の自動実行より先に復元を完了してください")
+        saved = Plan(run_directory(args.local_dir, active["run_id"]), args.expected_email)
+        try:
+            require(saved.manifest["files"]["master.xml"] == digest,
+                    "未完了のメール計画と対象Masterが異なります。固定済み計画で再開してください")
+        finally:
+            saved.close()
+    print("【フィルタ配備と既存メール再分類の一括実行】", flush=True)
+    print(f"アカウント: {args.expected_email} / Master: {target.name}", flush=True)
+    print("配備・照合後、受信トレイとアーカイブ済みメールをバックアップし、"
+          "手動分を含むユーザーラベルをMasterの分類へ置き換えます。", flush=True)
+    print("一致なしはユーザーラベルなし、複数一致はすべて付与します。"
+          "送信済み・下書き・迷惑メール・ゴミ箱・チャットとシステムラベルは対象外です。", flush=True)
+    if getattr(args, "skip_unknown_message_labels", False):
+        print("計画時に未知のラベルIDが付くメールは未変更で保留し、他を進めます。保留ありは終了コード4です。", flush=True)
+    if not d.confirm_interactive("このMasterで既存メール再分類まで自動実行することを承認しますか？ [y/N]: "):
+        d.observation_outcome("既存メールを含む実行の承認辞退")
+        return False
+    args._message_authorization = {"policy": RUN_AUTHORIZATION_POLICY, "account": args.expected_email,
+        "master_sha256": digest, "excluded_labels": sorted(EXCLUDED),
+        "approved_at_utc": datetime.now(timezone.utc).isoformat()}
+    args._message_api = message_client(args)
+    args._message_api_account = args.expected_email
+    return True
+
+
 def command(args):
     """Called under the common CLI lock."""
     require(not (args.local_dir / "run_pending.json").exists(), "フィルタ配備が未完了です")
-    if not getattr(args, "plan_only", False) and not sys.stdin.isatty():
+    authorization = getattr(args, "_message_authorization", None)
+    if not getattr(args, "plan_only", False) and authorization is None and not sys.stdin.isatty():
         print("非対話実行ではメール再分類・復元を開始しません。読取り計画には --plan-only を使用してください。", flush=True)
         d.observation_outcome("メール更新見送り（非対話）")
         return
@@ -736,14 +834,17 @@ def command(args):
             plan = Plan(run_directory(args.local_dir, run_id), args.expected_email)  # Before OAuth.
         api = message_client(args)
         if plan is None:
-            directory = create_plan(api, args.local_dir, d.select_master(args.local_dir, args.target), args.expected_email)
+            directory = create_plan(api, args.local_dir, d.select_master(args.local_dir, args.target), args.expected_email,
+                                    skip_unknown_labels=getattr(args, "skip_unknown_message_labels", False))
             plan = Plan(directory, args.expected_email)
         if getattr(args, "plan_only", False):
             plan.summary()
             d.observation_outcome("メール計画のみ作成（未適用）")
             return
-        execute(api, plan, args.local_dir, mode=mode, batch_size=args.message_batch_size,
-                max_batches=args.max_message_batches)
+        complete = execute(api, plan, args.local_dir, mode=mode, batch_size=args.message_batch_size,
+                           max_batches=args.max_message_batches, authorization=authorization)
+        if not complete and (authorization is not None or plan.deferred_count):
+            args.exit_code = 4
     finally:
         if plan:
             plan.close()
@@ -752,14 +853,21 @@ def command(args):
 def offer_after_deploy(args, target_path, current):
     """No extra OAuth or message reads unless the user opts into preparation."""
     d.start_phase("既存メール再分類の案内")
-    if not sys.stdin.isatty():
+    if not sys.stdin.isatty() and getattr(args, "_message_authorization", None) is None:
         print("非対話実行のため、既存メールの再分類を見送ります。", flush=True)
         return
     master = d.compile_xml(target_path)
     if d.counter(user_rules([r["filter"] for r in current])) != d.counter(user_rules(master)):
         print("ユーザーラベル用フィルタがMasterと一致しないため、既存メールの再分類を見送ります。", flush=True)
+        if getattr(args, "reclassify_existing", False):
+            args.exit_code = 4
+            d.observation_outcome("フィルタが未一致のためメール再分類は未実施")
         return
-    if d.confirm_interactive("既存メールの再分類を準備しますか？ [y/N]: "):
+    if getattr(args, "reclassify_existing", False):
+        require(getattr(args, "_message_authorization", None) is not None,
+                "既存メールの起動時承認がありません")
+        command(args)
+    elif d.confirm_interactive("既存メールの再分類を準備しますか？ [y/N]: "):
         command(args)
 
 
@@ -773,4 +881,6 @@ def resume_before_deploy(args):
     resume_args.cmd = "restore-labels" if active["mode"] == "restore" else "reclassify"
     resume_args.run_id = active["run_id"]
     command(resume_args)
+    if getattr(resume_args, "exit_code", 0):
+        args.exit_code = resume_args.exit_code
     return True

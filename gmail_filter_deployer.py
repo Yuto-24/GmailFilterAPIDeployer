@@ -2322,6 +2322,8 @@ def main(argv=None):
         p.add_argument("--message-read-batch-size", type=int, default=1,
                        help="最小メタデータ読取りのHTTPバッチ件数: 1〜50、既定1。更新バッチとは独立")
         p.add_argument("--message-batch-size", type=int, default=50, help="メール更新件数: 1〜1000、既定50")
+        p.add_argument("--max-message-seconds", type=float,
+                       help="起動からのメール処理時間の目安。計画完成後に確認し、適用は読戻しの区切りで保留")
         p.add_argument("--max-message-batches", type=int, help="指定バッチ数のメール更新・読戻し後に停止")
     for name in ("run", "apply"):
         sub.choices[name].add_argument("--max-batches", type=int,
@@ -2337,6 +2339,11 @@ def main(argv=None):
                 demand(1 <= args.message_read_batch_size <= 50, "message-read-batch-sizeは1〜50です")
                 demand(1 <= args.message_batch_size <= 1000, "message-batch-sizeは1〜1000です")
                 demand(args.max_message_batches is None or args.max_message_batches > 0, "max-message-batchesは1以上です")
+                if args.max_message_seconds is not None:
+                    import math
+                    demand(math.isfinite(args.max_message_seconds) and args.max_message_seconds > 0,
+                           "max-message-secondsは有限の正数です")
+                    args._message_deadline = time.monotonic() + args.max_message_seconds
             with messages.exclusive_lock(args.local_dir) if args.cmd in ("apply", "reclassify", "restore-labels") else nullcontext():
                 if args.cmd == "apply":
                     demand(messages.pending(args.local_dir) is None, "メール更新が未完了です。先に再開・復元してください")

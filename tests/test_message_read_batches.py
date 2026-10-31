@@ -54,6 +54,15 @@ class MessageReadBatchTests(unittest.TestCase):
         self.assertTrue(self.sleeper.called)
         self.assertEqual(self.client.writes, [])
 
+    def test_single_and_batched_reads_reserve_current_per_user_quota_headroom(self):
+        for size, expected_delay in [(1, 0.25), (3, 0.75)]:
+            with self.subTest(size=size):
+                api = m.Gmail(self.client, read_batch_size=size)
+                self.sleeper.reset_mock()
+                with patch.object(m.time, 'monotonic', return_value=0):
+                    list(api.snapshots(['a','b','c'][:size]))
+                self.sleeper.assert_called_once_with(expected_delay)
+
     def test_missing_duplicate_and_forbidden_responses_yield_no_partial_chunk(self):
         for fault in ('missing','duplicate','forbidden'):
             with self.subTest(fault=fault):

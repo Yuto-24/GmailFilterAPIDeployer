@@ -161,6 +161,10 @@ def user_rules(templates):
     return [t for t in templates if any(x.startswith("label:") for x in t["action"]["addLabelIds"])]
 
 
+class MessageTimeLimit(d.DeploymentError):
+    """A fixed plan can be resumed after its invocation time budget expires."""
+
+
 class UnknownMessageLabels(d.DeploymentError):
     """Well-formed metadata with label IDs absent from the saved catalog."""
     def __init__(self, row):
@@ -175,6 +179,7 @@ class Gmail:
                 "メール読取りバッチ件数は1〜50です")
         self.client, self.verbose = client, verbose
         self.read_batch_size = read_batch_size
+        self.deadline = None
 
     def read(self, kind, request):
         return d.read_operation("Gmail " + kind, lambda: request.execute(num_retries=0), self.verbose)
@@ -232,16 +237,26 @@ class Gmail:
     def message(self, mid, labels):
         return self.metadata(mid, self.read("messages.get", self.message_request(mid)), labels)
 
+    def check_deadline(self):
+        if self.deadline is not None and time.monotonic() >= self.deadline:
+            raise MessageTimeLimit("メール処理の時間上限です。固定済み計画から再開できます")
+
     def snapshots(self, ids):
         """Fresh minimal GETs only; require every response before yielding a chunk.
 
         Whole-chunk retries are safe because this path never contains writes.
-        Pace batches to at most 20 message GETs/second, leaving quota headroom.
+        Pace reads to four message GETs/second (4,800 units/minute at 20 units/GET).
         """
         remaining = iter(ids)
         while chunk := list(islice(remaining, self.read_batch_size)):
+            self.check_deadline()
             if self.read_batch_size == 1:
-                yield chunk[0], self.read("messages.get", self.message_request(chunk[0]))
+                started = time.monotonic()
+                row = self.read("messages.get", self.message_request(chunk[0]))
+                delay = 0.25 - (time.monotonic() - started)
+                if delay > 0:
+                    time.sleep(delay)
+                yield chunk[0], row
                 continue
             require(len(set(chunk)) == len(chunk), "メール読取りバッチのIDが重複しています")
             started = time.monotonic()
@@ -267,7 +282,7 @@ class Gmail:
                 return rows
 
             rows = d.read_operation("Gmail messages.get batch", fetch, self.verbose)
-            delay = len(chunk) / 20 - (time.monotonic() - started)
+            delay = len(chunk) / 4 - (time.monotonic() - started)
             if delay > 0:
                 time.sleep(delay)
             for mid in chunk:
@@ -689,7 +704,7 @@ def reconcile(api, plan, journal, mode):
         journal.db.commit()
 
 
-def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=None, authorization=None):
+def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=None, authorization=None, deadline=None):
     """Validate, ask once for this invocation, send durable intents, and read back."""
     require(mode in ("apply", "restore"), "メール更新modeが不正です")
     require(1 <= batch_size <= 1000 and (max_batches is None or max_batches > 0), "メールバッチ上限が不正です")
@@ -698,6 +713,8 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
     require(not active or active.get("digest") == plan.manifest["digest"], "保留メール計画のdigest不一致")
     require(not (local_dir / "run_pending.json").exists(), "フィルタ配備が未完了です")
     journal = Journal(plan) if (plan.directory / "progress.sqlite").exists() else None
+    previous_deadline = api.deadline
+    api.deadline = deadline
     try:
         plan.verify_files()
         if authorization is not None:
@@ -710,6 +727,17 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
         require(mode != "restore" or journal is not None, "変更履歴がないため復元できません")
         require(not journal or mode == "restore" or journal.meta("mode") == "apply",
                 "復元を開始した計画は再分類へ戻せません")
+        if authorization is not None:
+            if journal is None:
+                journal = Journal(plan, create=True)
+            journal.set_meta("mode", mode)
+            journal.set_meta("complete", "false")
+            journal.db.execute("INSERT OR REPLACE INTO meta VALUES('eligible_verified', 'false')")
+            journal.event("approval", {"mode": mode, "digest": plan.manifest["digest"],
+                                      "source": "run_upfront", "authorization": authorization})
+            journal.db.commit()
+            save(local_dir / PENDING, {"run_id": plan.directory.name, "mode": mode,
+                                      "digest": plan.manifest["digest"]})
         reconcile(api, plan, journal, mode)
         plan.summary()
         if journal:
@@ -723,17 +751,18 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
             print("メール更新を見送りました。", flush=True)
             d.observation_outcome("メール更新承認辞退")
             return False
-        # Reconcile again after interactive waiting; never use a stale approval snapshot.
+        # Only interactive approval introduces a waiting interval after preflight.
         plan.verify_files()
-        reconcile(api, plan, journal, mode)
+        if authorization is None:
+            reconcile(api, plan, journal, mode)
         if journal is None:
             journal = Journal(plan, create=True)
         journal.set_meta("mode", mode)
         journal.set_meta("complete", "false")
         journal.db.execute("INSERT OR REPLACE INTO meta VALUES('eligible_verified', 'false')")
-        journal.event("approval", {"mode": mode, "digest": plan.manifest["digest"],
-                                  "source": "run_upfront" if authorization is not None else "interactive",
-                                  "authorization": authorization})
+        if authorization is None:
+            journal.event("approval", {"mode": mode, "digest": plan.manifest["digest"],
+                                      "source": "interactive", "authorization": None})
         journal.db.commit()
         save(local_dir / PENDING, {"run_id": plan.directory.name, "mode": mode,
                                   "digest": plan.manifest["digest"]})
@@ -750,6 +779,7 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
         batches = 0
         for (add, remove), all_ids in sorted(groups.items()):
             for offset in range(0, len(all_ids), batch_size):
+                api.check_deadline()
                 if max_batches is not None and batches >= max_batches:
                     print("メールバッチ上限で停止。保留計画から再開できます。", flush=True)
                     d.observation_outcome("メール更新途中終了（保留計画を保持）")
@@ -775,12 +805,17 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
                     failure = exc
                     journal.event("write_failed", d.api_error_details(exc))
                     journal.db.commit()
-                # Even a successful empty batch response is not a per-message acknowledgement.
-                for mid, raw in api.snapshots(ids):
-                    now = api.metadata(mid, raw, plan.labels)
-                    require(sorted(set(now["labelIds"]) - plan.users) == systems[mid],
-                            "送信中にシステム状態が変更されました: " + mid)
-                    observe(api, plan, journal, plan.row(mid), mode, now=now)
+                # Finish readback of an owned write before observing the time limit.
+                api.deadline = None
+                try:
+                    # Even a successful empty batch response is not a per-message acknowledgement.
+                    for mid, raw in api.snapshots(ids):
+                        now = api.metadata(mid, raw, plan.labels)
+                        require(sorted(set(now["labelIds"]) - plan.users) == systems[mid],
+                                "送信中にシステム状態が変更されました: " + mid)
+                        observe(api, plan, journal, plan.row(mid), mode, now=now)
+                finally:
+                    api.deadline = deadline
                 journal.db.commit()
                 validate_labels(api, plan)
                 if failure is not None:
@@ -806,6 +841,15 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
         d.observation_outcome("メール復元全件照合済み" if mode == "restore" else
                               "メール再分類全件照合済み" if complete else "メール再分類は一部保留（未知のラベル）")
         return complete
+    except MessageTimeLimit as exc:
+        if journal:
+            journal.set_meta("complete", "false")
+            journal.db.execute("INSERT OR REPLACE INTO meta VALUES('eligible_verified', 'false')")
+            journal.event("time_limit", {"mode": mode})
+            journal.db.commit()
+        print(str(exc), flush=True)
+        d.observation_outcome("メール処理は時間上限で保留（固定計画・進捗を保持）")
+        return False
     except BaseException as exc:
         if journal:
             journal.set_meta("complete", "false")
@@ -814,6 +858,7 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
             journal.db.commit()
         raise
     finally:
+        api.deadline = previous_deadline
         if journal:
             journal.report()
             journal.close()
@@ -896,8 +941,10 @@ def command(args):
             d.observation_outcome("メール計画のみ作成（未適用）")
             return
         complete = execute(api, plan, args.local_dir, mode=mode, batch_size=args.message_batch_size,
-                           max_batches=args.max_message_batches, authorization=authorization)
-        if not complete and (authorization is not None or plan.deferred_count):
+                           max_batches=args.max_message_batches, authorization=authorization,
+                           deadline=getattr(args, "_message_deadline", None))
+        if not complete and (authorization is not None or plan.deferred_count
+                             or getattr(args, "max_message_seconds", None) is not None):
             args.exit_code = 4
     finally:
         if plan:

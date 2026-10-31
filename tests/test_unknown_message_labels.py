@@ -63,7 +63,7 @@ class UnknownMessageLabelsTests(unittest.TestCase):
         self.assertEqual(self.client.writes, [])
 
     def test_read_failure_is_not_silently_deferred(self):
-        with patch.object(self.api, 'message', side_effect=RuntimeError('read failed')):
+        with patch.object(self.api, 'snapshots', side_effect=RuntimeError('read failed')):
             with self.assertRaisesRegex(RuntimeError, 'read failed'):
                 m.create_plan(self.api, self.local, self.master, fixtures.ACCOUNT, skip_unknown_labels=True)
         self.assertEqual(self.client.writes, [])

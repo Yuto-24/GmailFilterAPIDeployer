@@ -132,12 +132,14 @@ APIにもMasterと同じnative条件がある場合は、作成・削除せず�
 ### 配備後の過去メール再分類を自動実行
 
 ```bash
-docker compose run --rm --service-ports deployer run --reclassify-existing --skip-unknown-message-labels
+docker compose run --rm --service-ports deployer run --reclassify-existing --skip-unknown-message-labels --message-read-batch-size 25
 ```
 
 `--reclassify-existing`では、起動時に対象アカウント・Master・手動分を含むユーザーラベルの置換範囲を確認し、メール用OAuthを先に完了します。フィルタの配備・Master照合後、バックアップ、検索、再分類と読戻しまで自動で続けます。メール処理直前の追加承認は不要です。既存のフィルタ差分・Action/Delete・Trashの承認は従来どおり必要です。指定しなければ従来の準備確認とメール更新の個別承認を使います。復元は一括承認の対象外です。
 
 `--skip-unknown-message-labels`は`run`・`reclassify`で使用できます。計画時の正常な最小メタデータに、ラベル一覧に存在しないIDが含まれるメールだけを保留します。保留IDと元のメタデータはハッシュ付き計画DBの`deferred`表に保存し、そのメールは一切更新しません。確認できた対象の処理後も全件完了とはせず、終了コード4・`complete=false`・`eligible_verified=true`で部分完了を示します。送信済み操作の不明状態がなければ`messages_pending.json`は解消します。保留分はラベルの不整合が解消した後、新しい読取り計画で確認します。通信失敗、不正なメタデータ、計画後の外部変更は停止します。保留機能を使う計画はv2となり、旧版では再開できません。指定しない場合は従来どおり未知のラベルでも停止し、計画はv1です。
+
+`--message-read-batch-size N`は最小メタデータの読取りを1〜50件ずつまとめます（既定1）。計画・事前照合・更新直前・読戻しのそれぞれで新たに取得し、キャッシュは再利用しません。内側の応答が全件揃った場合だけ処理し、読取り失敗には既存の有界リトライを使います。2件以上では毎秒20件以下を目安に送信間隔を空けます。更新用の`--message-batch-size`とは別設定で、更新要求の自動再送はしません。Googleの[HTTPバッチの説明](https://developers.google.com/workspace/gmail/api/guides/batch)に従い上限50件とし、バッチ内の各API呼出しはそれぞれ利用枠に数えられます。
 
 対象メールの列挙と複数回の照合が必要なため、メール数によっては3時間を超えることがあります。処理中は既存メールの既読状態・ラベルを他のクライアントで変更すると、外部変更として停止する場合があります。
 

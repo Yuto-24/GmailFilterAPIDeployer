@@ -15,6 +15,8 @@ from pathlib import Path
 import re
 import sqlite3
 import sys
+import time
+from itertools import islice
 import uuid
 
 import gmail_filter_deployer as d
@@ -168,8 +170,11 @@ class UnknownMessageLabels(d.DeploymentError):
 
 class Gmail:
     """One-attempt writes; bounded read retries, minimal message projections."""
-    def __init__(self, client, verbose=False):
+    def __init__(self, client, verbose=False, read_batch_size=1):
+        require(isinstance(read_batch_size, int) and 1 <= read_batch_size <= 50,
+                "メール読取りバッチ件数は1〜50です")
         self.client, self.verbose = client, verbose
+        self.read_batch_size = read_batch_size
 
     def read(self, kind, request):
         return d.read_operation("Gmail " + kind, lambda: request.execute(num_retries=0), self.verbose)
@@ -209,9 +214,12 @@ class Gmail:
             require(token not in seen, "messages.listのページが循環しています")
             seen.add(token)
 
-    def message(self, mid, labels):
-        row = self.read("messages.get", self.client.users().messages().get(
-            userId="me", id=mid, format="minimal", fields="id,threadId,labelIds,historyId"))
+    def message_request(self, mid):
+        return self.client.users().messages().get(
+            userId="me", id=mid, format="minimal", fields="id,threadId,labelIds,historyId")
+
+    @staticmethod
+    def metadata(mid, row, labels):
         lids = row.get("labelIds", [])
         require(row.get("id") == mid and isinstance(row.get("threadId"), str) and
                 isinstance(lids, list) and all(isinstance(x, str) and x for x in lids)
@@ -220,6 +228,50 @@ class Gmail:
             raise UnknownMessageLabels(row)
         return {"id": mid, "threadId": row["threadId"], "labelIds": sorted(lids),
                 "historyId": row.get("historyId")}
+
+    def message(self, mid, labels):
+        return self.metadata(mid, self.read("messages.get", self.message_request(mid)), labels)
+
+    def snapshots(self, ids):
+        """Fresh minimal GETs only; require every response before yielding a chunk.
+
+        Whole-chunk retries are safe because this path never contains writes.
+        Pace batches to at most 20 message GETs/second, leaving quota headroom.
+        """
+        remaining = iter(ids)
+        while chunk := list(islice(remaining, self.read_batch_size)):
+            if self.read_batch_size == 1:
+                yield chunk[0], self.read("messages.get", self.message_request(chunk[0]))
+                continue
+            require(len(set(chunk)) == len(chunk), "メール読取りバッチのIDが重複しています")
+            started = time.monotonic()
+
+            def fetch():
+                rows, failures, seen, invalid = {}, {}, set(), []
+                def observed(mid, row, error):
+                    if mid not in chunk or mid in seen:
+                        invalid.append(mid)
+                        return
+                    seen.add(mid)
+                    if error is not None:
+                        failures[mid] = error
+                    else:
+                        rows[mid] = row
+                batch = self.client.new_batch_http_request(callback=observed)
+                for mid in chunk:
+                    batch.add(self.message_request(mid), request_id=mid)
+                batch.execute()
+                require(not invalid and seen == set(chunk), "メール読取りバッチの応答が不足・重複しています")
+                if failures:
+                    raise next(iter(failures.values()))
+                return rows
+
+            rows = d.read_operation("Gmail messages.get batch", fetch, self.verbose)
+            delay = len(chunk) / 20 - (time.monotonic() - started)
+            if delay > 0:
+                time.sleep(delay)
+            for mid in chunk:
+                yield mid, rows[mid]
 
     def history_start(self):
         row = self.read("getProfile", self.client.users().getProfile(userId="me"))
@@ -320,9 +372,9 @@ def create_plan(api, local_dir, master, account, *, skip_unknown_labels=False):
         require(not changed - added, "列挙中に既存メールが変更されました。計画を作り直してください")
         initial_ids = first_ids - added
         excluded = 0
-        for n, mid in enumerate(sorted(initial_ids), 1):
+        for n, (mid, raw) in enumerate(api.snapshots(sorted(initial_ids)), 1):
             try:
-                row = api.message(mid, labels)
+                row = api.metadata(mid, raw, labels)
             except UnknownMessageLabels as exc:
                 if not skip_unknown_labels:
                     raise
@@ -624,9 +676,10 @@ def reconcile(api, plan, journal, mode):
     validate_labels(api, plan)
     if mode == "apply":
         api.filters_match(plan.rules, plan.labels, normalization=plan.manifest["normalization_version"])
-    for row in plan.rows():
+    for mid, raw in api.snapshots(row["id"] for row in plan.rows()):
+        row = plan.row(mid)
         try:
-            observe(api, plan, journal, row, mode)
+            observe(api, plan, journal, row, mode, now=api.metadata(mid, raw, plan.labels))
         except BaseException as exc:
             if journal:
                 journal.event("conflict", {"message": row["id"], "error": str(exc)})
@@ -706,8 +759,9 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
                 if mode == "apply":
                     api.filters_match(plan.rules, plan.labels, normalization=plan.manifest["normalization_version"])
                 systems = {}
-                for mid in ids:
-                    now = observe(api, plan, journal, plan.row(mid), mode)
+                for mid, raw in api.snapshots(ids):
+                    now = observe(api, plan, journal, plan.row(mid), mode,
+                                  now=api.metadata(mid, raw, plan.labels))
                     systems[mid] = sorted(set(now["labelIds"]) - plan.users)
                 journal.db.execute("INSERT INTO intents(mode,ids,add_labels,remove_labels,systems) VALUES(?,?,?,?,?)",
                                    (mode, encode(ids), encode(add), encode(remove), encode(systems)))
@@ -722,8 +776,8 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
                     journal.event("write_failed", d.api_error_details(exc))
                     journal.db.commit()
                 # Even a successful empty batch response is not a per-message acknowledgement.
-                for mid in ids:
-                    now = api.message(mid, plan.labels)
+                for mid, raw in api.snapshots(ids):
+                    now = api.metadata(mid, raw, plan.labels)
                     require(sorted(set(now["labelIds"]) - plan.users) == systems[mid],
                             "送信中にシステム状態が変更されました: " + mid)
                     observe(api, plan, journal, plan.row(mid), mode, now=now)
@@ -776,7 +830,7 @@ def message_client(args):
             "メール用トークンは配備用トークン・クライアント秘密情報と別のファイルにしてください")
     client, _ = d.get_client(args.client_secrets, token, allow_auth=sys.stdin.isatty(),
         scopes=d.SCOPES + ["https://www.googleapis.com/auth/gmail.modify"], expected_email=args.expected_email)
-    return Gmail(client, getattr(args, "verbose", False))
+    return Gmail(client, getattr(args, "verbose", False), getattr(args, "message_read_batch_size", 1))
 
 
 def authorize_run(args):

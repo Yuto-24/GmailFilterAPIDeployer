@@ -2319,6 +2319,8 @@ def main(argv=None):
     for name in ("run", "reclassify", "restore-labels"):
         p = sub.choices[name]
         p.add_argument("--message-token", type=Path, help="メール専用OAuthトークン（既定: local-dir/message_token.json）")
+        p.add_argument("--message-read-batch-size", type=int, default=1,
+                       help="最小メタデータ読取りのHTTPバッチ件数: 1〜50、既定1。更新バッチとは独立")
         p.add_argument("--message-batch-size", type=int, default=50, help="メール更新件数: 1〜1000、既定50")
         p.add_argument("--max-message-batches", type=int, help="指定バッチ数のメール更新・読戻し後に停止")
     for name in ("run", "apply"):
@@ -2332,6 +2334,7 @@ def main(argv=None):
             if args.cmd in ("plan", "apply", "verify", "run", "reclassify", "restore-labels"):
                 args.expected_email = resolve_expected_email(args.expected_email)
             if hasattr(args, "message_batch_size"):
+                demand(1 <= args.message_read_batch_size <= 50, "message-read-batch-sizeは1〜50です")
                 demand(1 <= args.message_batch_size <= 1000, "message-batch-sizeは1〜1000です")
                 demand(args.max_message_batches is None or args.max_message_batches > 0, "max-message-batchesは1以上です")
             with messages.exclusive_lock(args.local_dir) if args.cmd in ("apply", "reclassify", "restore-labels") else nullcontext():

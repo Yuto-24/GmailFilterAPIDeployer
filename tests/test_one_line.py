@@ -315,7 +315,7 @@ class TestOneLine(unittest.TestCase):
 
     def test_resume_partial_deploy(self):
         real_perform=d.perform
-        def interrupt(client,plan,expected,digest,log,batch,verbose=False,max_batches=None):
+        def interrupt(client,plan,expected,digest,log,batch,verbose=False,max_batches=None,defer_unconfirmed=False):
             current, _ = d.api_fetch(client)
             original = plan['remove'][0]
             matches=[x for x in current if x['filter']==original]

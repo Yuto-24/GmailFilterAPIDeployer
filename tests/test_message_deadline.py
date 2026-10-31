@@ -63,6 +63,38 @@ class MessageDeadlineTests(unittest.TestCase):
         self.assertTrue(m.execute(self.api, plan, self.local, authorization=args._message_authorization))
         self.assertEqual(len(self.client.writes), 1)
 
+    def test_upfront_preflight_conflict_without_any_intent_allows_fresh_plan(self):
+        plan = self.plan()
+        args = self.authorize()
+        self.client.mail['a']['labelIds'].remove('UNREAD')
+        with self.assertRaisesRegex(d.DeploymentError, 'システム状態の外部変更'):
+            m.execute(self.api, plan, self.local, authorization=args._message_authorization)
+        self.assertEqual(self.client.writes, [])
+        self.assertFalse((self.local/m.PENDING).exists())
+        journal = m.Journal(plan)
+        try:
+            self.assertEqual(journal.db.execute('SELECT count(*) FROM intents').fetchone()[0], 0)
+            self.assertEqual(journal.meta('complete'), 'false')
+        finally:
+            journal.close()
+        plan.verify_files()
+        directory = m.create_plan(self.api, self.local, self.master, fixtures.ACCOUNT)
+        self.assertNotEqual(directory, plan.directory)
+
+    def test_postwrite_failure_with_durable_intent_keeps_fixed_plan_pointer(self):
+        plan = self.plan()
+        args = self.authorize()
+        self.client.write_failure = TimeoutError('lost response')
+        with self.assertRaises(d.DeploymentError):
+            m.execute(self.api, plan, self.local, authorization=args._message_authorization)
+        self.assertEqual(len(self.client.writes), 1)
+        self.assertEqual(m.pending(self.local)['run_id'], plan.directory.name)
+        journal = m.Journal(plan)
+        try:
+            self.assertEqual(journal.db.execute('SELECT count(*) FROM intents').fetchone()[0], 1)
+        finally:
+            journal.close()
+
     def test_invalid_time_budgets_fail_before_oauth(self):
         with patch.object(d, 'get_client', side_effect=AssertionError('no OAuth')):
             for value in ('0','-1','nan','inf'):

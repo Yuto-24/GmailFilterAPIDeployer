@@ -856,6 +856,9 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
             journal.db.execute("INSERT OR REPLACE INTO meta VALUES('eligible_verified', 'false')")
             journal.event("stopped", {"error": str(exc), "type": type(exc).__name__})
             journal.db.commit()
+            if mode == "apply" and not journal.db.execute("SELECT 1 FROM intents").fetchone():
+                (local_dir / PENDING).unlink(missing_ok=True)
+                sync_directory(local_dir)
         raise
     finally:
         api.deadline = previous_deadline

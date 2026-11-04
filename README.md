@@ -194,7 +194,7 @@ APIにもMasterと同じnative条件がある場合は、作成・削除せず�
 bash scripts/watch_reclassification.sh
 ```
 
-上記スクリプトは `local/logs/` の最新ログを先頭から表示し、追記を監視します。過去のログも `local/logs/` から直接確認できます。
+上記スクリプトは**起動時点**の `local/logs/` の最新ログを先頭から表示し、追記を監視します。再分類を中断して `resume` など新しいコマンドを実行した場合は、監視側で Ctrl+C を押して同じコマンドを再実行してください（新しいログファイルに切り替わります）。過去のログも `local/logs/` から直接確認できます。
 
 `docker compose run --rm --service-ports deployer run` の実行方法は変更不要です。コンテナ終了後に Docker 自身の one-off コンテナログは削除されますが、`./local:/app/local` のバインドマウントにより保存済みログファイルは保持されます。
 

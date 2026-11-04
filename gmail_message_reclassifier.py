@@ -412,12 +412,13 @@ def create_plan(api, local_dir, master, account, *, skip_unknown_labels=False):
                     raise
                 db.execute("INSERT INTO deferred VALUES(?,?)", (mid, encode(exc.row)))
                 deferred += 1
-                continue
-            if set(row["labelIds"]) & EXCLUDED:
+                row = None
+            if row is not None and set(row["labelIds"]) & EXCLUDED:
                 excluded += 1
-                continue
-            db.execute("INSERT INTO messages VALUES(?,?,?,?,0)",
-                       (mid, row["threadId"], encode(row["labelIds"]), "[]"))
+                row = None
+            if row is not None:
+                db.execute("INSERT INTO messages VALUES(?,?,?,?,0)",
+                           (mid, row["threadId"], encode(row["labelIds"]), "[]"))
             show_progress("メタデータ取得", n, len(initial_ids))
         show_progress("メタデータ取得", len(initial_ids), len(initial_ids), force=True)
         db.commit()
@@ -454,7 +455,12 @@ def create_plan(api, local_dir, master, account, *, skip_unknown_labels=False):
             desired = [r[0] for r in db.execute("SELECT label FROM desired_labels WHERE message=? ORDER BY label", (mid,))]
             db.execute("UPDATE messages SET desired=? WHERE id=?", (encode(desired), mid))
         show_progress("計画最終照合（メール列挙）")
-        second_ids = set(api.ids())
+        second_ids = set()
+        for mid in api.ids():
+            second_ids.add(mid)
+            if len(second_ids) % 500 == 0:
+                show_progress("計画最終照合（メール列挙）", len(second_ids))
+        show_progress("計画最終照合（メール列挙）", len(second_ids))
         new_ids, changed = api.changes(start)
         require(not changed - new_ids and second_ids - new_ids == initial_ids,
                 "計画中に既存メールが変更・増減しました。計画を作り直してください")
@@ -800,7 +806,8 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
             key = (tuple(sorted(new - old)), tuple(sorted(old - new)))
             groups.setdefault(key, []).append(row["id"])
         counts = dict(journal.db.execute("SELECT status,count(*) FROM progress GROUP BY status"))
-        total_changes = sum(counts.values())
+        total_changes = (sum(counts.values()) if mode == "apply"
+                         else counts.get("applied", 0) + counts.get("restored", 0))
         target_state = "applied" if mode == "apply" else "restored"
         completed_changes = counts.get(target_state, 0)
         show_progress("更新" if mode == "apply" else "復元", completed_changes, total_changes, force=True)

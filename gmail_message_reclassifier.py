@@ -399,7 +399,6 @@ def create_plan(api, local_dir, master, account, *, skip_unknown_labels=False):
             if len(first_ids) % 500 == 0:
                 show_progress("メール列挙", len(first_ids))
         show_progress("メール列挙", len(first_ids))
-        show_progress("メタデータ取得", 0, len(first_ids))
         added, changed = api.changes(start)
         require(not changed - added, "列挙中に既存メールが変更されました。計画を作り直してください")
         initial_ids = first_ids - added

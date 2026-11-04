@@ -341,6 +341,16 @@ def connect_db(path, *, readonly=False):
     return db
 
 
+def show_progress(phase, done=None, total=None, *, force=False):
+    """Progress reflects completed work in this invocation, not API log volume."""
+    if total is None:
+        print(f"[メール進捗] {phase}: 集計中" +
+              (f"（{done}件確認）" if done is not None else ""), flush=True)
+    elif force or done == 0 or done == total or done % 500 == 0:
+        percent = 100.0 if total == 0 else done * 100 / total
+        print(f"[メール進捗] {phase}: {done}/{total} ({percent:.1f}%)", flush=True)
+
+
 def create_plan(api, local_dir, master, account, *, skip_unknown_labels=False):
     """Finish and hash a complete snapshot before making it eligible for approval."""
     require(pending(local_dir) is None, "未完了のメール更新があります。先に再開または復元してください")
@@ -382,11 +392,18 @@ def create_plan(api, local_dir, master, account, *, skip_unknown_labels=False):
             db.execute("CREATE TABLE deferred(id TEXT PRIMARY KEY, metadata TEXT NOT NULL)")
         deferred = 0
         start = api.history_start()
-        first_ids = set(api.ids())
+        show_progress("メール列挙")
+        first_ids = set()
+        for mid in api.ids():
+            first_ids.add(mid)
+            if len(first_ids) % 500 == 0:
+                show_progress("メール列挙", len(first_ids))
+        show_progress("メール列挙", len(first_ids))
         added, changed = api.changes(start)
         require(not changed - added, "列挙中に既存メールが変更されました。計画を作り直してください")
         initial_ids = first_ids - added
         excluded = 0
+        show_progress("メタデータ取得", 0, len(initial_ids))
         for n, (mid, raw) in enumerate(api.snapshots(sorted(initial_ids)), 1):
             try:
                 row = api.metadata(mid, raw, labels)
@@ -395,14 +412,15 @@ def create_plan(api, local_dir, master, account, *, skip_unknown_labels=False):
                     raise
                 db.execute("INSERT INTO deferred VALUES(?,?)", (mid, encode(exc.row)))
                 deferred += 1
-                continue
-            if set(row["labelIds"]) & EXCLUDED:
+                row = None
+            if row is not None and set(row["labelIds"]) & EXCLUDED:
                 excluded += 1
-                continue
-            db.execute("INSERT INTO messages VALUES(?,?,?,?,0)",
-                       (mid, row["threadId"], encode(row["labelIds"]), "[]"))
-            if n % 500 == 0:
-                print(f"[メール計画] メタデータ取得 {n}/{len(initial_ids)}", flush=True)
+                row = None
+            if row is not None:
+                db.execute("INSERT INTO messages VALUES(?,?,?,?,0)",
+                           (mid, row["threadId"], encode(row["labelIds"]), "[]"))
+            show_progress("メタデータ取得", n, len(initial_ids))
+        show_progress("メタデータ取得", len(initial_ids), len(initial_ids), force=True)
         db.commit()
 
         def search(query):
@@ -414,6 +432,7 @@ def create_plan(api, local_dir, master, account, *, skip_unknown_labels=False):
             return {r[0] for r in db.execute("SELECT message FROM query_hits WHERE query=?", (query,))}
 
         target_ids = {r[0] for r in db.execute("SELECT id FROM messages")}
+        show_progress("ルール照合", 0, len(rules))
         for number, (rule, spec) in enumerate(zip(rules, specs), 1):
             matched = set(target_ids)
             for group in spec["all"]:
@@ -430,12 +449,18 @@ def create_plan(api, local_dir, master, account, *, skip_unknown_labels=False):
             db.executemany("INSERT OR IGNORE INTO desired_labels VALUES(?,?)",
                            ((mid, lid) for mid in matched for lid in ids))
             db.commit()
-            if number % 50 == 0:
-                print(f"[メール計画] ルール照合 {number}/{len(rules)}", flush=True)
+            if number % 50 == 0 or number == len(rules):
+                show_progress("ルール照合", number, len(rules), force=True)
         for mid in target_ids:
             desired = [r[0] for r in db.execute("SELECT label FROM desired_labels WHERE message=? ORDER BY label", (mid,))]
             db.execute("UPDATE messages SET desired=? WHERE id=?", (encode(desired), mid))
-        second_ids = set(api.ids())
+        show_progress("計画最終照合（メール列挙）")
+        second_ids = set()
+        for mid in api.ids():
+            second_ids.add(mid)
+            if len(second_ids) % 500 == 0:
+                show_progress("計画最終照合（メール列挙）", len(second_ids))
+        show_progress("計画最終照合（メール列挙）", len(second_ids))
         new_ids, changed = api.changes(start)
         require(not changed - new_ids and second_ids - new_ids == initial_ids,
                 "計画中に既存メールが変更・増減しました。計画を作り直してください")
@@ -687,11 +712,13 @@ def validate_labels(api, plan):
             "ラベル定義がバックアップと一致しません")
 
 
-def reconcile(api, plan, journal, mode):
+def reconcile(api, plan, journal, mode, *, phase="最終照合"):
+    total = plan.manifest["summary"]["target"]
+    show_progress(phase, 0, total)
     validate_labels(api, plan)
     if mode == "apply":
         api.filters_match(plan.rules, plan.labels, normalization=plan.manifest["normalization_version"])
-    for mid, raw in api.snapshots(row["id"] for row in plan.rows()):
+    for n, (mid, raw) in enumerate(api.snapshots(row["id"] for row in plan.rows()), 1):
         row = plan.row(mid)
         try:
             observe(api, plan, journal, row, mode, now=api.metadata(mid, raw, plan.labels))
@@ -700,6 +727,8 @@ def reconcile(api, plan, journal, mode):
                 journal.event("conflict", {"message": row["id"], "error": str(exc)})
                 journal.db.commit()
             raise
+        show_progress(phase, n, total)
+    show_progress(phase, total, total, force=True)
     if journal:
         journal.db.commit()
 
@@ -738,7 +767,7 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
             journal.db.commit()
             save(local_dir / PENDING, {"run_id": plan.directory.name, "mode": mode,
                                       "digest": plan.manifest["digest"]})
-        reconcile(api, plan, journal, mode)
+        reconcile(api, plan, journal, mode, phase="事前照合")
         plan.summary()
         if journal:
             journal.report()
@@ -754,7 +783,7 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
         # Only interactive approval introduces a waiting interval after preflight.
         plan.verify_files()
         if authorization is None:
-            reconcile(api, plan, journal, mode)
+            reconcile(api, plan, journal, mode, phase="承認後照合")
         if journal is None:
             journal = Journal(plan, create=True)
         journal.set_meta("mode", mode)
@@ -776,6 +805,12 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
                 old, new = new, old
             key = (tuple(sorted(new - old)), tuple(sorted(old - new)))
             groups.setdefault(key, []).append(row["id"])
+        counts = dict(journal.db.execute("SELECT status,count(*) FROM progress GROUP BY status"))
+        total_changes = (sum(counts.values()) if mode == "apply"
+                         else counts.get("applied", 0) + counts.get("restored", 0))
+        target_state = "applied" if mode == "apply" else "restored"
+        completed_changes = counts.get(target_state, 0)
+        show_progress("更新" if mode == "apply" else "復元", completed_changes, total_changes, force=True)
         batches = 0
         for (add, remove), all_ids in sorted(groups.items()):
             for offset in range(0, len(all_ids), batch_size):
@@ -823,8 +858,10 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
                 expected = "applied" if mode == "apply" else "restored"
                 require(all(journal.state(mid) == expected for mid in ids), "メール更新が一部未反映です。再開してください")
                 batches += 1
-                print(f"[メール更新] {batches}バッチ読戻し確認済み", flush=True)
-        reconcile(api, plan, journal, mode)
+                completed_changes += len(ids)
+                show_progress("更新" if mode == "apply" else "復元",
+                              completed_changes, total_changes, force=True)
+        reconcile(api, plan, journal, mode, phase="最終照合")
         expected = {"applied"} if mode == "apply" else {"new", "restored"}
         require(all(row[0] in expected for row in journal.db.execute("SELECT status FROM progress")),
                 "メール更新の未確認進捗が残っています")
@@ -838,6 +875,7 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
         if not complete:
             print(f"既知のラベルを持つ対象メールは照合済み。未知のラベルを持つ{plan.deferred_count}通は未変更で保留です。"
                   "保留IDは計画DBのdeferred表に保存しました。解消後は新しい計画で確認してください。", flush=True)
+        print("[メール進捗] 全工程完了" if complete else "[メール進捗] 対象照合完了（一部保留）", flush=True)
         d.observation_outcome("メール復元全件照合済み" if mode == "restore" else
                               "メール再分類全件照合済み" if complete else "メール再分類は一部保留（未知のラベル）")
         return complete

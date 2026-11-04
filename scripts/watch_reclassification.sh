@@ -12,6 +12,6 @@ if (("${#containers[@]}" > 1)); then
   echo "複数のdeployerコンテナが見つかりました。最新のコンテナを表示します。" >&2
 fi
 docker logs --tail 100 -f "${containers[0]}" 2>&1 | awk '
-  /Gmail messages.get batch/ {next}
+  /\[処理(開始|完了)\] Gmail messages.get batch/ {next}
   {print; fflush()}
 '

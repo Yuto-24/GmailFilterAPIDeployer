@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, redirect_stdout, redirect_stderr
 from contextvars import ContextVar
 from datetime import datetime, timezone
 import hashlib
@@ -23,6 +23,7 @@ import sys
 import tempfile
 import time
 import xml.etree.ElementTree as ET
+import uuid
 
 ATOM = "http://www.w3.org/2005/Atom"
 APPS = "http://schemas.google.com/apps/2006"
@@ -2297,6 +2298,44 @@ def resolve_expected_email(cli_email: str | None) -> str:
     return email
 
 
+class LogTee:
+    """Write visible CLI output to both the terminal and a private run log."""
+
+    def __init__(self, terminal, logfile):
+        self.terminal, self.logfile = terminal, logfile
+
+    def write(self, value):
+        self.logfile.write(value)
+        self.logfile.flush()
+        return self.terminal.write(value)
+
+    def flush(self):
+        self.logfile.flush()
+        self.terminal.flush()
+
+    def isatty(self):
+        return self.terminal.isatty()
+
+
+@contextmanager
+def command_log(args):
+    """Keep one complete, unfiltered stdout/stderr record per invocation."""
+    if args.cmd not in ("run", "apply", "reclassify", "restore-labels"):
+        yield
+        return
+    directory = args.local_dir / "logs"
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    directory.chmod(0o700)
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S_%fZ")
+    name = f"{stamp}_{args.cmd}_{uuid.uuid4().hex[:8]}.log"
+    path = directory / name
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8", buffering=1) as log:
+        with redirect_stdout(LogTee(sys.stdout, log)), redirect_stderr(LogTee(sys.stderr, log)):
+            print(f"[実行ログ] {path}", flush=True)
+            yield
+
+
 def main(argv=None):
     """Dispatch CLI commands, summarize run/apply measurements, and classify failures."""
     root = Path(__file__).resolve().parent
@@ -2372,34 +2411,35 @@ def main(argv=None):
         sub.choices[name].add_argument("--max-batches", type=int,
                                        help="指定数のバッチを照合後、保留計画を保持して終了（既定は全件）")
     args = ap.parse_args(argv)
-    try:
-        with observe_command(args.cmd, args.verbose) if args.cmd in ("run", "apply", "reclassify", "restore-labels") else nullcontext():
-            demand(not getattr(args, "defer_unconfirmed", False) or args.batch_size == 1,
-                   "保留継続モードは--batch-size 1専用です")
-            max_batches = getattr(args, "max_batches", None)
-            demand(max_batches is None or max_batches > 0, "max-batchesは1以上で指定してください")
-            if args.cmd in ("plan", "apply", "verify", "run", "reclassify", "restore-labels"):
-                args.expected_email = resolve_expected_email(args.expected_email)
-            if hasattr(args, "message_batch_size"):
-                demand(1 <= args.message_read_batch_size <= 50, "message-read-batch-sizeは1〜50です")
-                demand(1 <= args.message_batch_size <= 1000, "message-batch-sizeは1〜1000です")
-                demand(args.max_message_batches is None or args.max_message_batches > 0, "max-message-batchesは1以上です")
-                if args.max_message_seconds is not None:
-                    import math
-                    demand(math.isfinite(args.max_message_seconds) and args.max_message_seconds > 0,
-                           "max-message-secondsは有限の正数です")
-                    args._message_deadline = time.monotonic() + args.max_message_seconds
-            with messages.exclusive_lock(args.local_dir) if args.cmd in ("apply", "reclassify", "restore-labels") else nullcontext():
-                if args.cmd == "apply":
-                    demand(messages.pending(args.local_dir) is None, "メール更新が未完了です。先に再開・復元してください")
-                args.func(args)
-    except DeploymentError as exc:
-        print("STOP: " + str(exc), file=sys.stderr)
-        return 2
-    except Exception as exc:
-        print("STOP: 予期しないエラーです。途中まで反映された可能性があります。planを再実行せず状態照合してください: " + str(exc), file=sys.stderr)
-        return 3
-    return getattr(args, "exit_code", 0)
+    with command_log(args):
+        try:
+            with observe_command(args.cmd, args.verbose) if args.cmd in ("run", "apply", "reclassify", "restore-labels") else nullcontext():
+                demand(not getattr(args, "defer_unconfirmed", False) or args.batch_size == 1,
+                       "保留継続モードは--batch-size 1専用です")
+                max_batches = getattr(args, "max_batches", None)
+                demand(max_batches is None or max_batches > 0, "max-batchesは1以上で指定してください")
+                if args.cmd in ("plan", "apply", "verify", "run", "reclassify", "restore-labels"):
+                    args.expected_email = resolve_expected_email(args.expected_email)
+                if hasattr(args, "message_batch_size"):
+                    demand(1 <= args.message_read_batch_size <= 50, "message-read-batch-sizeは1〜50です")
+                    demand(1 <= args.message_batch_size <= 1000, "message-batch-sizeは1〜1000です")
+                    demand(args.max_message_batches is None or args.max_message_batches > 0, "max-message-batchesは1以上です")
+                    if args.max_message_seconds is not None:
+                        import math
+                        demand(math.isfinite(args.max_message_seconds) and args.max_message_seconds > 0,
+                               "max-message-secondsは有限の正数です")
+                        args._message_deadline = time.monotonic() + args.max_message_seconds
+                with messages.exclusive_lock(args.local_dir) if args.cmd in ("apply", "reclassify", "restore-labels") else nullcontext():
+                    if args.cmd == "apply":
+                        demand(messages.pending(args.local_dir) is None, "メール更新が未完了です。先に再開・復元してください")
+                    args.func(args)
+        except DeploymentError as exc:
+            print("STOP: " + str(exc), file=sys.stderr)
+            return 2
+        except Exception as exc:
+            print("STOP: 予期しないエラーです。途中まで反映された可能性があります。planを再実行せず状態照合してください: " + str(exc), file=sys.stderr)
+            return 3
+        return getattr(args, "exit_code", 0)
 
 
 if __name__ == "__main__":

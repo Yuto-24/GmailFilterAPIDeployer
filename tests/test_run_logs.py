@@ -60,3 +60,13 @@ class RunLogTests(unittest.TestCase):
         self.assertIn("WARNING: readback delayed", log)
         self.assertIn("STOP: API照合で停止", log)
         self.assertIn("更新処理中", log)
+
+    def test_log_setup_failure_returns_stop_without_running_command(self):
+        console, errors = StringIO(), StringIO()
+        with patch.object(d.Path, "mkdir", side_effect=PermissionError("readonly")), \
+             patch.object(d, "cmd_run") as deploy, \
+             redirect_stdout(console), redirect_stderr(errors):
+            code = d.main(["run", "--local-dir", str(self.local)])
+        self.assertEqual(code, 3)
+        self.assertIn("STOP: 実行ログの準備・保存に失敗しました", errors.getvalue())
+        deploy.assert_not_called()

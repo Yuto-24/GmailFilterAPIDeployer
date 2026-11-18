@@ -643,7 +643,9 @@ def create_plan(api, local_dir, master, account, *, skip_unknown_labels=False):
                 show_progress("ルール照合", number, len(rules), force=True)
         excluded, deferred, new_count = _plan_reconcile(
             api, db, labels, rules, specs, initial_ids, start, excluded, deferred, skip_unknown_labels)
-        for mid, in db.execute("SELECT id FROM messages"):
+        require(api.labels() == labels, "計画中にラベル定義が変更されました")
+        api.filters_match(rules, labels)
+        for (mid,) in list(db.execute("SELECT id FROM messages")):
             desired = [r[0] for r in db.execute("SELECT label FROM desired_labels WHERE message=? ORDER BY label", (mid,))]
             db.execute("UPDATE messages SET desired=? WHERE id=?", (encode(desired), mid))
         summary = {"target": db.execute("SELECT count(*) FROM messages").fetchone()[0],

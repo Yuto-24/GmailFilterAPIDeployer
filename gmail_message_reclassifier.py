@@ -457,6 +457,7 @@ def _plan_reconcile(api, db, labels, rules, specs, initial_ids, history_start,
                     db.execute("DELETE FROM messages WHERE id=?", (mid,))
                     db.execute("DELETE FROM matches WHERE message=?", (mid,))
                     db.execute("DELETE FROM desired_labels WHERE message=?", (mid,))
+                    db.execute("DELETE FROM query_hits WHERE message=?", (mid,))
                 continue
             try:
                 now = api.message(mid, labels)
@@ -471,6 +472,7 @@ def _plan_reconcile(api, db, labels, rules, specs, initial_ids, history_start,
                     db.execute("DELETE FROM messages WHERE id=?", (mid,))
                     db.execute("DELETE FROM matches WHERE message=?", (mid,))
                     db.execute("DELETE FROM desired_labels WHERE message=?", (mid,))
+                    db.execute("DELETE FROM query_hits WHERE message=?", (mid,))
                     deferred += 1
                 continue
             if mid not in current:
@@ -485,6 +487,7 @@ def _plan_reconcile(api, db, labels, rules, specs, initial_ids, history_start,
                 db.execute("DELETE FROM messages WHERE id=?", (mid,))
                 db.execute("DELETE FROM matches WHERE message=?", (mid,))
                 db.execute("DELETE FROM desired_labels WHERE message=?", (mid,))
+                db.execute("DELETE FROM query_hits WHERE message=?", (mid,))
                 excluded += 1
                 continue
             db.execute("UPDATE messages SET before_labels=? WHERE id=?",

@@ -356,6 +356,46 @@ PLANNING_SCHEMA = "gmail-message-planning-checkpoint/v1"
 MAX_RECONCILE_PASSES = 3
 
 
+def require_planning_target(local_dir, master, account):
+    """Never deploy a different Master over an in-progress message snapshot."""
+    path = local_dir / PLANNING
+    if not path.exists():
+        return
+    checkpoint = json.loads(path.read_text())
+    require(checkpoint.get("schema") == PLANNING_SCHEMA
+            and checkpoint.get("account") == account
+            and checkpoint.get("master_sha256") == d.file_hash(master),
+            "未完了のメール計画と配備先のMaster・アカウントが異なります。"
+            "配備前に計画を再開するか、明示的に計画を破棄してください")
+
+
+def reset_planning(args):
+    """Explicitly release a read-only, incomplete plan without deleting its audit DB."""
+    require(pending(args.local_dir) is None
+            and not (args.local_dir / "run_pending.json").exists(),
+            "承認済みの変更が未完了です。先にその計画を再開・復元してください")
+    path = args.local_dir / PLANNING
+    if not path.exists():
+        print("破棄対象の未完了メール計画はありません。", flush=True)
+        return
+    checkpoint = json.loads(path.read_text())
+    require(checkpoint.get("schema") == PLANNING_SCHEMA
+            and checkpoint.get("account") == args.expected_email,
+            "計画の形式・アカウントが一致しません")
+    directory = run_directory(args.local_dir, checkpoint.get("run_id"))
+    require(directory.is_dir() and not (directory / "manifest.json").exists(),
+            "完了済みの計画または破損したチェックポイントです")
+    print(f"破棄対象: {directory}", flush=True)
+    print("計画の再開ポインタだけを解除します。過去のバックアップは保持し、"
+          "Gmailのフィルタ・メールは変更しません。", flush=True)
+    if not d.confirm_interactive("未完了の計画を破棄しますか？ [y/N]: "):
+        print("破棄を見送りました。", flush=True)
+        return
+    path.unlink()
+    sync_directory(args.local_dir)
+    print("未完了の計画ポインタを破棄しました。次回の再分類は最初から計画します。", flush=True)
+
+
 def _mutable_search(query):
     """Only native address/subject predicates are independent of Gmail label state.
 
@@ -541,6 +581,19 @@ def create_plan(api, local_dir, master, account, *, skip_unknown_labels=False):
                 "保存済みルールがMasterのprefixと一致しません")
         require(not db.execute("SELECT 1 FROM messages WHERE id NOT IN (SELECT id FROM initial_ids)").fetchone(),
                 "計画チェックポイントのメールIDが不正です")
+        allowed_queries = {q for spec in specs for group in spec["all"] for q in group}
+        allowed_queries.update(spec["exclude"] for spec in specs if spec["exclude"])
+        cached_queries = {row[0] for row in db.execute("SELECT query FROM queries")}
+        require(cached_queries <= allowed_queries and not db.execute(
+                    "SELECT 1 FROM query_hits WHERE query NOT IN (SELECT query FROM queries) "
+                    "OR message NOT IN (SELECT id FROM messages)").fetchone()
+                and not db.execute(
+                    "SELECT 1 FROM matches WHERE rule NOT IN (SELECT number FROM rules) "
+                    "OR message NOT IN (SELECT id FROM messages)").fetchone()
+                and not db.execute(
+                    "SELECT 1 FROM desired_labels WHERE message NOT IN (SELECT id FROM messages)").fetchone()
+                and all(row[0] in user_ids for row in db.execute("SELECT DISTINCT label FROM desired_labels")),
+                "計画チェックポイントの検索キャッシュ・分類の整合性がありません")
         excluded, deferred, start = (checkpoint["excluded"], checkpoint["deferred"],
                                      checkpoint["history_start"])
         print(f"[メール計画] チェックポイント再開: ルール照合 {len(persisted)}/{len(rules)}"

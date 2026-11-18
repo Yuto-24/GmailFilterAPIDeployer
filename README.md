@@ -4,32 +4,85 @@ Gmailに現在登録されているフィルタと、最新のMaster XMLとの�
 
 配備後には、独立した承認を経て既存メールのユーザーラベルをMasterに合わせて再分類できます。バックアップ、固定計画、中断再開、ユーザーラベルの復元に対応しています。
 
-## 最短の運用：配備は1コマンド
+---
 
-### 初回準備
+## 目次
 
-最初に1度だけ、`local/credentials.json`（Google Cloud OAuth DesktopクライアントJSON）と`.env`（Gmailアドレス）を用意します。Master XMLは`local/masters/`に**元のファイル名のまま**保存してください。旧Masterの配置やファイルのリネームは不要です。
+- [クイックスタート（Clone 〜 初回準備 〜 日常実行）](#クイックスタートclone--初回準備--日常実行)
+- [よく使うコマンド一覧](#よく使うコマンド一覧)
+- [基本運用の流れと承認ルール](#基本運用の流れと承認ルール)
+- [CLIリファレンス（サブコマンド・オプション）](#cliリファレンスサブコマンドオプション)
+- [技術仕様・内部挙動・障害復旧](#技術仕様内部挙動障害復旧)
+- [トラブルシューティング・安全上の制約・公式資料](#トラブルシューティング安全上の制約公式資料)
+
+---
+
+## クイックスタート（Clone 〜 初回準備 〜 日常実行）
+
+### 1. Clone と初回準備（最初の1度だけ）
+
+`local/credentials.json`（Google Cloud OAuth DesktopクライアントJSON）と`.env`（Gmailアドレス）を用意し、Master XMLを`local/masters/`に**元のファイル名のまま**保存してください（旧Masterの配置やファイルのリネームは不要です）。
 
 ```bash
+git clone https://github.com/Yuto-24/GmailFilterAPIDeployer.git
+cd GmailFilterAPIDeployer
+
 cp .env.example .env
 # .envの GMAIL_EXPECTED_EMAIL を自分のアドレスに変更
+
 mkdir -p local/masters
 # local/credentials.json および local/masters/mailFilters_v0.14.0_proposed_master_20261019.xml 等を配置
+
 docker compose build
 ```
 
-### 毎回の実行と処理順序
+> **Dockerを使わない場合**：依存ライブラリは`requirements.txt`を使用します。`pip install -r requirements.txt`後に`python gmail_filter_deployer.py run`で同じCLIを呼べます（環境変数の設定が別途必要です）。
 
-初回準備の後は、毎回以下の**1コマンドだけ**を実行します。
+### 2. 日常の実行（XML配置後のフィルタ更新＋過去メール再分類）
+
+新しいMaster XMLを `local/masters/` に格納した後は、毎回以下のコマンドでフィルタの配備から過去メールの再分類までを一括で実行します。
 
 ```bash
-docker compose run --rm --service-ports deployer run
-
-# フィルタごとの処理内容も表示するとき
-# docker compose run --rm --service-ports deployer run -v
+docker compose run --rm \
+--service-ports deployer run \ # 初回OAuth用ポートを開放し、検証〜承認〜配備〜検証を一括実行
+--reclassify-existing \ # フィルタ配備後に既存メールのユーザーラベルも自動で再分類
+--skip-unknown-message-labels \ # ラベル一覧に存在しないIDを含むメールはエラー停止せず保留
+--max-message-seconds 10800 # メール再分類の実行時間上限（約3時間）を設定して安全に途中保留
 ```
 
-`run`は次の順序で進みます。
+*(※ シェルにそのまま貼り付ける場合は、`# ...` のコメント部分を除いて実行してください)*
+
+```bash
+docker compose run --rm \
+--service-ports deployer run \
+--reclassify-existing \
+--skip-unknown-message-labels \
+--max-message-seconds 10800
+```
+
+---
+
+## よく使うコマンド一覧
+
+| 用途 | コマンド |
+|---|---|
+| **日常の実行（フィルタ更新＋過去メール再分類）** | `docker compose run --rm --service-ports deployer run --reclassify-existing --skip-unknown-message-labels --max-message-seconds 10800` |
+| **フィルタ配備のみ（再分類なし・最小構成）** | `docker compose run --rm --service-ports deployer run` |
+| **フィルタごとの処理内容も詳細表示して配備** | `docker compose run --rm --service-ports deployer run -v` |
+| **未確定操作を保留して継続する長時間配備** | `docker compose run --rm --service-ports deployer run --defer-unconfirmed` |
+| **メタデータ読取りバッチサイズも指定して一括再分類** | `docker compose run --rm --service-ports deployer run --reclassify-existing --skip-unknown-message-labels --message-read-batch-size 5 --max-message-seconds 10800` |
+| **実行中ログの追跡（別端末から監視）** | `bash scripts/watch_reclassification.sh` |
+| **メール再分類の計画作成のみ** | `docker compose run --rm --service-ports deployer reclassify --plan-only` |
+| **メール再分類の適用・再開** | `docker compose run --rm --service-ports deployer reclassify --resume RUN_ID` |
+| **指定実行のユーザーラベル復元・再開** | `docker compose run --rm --service-ports deployer restore-labels --run-id RUN_ID` |
+| **XMLの静的検証（オフライン）** | `docker compose run --rm --service-ports deployer validate` |
+| **配備後の完全一致確認** | `docker compose run --rm --service-ports deployer verify` |
+
+---
+
+## 基本運用の流れと承認ルール
+
+### `run` の処理順序
 
 1. **XML検証**
 2. **OAuth認証・アカウント照合**
@@ -53,7 +106,7 @@ docker compose run --rm --service-ports deployer run
 
 ### 配備後の既存メール再分類
 
-フィルタの配備が完了した場合、または変更不要だった場合は、ユーザーラベル用フィルタがMasterと一致することを確認したうえで **「既存メールの再分類を準備しますか？ [y/N]」** を表示します。
+`--reclassify-existing` を指定しない場合、フィルタの配備が完了または変更不要だったときは、ユーザーラベル用フィルタがMasterと一致することを確認したうえで **「既存メールの再分類を準備しますか？ [y/N]」** を表示します。
 
 この照合では現行のXML変換・正規化方式を使います。旧方式の保留計画を再開した場合、配備時に使った表現と異なるため、配備が完了しても再分類の案内を見送ることがあります。
 
@@ -62,13 +115,135 @@ docker compose run --rm --service-ports deployer run
 - 再分類は、受信トレイ・アーカイブ済みのメールにある**手動分を含む全ユーザーラベル**を、Masterに一致するラベル集合へ置き換えます。複数一致はすべて付与し、一致なしはユーザーラベルなしになります。
 - SENT・DRAFT・SPAM・TRASH・CHAT付きメールは除外します。システムラベル、本文、添付、ラベル定義は更新しません。`Action/Delete`もラベルの付与だけです。詳細は[再分類・再開・復元の仕様](docs/issue-6-message-reclassification.md)を参照してください。
 
-### Gmailの1000フィルタ上限対策と読み戻し検証
+### XML自動選択の規則
+
+`local/masters/*.xml`と`local/*.xml`のうち、ファイル名に`vX.Y.Z`と`master`を含むファイルから、バージョンと日付が最も新しいものを選びます。`patch`、`export`、`cumulative`、`incremental`、`baseline`、`target`は候補から除外します。同順位の候補が複数あれば停止し、明示`--target`指定を求めます。候補がない場合のみ旧`local/target.xml`を使います。
+
+### 実行ログの保存と追跡
+
+`run`、`apply`、`reclassify`、`restore-labels` の実行では、**`-v` の有無にかかわらず**、端末に表示される標準出力と標準エラーを同じ内容のまま `local/logs/` に自動保存します。日時（UTC）・コマンド名・一意識別子を含む別ファイルを実行ごとに作成します。権限はログディレクトリが700、ファイルが600です。詳細なAPIログは `-v` を付けた実行でだけ記録されます。ログにはメールIDや実行情報などが含まれる可能性があるため、公開・コミットしないでください。
+
+実行中のログは**別端末から1コマンド**で追跡できます（ホストのPython・SQLite・Dockerログ取得は不要）。
+
+```bash
+bash scripts/watch_reclassification.sh
+```
+
+- 上記スクリプトは**起動時点**の `local/logs/` の最新ログを先頭から表示し、追記を監視します。
+- 再分類を中断して `resume` など新しいコマンドを実行した場合は、監視側で Ctrl+C を押して同じコマンドを再実行してください（新しいログファイルに切り替わります）。過去のログも `local/logs/` から直接確認できます。
+- `docker compose run --rm --service-ports deployer run` の実行方法は変更不要です。コンテナ終了後に Docker 自身の one-off コンテナログは削除されますが、`./local:/app/local` のバインドマウントにより保存済みログファイルは保持されます。
+
+---
+
+## CLIリファレンス（サブコマンド・オプション）
+
+`docker compose run --rm --service-ports deployer <subcommand> [options]` の`deployer`はComposeのサービス名、`<subcommand>`以下はPython CLIの引数です。`--service-ports`はDocker Composeのオプションで、初回OAuth認証を行うコマンド（`run`/`plan`）で使います。認証済みでも付けたままで問題ありません。
+
+### サブコマンド一覧
+
+| サブコマンド | 意味 | Gmailへの変更 | 使用例 |
+|---|---|---|---|
+| `run` | 検証から承認・配備・検証まで一括 | `y`でのみ変更 | `... deployer run` |
+| `validate` | XML構文・処理内容の静的検証 | なし | `... deployer validate` |
+| `plan` | 実フィルタから差分計画を保存 | なし | `... deployer plan` |
+| `apply` | 保存された`plan.json`を厳格に適用 | あり | `... deployer apply --approve HASH --allow-removals` |
+| `verify` | 実フィルタとMasterの一致を確認 | なし | `... deployer verify` |
+| `reclassify` | メール再分類の計画・適用・再開 | 専用の対話承認後のみ | `... deployer reclassify --plan-only` |
+| `restore-labels` | 指定実行のユーザーラベルを復元・再開 | 専用の対話承認後のみ | `... deployer restore-labels --run-id RUN_ID` |
+
+全オプションの確認：
+
+```bash
+docker compose run --rm deployer --help
+docker compose run --rm deployer run --help
+docker compose run --rm deployer apply --help
+```
+
+### `run`（推奨）のオプション
+
+- `--target PATH`：バージョン自動選択を使わず、対象Master XMLを明示。
+- `--batch-size N`：削除・追加をまとめるHTTPバッチ件数。**1〜25、既定1**。1で開始した計画は逐次処理になります。
+- `-v`, `--verbose`：フィルタ単位の処理結果や照合状況、API読み取り・削除・追加と全6フェーズの開始/終了時刻・所要秒数、API種類別集計を表示します。再分類の案内以降は配備区間と分けて計測します。詳細は下記「時間とAPI試行数の読み方」を参照してください。
+- `--expected-email ADDRESS`：`.env`の`GMAIL_EXPECTED_EMAIL`より優先するアカウント照合先。
+- `--local-dir PATH`：Masterと配備記録の保存フォルダ。既定`/app/local`（Docker内）。
+- `--client-secrets PATH`：OAuth DesktopクライアントJSON。既定`/app/local/credentials.json`。
+- `--token PATH`：OAuth認証トークン。既定`/app/local/token.json`。
+
+`run`に`--approve`/`--allow-removals`はありません。承認ハッシュは内部で作成・照合し、対話確認を行います。
+
+### `validate`（オフライン検証）のオプション
+
+- `--target PATH`：検証対象を指定。省略時は最新Master。
+- `--base PATH`：任意の旧Masterと比較し、Delete/Trash変更等を検出。
+- `--out PATH`：検証結果JSONを保存。
+- `--local-dir PATH`：Master検索先を変更。
+
+### `plan`（詳細な配備計画）のオプション
+
+- `--target PATH`：配備先Masterを指定（省略時は最新版）。
+- `--base PATH`：現行Gmailがその旧Masterと完全一致する場合だけ計画する、厳格モード。
+- `--also-baseline PATH`：`--base`と同時に追加する既知Master。複数指定可。
+- `--out PATH`：計画保存先。既定`/app/local/plan.json`。
+- `--expected-email`、`--local-dir`、`--client-secrets`、`--token`：`run`と同じ。
+
+### `apply`（上級者向け分割操作）のオプション
+
+- `--approve HASH`：`plan`の`approval_digest`を指定。**必須**。
+- `--allow-removals`：旧フィルタの削除を伴う配備を明示的に承認。ない場合は削除対象があれば停止。
+- `--plan PATH`：`plan.json`のパス。既定`/app/local/plan.json`。
+- `--log PATH`：進捗記録。既定`/app/local/deploy_log.json`。
+- `--batch-size N`：削除・追加のHTTPバッチ件数（1〜25、既定1）。
+- `-v`, `--verbose`：`run`と同じ詳細表示。
+- `--expected-email`、`--local-dir`、`--client-secrets`、`--token`：`run`と同じ。
+
+### `verify`（配備後の完全比較）のオプション
+
+- `--target PATH`：照合対象Master。
+- `--out PATH`：照合結果JSONの保存先（既定`/app/local/verify.json`）。
+- `--expected-email`、`--local-dir`、`--client-secrets`、`--token`：`run`と同じ。
+
+### 過去メール再分類・復元の詳細オプション
+
+#### 一括自動実行オプション（`run`）
+
+```bash
+docker compose run --rm --service-ports deployer run --reclassify-existing --skip-unknown-message-labels --message-read-batch-size 5 --max-message-seconds 10800
+```
+
+- `--reclassify-existing`：起動時に対象アカウント・Master・手動分を含むユーザーラベルの置換範囲を確認し、メール用OAuthを先に完了します。フィルタの配備・Master照合後、バックアップ、検索、再分類と読戻しまで自動で続けます。メール処理直前の追加承認は不要です。既存のフィルタ差分・Action/Delete・Trashの承認は従来どおり必要です。指定しなければ従来の準備確認とメール更新の個別承認を使います。復元は一括承認の対象外です。
+- `--skip-unknown-message-labels`：`run`・`reclassify`で使用できます。計画時の正常な最小メタデータに、ラベル一覧に存在しないIDが含まれるメールだけを保留します。保留IDと元のメタデータはハッシュ付き計画DBの`deferred`表に保存し、そのメールは一切更新しません。確認できた対象の処理後も全件完了とはせず、終了コード4・`complete=false`・`eligible_verified=true`で部分完了を示します。送信済み操作の不明状態がなければ`messages_pending.json`は解消します。保留分はラベルの不整合が解消した後、新しい読取り計画で確認します。通信失敗、不正なメタデータ、計画後の外部変更は停止します。保留機能を使う計画はv2となり、旧版では再開できません。指定しない場合は従来どおり未知のラベルでも停止し、計画はv1です。
+- `--message-read-batch-size N`：最小メタデータの読取りを1〜50件ずつまとめます（既定1）。計画・事前照合・更新直前・読戻しのそれぞれで新たに取得し、キャッシュは再利用しません。内側の応答が全件揃った場合だけ処理し、読取り失敗には既存の有界リトライを使います。単独・複数件とも毎秒4件を目安に送信間隔を空けます。現在の[利用枠](https://developers.google.com/workspace/gmail/api/reference/quota)では最小取得も1通20単位、標準のユーザー枠は毎分6,000単位のため、読取りを毎分4,800単位相当に抑えます。他の利用も枠を消費するので、制限が続く場合は停止します。更新用の`--message-batch-size`とは別設定で、更新要求の自動再送はしません。Googleの[HTTPバッチの説明](https://developers.google.com/workspace/gmail/api/guides/batch)に従い上限50件とし、バッチ内の各API呼出しはそれぞれ利用枠に数えられます。
+- `--max-message-seconds 10800`：起動から約3時間を目安にメール処理を保留します。初回はハッシュ付き計画・バックアップの完成を待ってから上限を確認するため、計画が長引く場合は目安を超えます。送信済みバッチは読戻しを終えてから止めます。起動時承認を使う場合、適用前の全件照合から固定計画と承認済み進捗を保持するので、時間上限でも`messages_pending.json`を残し、同じMaster・オプションの`run`で再開できます。終了コード4で、全件完了とは表示しません。送信意図が一件もない状態で時間上限以外のエラーになった場合は、バックアップと失敗記録を残して保留ポインタを解除し、再計画を可能にします。送信意図があれば保留ポインタを維持します。指定しなければ時間上限はありません。起動時承認後の再分類では追加の承認待ちがないため、適用前の全件照合は1回です。個別の対話承認では承認前後の2回の照合を維持します。
+
+> **注意**：対象メールの列挙と複数回の照合が必要なため、メール数によっては3時間を超えることがあります。処理中は既存メールの既読状態・ラベルを他のクライアントで変更すると、外部変更として停止する場合があります。
+
+#### 個別計画・再開・復元（`reclassify` / `restore-labels`）
+
+```bash
+# 読取り計画だけを作成。表示されたrun-idとバックアップ先を保持する
+docker compose run --rm --service-ports deployer reclassify --plan-only
+# 固定済み計画を照合し、メール専用の承認後に適用・再開する
+docker compose run --rm --service-ports deployer reclassify --resume RUN_ID
+# 当該実行で変更したと照合できるメールを復元。中断時も同じコマンドで再開
+docker compose run --rm --service-ports deployer restore-labels --run-id RUN_ID
+```
+
+- `run`・`reclassify`・`restore-labels`の`--message-batch-size`は1〜1000、既定50メッセージです。`--max-message-batches N`はNバッチの読み戻し後に保留状態で止めます。フィルタ用の`--batch-size`・`--max-batches`とは独立しています。`reclassify`では`--target`でMasterを選べますが、`--resume`では保存済みMaster・検索結果を使います。
+- メール用OAuthは従来スコープに`gmail.modify`を追加し、既定で`local-dir/message_token.json`に保存します。配備用`token.json`は保持します。`--message-token PATH`で専用トークンの場所を指定できます。権限不足なら対話認証をやり直し、必要スコープとアカウントの照合が成功するまで既存ファイルを置き換えません。メール用の初回認証にも`--service-ports`を使用してください。
+- 未完了の再分類・復元があると、`run`は新しいフィルタ配備より先に保留状態を案内し、固定済み計画を照合・再開します。`local/messages_pending.json`と実行別バックアップ・進捗を保持してください。別Masterへの自動差し替え、バッチ全体の自動再送、競合の強制上書きはしません。復元時は現在のシステム状態を保持しますが、対象外フォルダへの移動、ユーザーラベルの外部変更、ラベル定義の変更・消失は停止理由になります。
+- 再分類の工程別進捗は「メール列挙（集計中）」「メタデータ取得」「ルール照合」「事前照合」「更新」「最終照合」をそれぞれ表示します。更新100%は最終照合完了を意味しません。再開時の更新済み件数は保存済み進捗DBから算出します。
+
+---
+
+## 技術仕様・内部挙動・障害復旧
+
+### 1. Gmailの1000フィルタ上限対策と読み戻し検証
 
 - **Gmailの1000フィルタ上限対策**：新規配備計画では、最終承認後に**旧フィルタを先に削除し、次に新フィルタを追加**します。現行846件・削除257件・追加341件なら、846→589→930件となり上限を超えません。削除と追加の間には、一時的に旧振り分け条件がない時間帯が生じます。配備は既定で1件ずつ実行し、Gmail APIで照合しながら、途中中断時も承認した手順の進捗から再開します。過去の追加先行方式で実行中だった計画は、その実行順序のまま再開します。表現差による不要な差分の最適化は [Issue #1](https://github.com/Yuto-24/GmailFilterAPIDeployer/issues/1) に分離しています。
 - **Gmail APIの読み戻しが一時的に不一致の場合**：削除後または追加後の検証タイミングで期待したフィルタ集合と一致しなければ、**次の変更操作を行わず**、2秒・5秒の待機を挟んで最大2回の追加読み取り（計3回）を行います。期待するルール集合が完全一致した場合のみ続行します。3回とも不一致・未対応のAPIエラー・外部変更の場合は停止し、承認済み計画とログを保持します。これは成功した書き込み後の読み戻し照合です。書き込み自体が失敗した場合は、後述の復旧手順を使います。
 - **不一致の診断記録**：不一致を検出した際は、**最初の読み戻し結果を含めて毎回** `local/logs/diagnostics/batch_*.json` に時刻・期待状態・実フィルタID・ルール内容・不足ID等を保存します。不一致が後で解消しても、診断記録は保持されます。診断ファイルは個人情報を含むため、公開リポジトリ等にはアップロードしないでください。
 
-### フィルタのバッチ処理
+### 2. フィルタのバッチ処理
 
 既定は1件ずつの逐次処理です。複数件バッチは明示的に選択できますが、部分成功やサーバー側エラーが起きる可能性があります。原因不明の400を一時障害として自動再送することはしません。既存バッチ計画の再開経路では、エラー後の読み戻しを保存して停止します。新規の逐次処理でも、400等の失敗直後に実設定を読み戻して停止します。復旧用の読み取りが失敗したら、その場で停止し記録を保持します。
 
@@ -77,13 +252,13 @@ docker compose run --rm --service-ports deployer run
 - **`--max-batches N`による上限指定**：`--max-batches N`を`run`または`apply`に付けると、最大Nバッチを実行・読み戻し照合した時点で終了します。未完了なら保留計画と進捗を保持し、再開時は確認済みの操作を繰り返しません。この上限は複数件バッチ、または既存バッチ計画の再開専用です。既存バッチ計画の少量確認には`run --batch-size 1 --max-batches 1 -v`を使用できます。新規・従来の逐次計画で`--batch-size 1`と併用すると最終承認前に停止します。既存バッチ計画の単独HTTP要求は1件を1バッチとして数えます。ラベル作成はバッチ数に含みません。
 - **バッチの部分失敗・応答消失・中断**：送信前に対象操作・削除ID・その時点の期待状態を計画別ログへ原子的に保存し、各成功応答も個別に保存します。正常な応答を受け取った操作を期待状態へ反映して処理を進めます。全件照合の時点でIDや内容が一致しなければ後続の要求を止めます。失敗時には実設定を読み戻し、2秒・5秒後にも照合して進捗を記録して停止します。Googleのエラー理由・状態・メッセージもローカルの進捗ログに記録します（リクエストヘッダーや認証情報は記録しません）。バッチ全体や失敗操作は自動再送しません。同じ`run`を再実行すると、保存済みバッチの任意の部分成功（先頭から順番に成功していなくても可）をID・内容で照合し、最終承認後に未反映の操作だけを送信します。未送信の操作や既存IDに外部変更があれば停止します。通常の読み戻し不一致は`local/logs/diagnostics/batch_*.json`にも直前・観測時の設定を保存します。復旧用の読み取り自体が失敗した場合はその場で停止します。
 
-### 中断からの再開とログ保存
+### 3. 中断からの再開とログ保存
 
 既存の逐次処理で中断した計画も、承認内容と実行順を変えずにバッチ処理へ移行できます。バッチを始めた後は新しい進捗形式が必要なため、完了まで旧版へ戻さず、保留計画と進捗ログを両方保持してください。
 
 中断した場合は`local/run_pending.json`に固定した計画に対し、現在のGmail設定がその計画の途中状態であることを検証して再開します。別の変更が見つかった場合は停止します。計画ごとのログは`local/logs/`に保存するため、**翌週の新しい配備でもログをリネームする必要はありません**。計画全文は`local/run_plan.json`に保存されます。`local/`と`.env`はGit管理対象外です。
 
-## 全件照合の間隔と進捗の意味
+### 4. 全件照合の間隔と進捗の意味
 
 `run` / `apply` は開始・再開時、通常50変更操作ごと、削除と追加の工程切り替え時、および終了時に全フィルタ・ラベルを照合します。末尾が50件未満でも照合します。新規ラベルは50件ごと、およびフィルタ追加へ進む前にも照合します。`--max-batches`による途中終了も、未照合の末尾を照合してから返ります。最後の工程の照合結果は終了時の確認・結果表示に再利用し、直後に同じ一覧を取り直しません。
 
@@ -93,13 +268,13 @@ docker compose run --rm --service-ports deployer run
 - 失敗・応答不明時は次の操作を止め、その時点で実設定を読み戻します。逐次処理の同一操作に対する有界リトライと、既存バッチ計画の読み戻し後停止は従来どおりです。復旧読み取りが失敗したら、さらに書き込みや入れ子の再試行を行いません。
 - 旧逐次計画・旧バッチ進捗からも、承認済みの操作と順序を維持して再開できます。再開で既に全操作の反映を確認できた場合も、ジャーナルを照合完了に更新してから保留計画を解消します。
 
-**外部変更は次の全件照合まで検知が遅れます。** 毎操作で外部ドリフトを検知する保証ではありません。実行中はGmail UIや別クライアントでフィルタ・ラベルを編集しないでください。同名・同内容でもIDが変わった設定、予期しない追加・削除、ラベル変更は照合時に停止します。
+> **警告**：**外部変更は次の全件照合まで検知が遅れます。** 毎操作で外部ドリフトを検知する保証ではありません。実行中はGmail UIや別クライアントでフィルタ・ラベルを編集しないでください。同名・同内容でもIDが変わった設定、予期しない追加・削除、ラベル変更は照合時に停止します。
 
 `tests/test_cadence.py` の合成88操作（削除45・追加43、ラベル作成なし）では、同じ実行処理の照合間隔1と50を比較し、変更要求88回を維持したまま一覧取得が178回から6回になりました。HTTP要求合計は266回から94回（約64.7%減）です。これは照合頻度の比較であり、実Gmailでの時間短縮率ではありません。
 
 運用判断の根拠: [追加Batch実測報告と再利用できる知見](docs/reports/2026-10-26-filter-add-batch.md)。配備の送信は引き続き1件ずつが既定です。
 
-## 未確定操作を保留して継続する運用
+### 5. 未確定操作を保留して継続する運用（`--defer-unconfirmed`）
 
 長時間の配備を端末を開いたまま進める場合は、次のオプションで保留継続モードを選べます。最初のグループ承認・最終承認は従来どおり必要です。実行中にGmail UIや別クライアントからフィルタ・ラベルを編集しないでください。
 
@@ -118,7 +293,7 @@ docker compose run --rm --service-ports deployer run --defer-unconfirmed
 
 継続モードの進捗は`batch_checkpoint.schema: 2`です。旧版はこの形式を拒否するため、未完了の間は旧版で再開しないでください。旧進捗からの切替は、送信中の未確定操作がなく、最初に旧進捗と実設定の一致を確認できた場合だけ行います。旧形式に送信中の操作が残る場合は、旧モードで照合してから切り替えてください。保留を消したり、成功件数を手で書き換えたり、部分状態から計画を作り直したりしないでください。配備完了後の既存メール再分類は引き続き別承認です。
 
-## 一時的なAPI障害からの復旧
+### 6. 一時的なAPI障害からの復旧
 
 以下の自動再試行は、逐次処理（`--batch-size 1`で開始した計画）とラベル作成に適用します。フィルタのバッチは上記のとおり読み戻して停止し、再開時に未反映分を処理します。
 
@@ -136,7 +311,7 @@ docker compose run --rm --service-ports deployer run --defer-unconfirmed
 
 一時障害とバックオフの根拠：[Gmail APIのエラー処理](https://developers.google.com/workspace/gmail/api/guides/handle-errors)。
 
-## 条件の表記差と計画の互換性
+### 7. 条件の表記差と計画の互換性
 
 Masterの条件をそのまま反映し、ツールの変換が生む不要な差分を避けるため、XMLの`from`・`subject`をAPIの同名フィールドへ保持します。fromのOR式・subjectの中括弧式も元の欄に残し、既存の受理・拒否条件を維持します。`hasTheWord`への括弧追加は従来どおりです。詳細は[nativeフィールド保持の仕様](docs/issue-1-native-fields-proposal.md)を参照してください。
 
@@ -160,7 +335,7 @@ APIにもMasterと同じnative条件がある場合は、作成・削除せず�
 
 承認済みdigestや計画を自動移行せず、journalは元の意味を保って進捗だけを更新します。未知・欠落・注入されたschema/versionの組み合わせは、XMLコンパイル・認証前に停止します。独立した`validate`・`plan`・`verify`は新方式を使用するため、旧保留計画の再開には従来どおり`run`またはその計画の`apply`を使用してください。
 
-## 削除対象の事前検証と一部未適用
+### 8. 削除対象の事前検証と一部未適用
 
 最終承認前に、削除予定ルールがGmail API上のフィルタID 1件に一意に対応するか検証します。0件（存在しない）、複数件（重複）、ID欠落は「スキップ予定」として明細を表示します。特定できないルールは削除せず、他の承認済みルールは処理します。
 
@@ -168,107 +343,7 @@ APIにもMasterと同じnative条件がある場合は、作成・削除せず�
 
 配備完了後には、追加・削除成功・スキップ・Masterへの未適用差分を表示します。途中で外部から設定が変わり、処理済み状態を確定できない場合はそれ以上の変更をせず、途中計画を保存します。
 
-## `deployer`以降のCLI仕様
-
-`docker compose run --rm --service-ports deployer <subcommand> [options]` の`deployer`はComposeのサービス名、`<subcommand>`以下はPython CLIの引数です。`--service-ports`はDocker Composeのオプションで、初回OAuth認証を行うコマンド（`run`/`plan`）で使います。認証済みでも付けたままで問題ありません。
-
-| サブコマンド | 意味 | Gmailへの変更 | 使用例 |
-|---|---|---|---|
-| `run` | 検証から承認・配備・検証まで一括 | `y`でのみ変更 | `... deployer run` |
-| `validate` | XML構文・処理内容の静的検証 | なし | `... deployer validate` |
-| `plan` | 実フィルタから差分計画を保存 | なし | `... deployer plan` |
-| `apply` | 保存された`plan.json`を厳格に適用 | あり | `... deployer apply --approve HASH --allow-removals` |
-| `verify` | 実フィルタとMasterの一致を確認 | なし | `... deployer verify` |
-| `reclassify` | メール再分類の計画・適用・再開 | 専用の対話承認後のみ | `... deployer reclassify --plan-only` |
-| `restore-labels` | 指定実行のユーザーラベルを復元・再開 | 専用の対話承認後のみ | `... deployer restore-labels --run-id RUN_ID` |
-
-### 既存メール再分類の工程別進捗と実行ログ
-
-「メール列挙（集計中）」「メタデータ取得」「ルール照合」「事前照合」「更新」「最終照合」をそれぞれ表示します。更新100%は最終照合完了を意味しません。再開時の更新済み件数は保存済み進捗DBから算出します。
-
-`run`、`apply`、`reclassify`、`restore-labels` の実行では、**`-v` の有無にかかわらず**、端末に表示される標準出力と標準エラーを同じ内容のまま `local/logs/` に自動保存します。日時（UTC）・コマンド名・一意識別子を含む別ファイルを実行ごとに作成します。権限はログディレクトリが700、ファイルが600です。詳細なAPIログは `-v` を付けた実行でだけ記録されます。ログにはメールIDや実行情報などが含まれる可能性があるため、公開・コミットしないでください。
-
-実行中のログを**別端末から1コマンド**で追跡できます（ホストのPython・SQLite・Dockerログ取得は不要）。
-
-```bash
-bash scripts/watch_reclassification.sh
-```
-
-上記スクリプトは**起動時点**の `local/logs/` の最新ログを先頭から表示し、追記を監視します。再分類を中断して `resume` など新しいコマンドを実行した場合は、監視側で Ctrl+C を押して同じコマンドを再実行してください（新しいログファイルに切り替わります）。過去のログも `local/logs/` から直接確認できます。
-
-`docker compose run --rm --service-ports deployer run` の実行方法は変更不要です。コンテナ終了後に Docker 自身の one-off コンテナログは削除されますが、`./local:/app/local` のバインドマウントにより保存済みログファイルは保持されます。
-
-### 配備後の過去メール再分類を自動実行
-
-```bash
-docker compose run --rm --service-ports deployer run --reclassify-existing --skip-unknown-message-labels --message-read-batch-size 5 --max-message-seconds 10800
-```
-
-`--reclassify-existing`では、起動時に対象アカウント・Master・手動分を含むユーザーラベルの置換範囲を確認し、メール用OAuthを先に完了します。フィルタの配備・Master照合後、バックアップ、検索、再分類と読戻しまで自動で続けます。メール処理直前の追加承認は不要です。既存のフィルタ差分・Action/Delete・Trashの承認は従来どおり必要です。指定しなければ従来の準備確認とメール更新の個別承認を使います。復元は一括承認の対象外です。
-
-`--skip-unknown-message-labels`は`run`・`reclassify`で使用できます。計画時の正常な最小メタデータに、ラベル一覧に存在しないIDが含まれるメールだけを保留します。保留IDと元のメタデータはハッシュ付き計画DBの`deferred`表に保存し、そのメールは一切更新しません。確認できた対象の処理後も全件完了とはせず、終了コード4・`complete=false`・`eligible_verified=true`で部分完了を示します。送信済み操作の不明状態がなければ`messages_pending.json`は解消します。保留分はラベルの不整合が解消した後、新しい読取り計画で確認します。通信失敗、不正なメタデータ、計画後の外部変更は停止します。保留機能を使う計画はv2となり、旧版では再開できません。指定しない場合は従来どおり未知のラベルでも停止し、計画はv1です。
-
-`--message-read-batch-size N`は最小メタデータの読取りを1〜50件ずつまとめます（既定1）。計画・事前照合・更新直前・読戻しのそれぞれで新たに取得し、キャッシュは再利用しません。内側の応答が全件揃った場合だけ処理し、読取り失敗には既存の有界リトライを使います。単独・複数件とも毎秒4件を目安に送信間隔を空けます。現在の[利用枠](https://developers.google.com/workspace/gmail/api/reference/quota)では最小取得も1通20単位、標準のユーザー枠は毎分6,000単位のため、読取りを毎分4,800単位相当に抑えます。他の利用も枠を消費するので、制限が続く場合は停止します。更新用の`--message-batch-size`とは別設定で、更新要求の自動再送はしません。Googleの[HTTPバッチの説明](https://developers.google.com/workspace/gmail/api/guides/batch)に従い上限50件とし、バッチ内の各API呼出しはそれぞれ利用枠に数えられます。
-
-`--max-message-seconds 10800`は起動から約3時間を目安にメール処理を保留します。初回はハッシュ付き計画・バックアップの完成を待ってから上限を確認するため、計画が長引く場合は目安を超えます。送信済みバッチは読戻しを終えてから止めます。起動時承認を使う場合、適用前の全件照合から固定計画と承認済み進捗を保持するので、時間上限でも`messages_pending.json`を残し、同じMaster・オプションの`run`で再開できます。終了コード4で、全件完了とは表示しません。送信意図が一件もない状態で時間上限以外のエラーになった場合は、バックアップと失敗記録を残して保留ポインタを解除し、再計画を可能にします。送信意図があれば保留ポインタを維持します。指定しなければ時間上限はありません。起動時承認後の再分類では追加の承認待ちがないため、適用前の全件照合は1回です。個別の対話承認では承認前後の2回の照合を維持します。
-
-対象メールの列挙と複数回の照合が必要なため、メール数によっては3時間を超えることがあります。処理中は既存メールの既読状態・ラベルを他のクライアントで変更すると、外部変更として停止する場合があります。
-
-### メールの計画・再開・復元
-
-```bash
-# 読取り計画だけを作成。表示されたrun-idとバックアップ先を保持する
-docker compose run --rm --service-ports deployer reclassify --plan-only
-# 固定済み計画を照合し、メール専用の承認後に適用・再開する
-docker compose run --rm --service-ports deployer reclassify --resume RUN_ID
-# 当該実行で変更したと照合できるメールを復元。中断時も同じコマンドで再開
-docker compose run --rm --service-ports deployer restore-labels --run-id RUN_ID
-```
-
-`run`・`reclassify`・`restore-labels`の`--message-batch-size`は1〜1000、既定50メッセージです。`--max-message-batches N`はNバッチの読み戻し後に保留状態で止めます。フィルタ用の`--batch-size`・`--max-batches`とは独立しています。`reclassify`では`--target`でMasterを選べますが、`--resume`では保存済みMaster・検索結果を使います。
-
-メール用OAuthは従来スコープに`gmail.modify`を追加し、既定で`local-dir/message_token.json`に保存します。配備用`token.json`は保持します。`--message-token PATH`で専用トークンの場所を指定できます。権限不足なら対話認証をやり直し、必要スコープとアカウントの照合が成功するまで既存ファイルを置き換えません。メール用の初回認証にも`--service-ports`を使用してください。
-
-未完了の再分類・復元があると、`run`は新しいフィルタ配備より先に保留状態を案内し、固定済み計画を照合・再開します。`local/messages_pending.json`と実行別バックアップ・進捗を保持してください。別Masterへの自動差し替え、バッチ全体の自動再送、競合の強制上書きはしません。復元時は現在のシステム状態を保持しますが、対象外フォルダへの移動、ユーザーラベルの外部変更、ラベル定義の変更・消失は停止理由になります。
-
-### `run`：推奨
-
-- `--target PATH`：バージョン自動選択を使わず、対象Master XMLを明示。
-- `--batch-size N`：削除・追加をまとめるHTTPバッチ件数。**1〜25、既定1**。1で開始した計画は逐次処理になります。
-- `-v`, `--verbose`：フィルタ単位の処理結果や照合状況、API読み取り・削除・追加と全6フェーズの開始/終了時刻・所要秒数、API種類別集計を表示します。再分類の案内以降は配備区間と分けて計測します。詳細は下記「時間とAPI試行数の読み方」を参照してください。
-- `--expected-email ADDRESS`：`.env`の`GMAIL_EXPECTED_EMAIL`より優先するアカウント照合先。
-- `--local-dir PATH`：Masterと配備記録の保存フォルダ。既定`/app/local`（Docker内）。
-- `--client-secrets PATH`：OAuth DesktopクライアントJSON。既定`/app/local/credentials.json`。
-- `--token PATH`：OAuth認証トークン。既定`/app/local/token.json`。
-
-`run`に`--approve`/`--allow-removals`はありません。承認ハッシュは内部で作成・照合し、対話確認を行います。
-
-### `validate`：オフライン検証
-
-- `--target PATH`：検証対象を指定。省略時は最新Master。
-- `--base PATH`：任意の旧Masterと比較し、Delete/Trash変更等を検出。
-- `--out PATH`：検証結果JSONを保存。
-- `--local-dir PATH`：Master検索先を変更。
-
-### `plan`：詳細な配備計画
-
-- `--target PATH`：配備先Masterを指定（省略時は最新版）。
-- `--base PATH`：現行Gmailがその旧Masterと完全一致する場合だけ計画する、厳格モード。
-- `--also-baseline PATH`：`--base`と同時に追加する既知Master。複数指定可。
-- `--out PATH`：計画保存先。既定`/app/local/plan.json`。
-- `--expected-email`、`--local-dir`、`--client-secrets`、`--token`：`run`と同じ。
-
-### `apply`：上級者向け分割操作
-
-- `--approve HASH`：`plan`の`approval_digest`を指定。**必須**。
-- `--allow-removals`：旧フィルタの削除を伴う配備を明示的に承認。ない場合は削除対象があれば停止。
-- `--plan PATH`：`plan.json`のパス。既定`/app/local/plan.json`。
-- `--log PATH`：進捗記録。既定`/app/local/deploy_log.json`。
-- `--batch-size N`：削除・追加のHTTPバッチ件数（1〜25、既定1）。
-- `-v`, `--verbose`：`run`と同じ詳細表示。
-- `--expected-email`、`--local-dir`、`--client-secrets`、`--token`：`run`と同じ。
-
-### 時間とAPI試行数の読み方
+### 9. 時間とAPI試行数の読み方
 
 `run`と`apply`は、通常表示でも既存の進捗に加えて、終了時に全体時間・承認入力待ち・その待ちを除いた時間・配備区間・終了理由を1行表示します。変更不要、承認辞退、上限指定による途中終了、例外やCtrl-Cによる停止でも集計します。進捗は従来どおり「応答確認済み」と「全件照合済み」を区別します。未到達のフェーズには計測値を作りません。
 
@@ -278,39 +353,25 @@ docker compose run --rm --service-ports deployer restore-labels --run-id RUN_ID
 
 Batchは外側のHTTP送信ごとに所要時間を測り、内部の送出対象数・成功応答・失敗応答・応答不明を別記します。外側HTTP成功でも内部要求が失敗することがあります。応答不明は未反映を意味しません。SDKが通知する前に中断した応答も不明に含めます。内部要求ごとのレイテンシは観測できないため表示しません。集計キーにはラベル名・フィルタID・ルール条件を使用せず、集計は実行ごとに破棄します。時刻・時間集計は標準出力のみ、既存の復旧用記録は従来どおり`local/logs/`です。
 
-### `verify`：配備後の完全比較
+---
 
-- `--target PATH`：照合対象Master。
-- `--out PATH`：照合結果JSONの保存先（既定`/app/local/verify.json`）。
-- `--expected-email`、`--local-dir`、`--client-secrets`、`--token`：`run`と同じ。
+## トラブルシューティング・安全上の制約・公式資料
 
-コマンドの全オプションは次で確認できます。
-
-```bash
-docker compose run --rm deployer --help
-docker compose run --rm deployer run --help
-docker compose run --rm deployer apply --help
-```
-
-## XML自動選択の規則
-
-`local/masters/*.xml`と`local/*.xml`のうち、ファイル名に`vX.Y.Z`と`master`を含むファイルから、バージョンと日付が最も新しいものを選びます。`patch`、`export`、`cumulative`、`incremental`、`baseline`、`target`は候補から除外します。同順位の候補が複数あれば停止し、明示`--target`指定を求めます。候補がない場合のみ旧`local/target.xml`を使います。
-
-## トラブルシューティング：Gmail API無効（HTTP 403）
+### トラブルシューティング：Gmail API無効（HTTP 403）
 
 `Gmail API has not been used in project ... or it is disabled` / `accessNotConfigured` は、**Google CloudのGmail APIが有効になっていない**ことを示します。エラー内のGoogle Cloudプロジェクトを選択し、[Gmail API](https://console.cloud.google.com/apis/library/gmail.googleapis.com)を有効化してから同じコマンドを再実行してください。反映には数分かかる場合があります。
 
 これはOAuth同意やメールのラベル設定とは別の問題です。`[3/6] Gmailの現行ラベル・フィルタを取得中`で発生した場合は、**配備処理は開始されておらず、Gmailフィルタは一切変更されていません**。スクリプトもこの原因を個別に表示します。配備が実際に開始された後で別のエラーが出た場合は、進捗ログと現在のGmail設定を確認してから再開してください。
 
-## 安全上の制約
+### 安全上の制約
 
 - 配備対象アカウントを`.env`の`GMAIL_EXPECTED_EMAIL`で固定し、実際にOAuthログインしたGoogleアカウントと照合します。指定がない場合は停止します。
-- `Action/Delete`もMaster XMLに合わせて追加・削除・置換します。ただしDeleteは**ラベル付与のみ**で、既読化・スター・重要・Trashの複合操作は禁止です。Trash移動アクションもMaster XMLを正本として差分更新します。新Master内のTrashアクションは従来どおり`in:spam`条件に限定し、変更があれば全件と警告を最終確認前に表示します。既存Gmail側の余分なTrashフィルタは承認後に削除対象となります。自動Archiveは禁止します。
+- `Action/Delete`もMaster XMLに合わせて追加・削除・置換します。ただしDeleteは**ラベル付与のみ**で、既読化・スター・重要・Trashの複合操作は禁止します。Trash移動アクションもMaster XMLを正本として差分更新します。新Master内のTrashアクションは従来どおり`in:spam`条件に限定し、変更があれば全件と警告を最終確認前に表示します。既存Gmail側の余分なTrashフィルタは承認後に削除対象となります。自動Archiveは禁止します。
 - UIベースのフィルタXMLをGmail API形式に変換できない条件、転送フィルタ等の予期しないアクション、1000件上限超過、途中状態不一致の場合は停止します。大規模差分でも、基本ルールの件数（`-v`指定時は全件詳細）とAction/Delete・Trashの全件明細を表示して承認を求めます。
 - 承認前に基本ルールの差分件数（`-v`指定時は全件詳細）と、Action/Delete・Trashの全差分明細を表示します。Action/Delete・Trashのグループ承認後、最後の全体承認が得られた場合のみ変更します。未承認のグループはGmailの現行状態を維持し、次の`run`で再提案します。Gmail APIで現在のフィルタを取得し、新規計画では**旧ルールの削除→新ルールの追加**の順に変更します。全件読み戻しは通常50操作ごと、工程切り替え時、末尾、途中終了時に行い、外部変更の検知は次の全件照合まで遅れます。
 - API読み戻し一致は、**Gmail UIのfresh exportや新着メッセージの分類が完全であることの証明ではありません**。実配備後は必要に応じて別途検証してください。
 - 2026-10-19の実配備は削除22件・追加0件で中断し、その後の診断では824件が承認済み計画の途中状態に一致しました。これは当時の記録です。今回の障害復旧処理は合成APIテストで検証しており、実Gmailでの改善後の配備完了は未確認です。再開時には現在の実設定と保留計画を照合してください。
 
-依存ライブラリは`requirements.txt`を使用します。Dockerを使わない場合は、`pip install -r requirements.txt`後に`python gmail_filter_deployer.py run`で同じCLIを呼べます（環境変数の設定が別途必要です）。
+### 公式資料
 
-Gmail API公式資料：[Managing Filters](https://developers.google.com/workspace/gmail/api/guides/filter_settings) / [users.settings.filters](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.settings.filters)。
+- Gmail API公式資料：[Managing Filters](https://developers.google.com/workspace/gmail/api/guides/filter_settings) / [users.settings.filters](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.settings.filters)

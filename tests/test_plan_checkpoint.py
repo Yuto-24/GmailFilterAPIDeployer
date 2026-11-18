@@ -128,3 +128,59 @@ class PlanningCheckpointTests(unittest.TestCase):
         with self.assertRaisesRegex(d.DeploymentError, "Master"):
             m.create_plan(self.api, self.local, self.master, fixtures.ACCOUNT)
         self.assertFalse(self.client.writes)
+
+    def test_master_drift_blocks_filter_run_before_oauth_and_writes(self):
+        def hook(kind):
+            if kind == "messages.list" and "from:a@example.invalid" in self.client.queries:
+                raise RuntimeError("pause")
+        self.client.on_request = hook
+        with self.assertRaisesRegex(RuntimeError, "pause"):
+            m.create_plan(self.api, self.local, self.master, fixtures.ACCOUNT)
+        self.client.on_request = None
+        different = self.local / "different.xml"
+        write_xml(different, [{"from": "else@example.invalid", "label": "Type/A"}])
+        with patch.object(d, "get_client", side_effect=AssertionError("OAuth should not run")):
+            result = d.main(["run", "--target", str(different),
+                             "--local-dir", str(self.local),
+                             "--expected-email", fixtures.ACCOUNT])
+        self.assertEqual(result, 2)
+        self.assertTrue((self.local / m.PLANNING).exists())
+        self.assertFalse(self.client.writes)
+
+    def test_explicit_reset_discards_pointer_only_without_touching_backup(self):
+        def hook(kind):
+            if kind == "messages.list" and "from:a@example.invalid" in self.client.queries:
+                raise RuntimeError("pause")
+        self.client.on_request = hook
+        with self.assertRaisesRegex(RuntimeError, "pause"):
+            m.create_plan(self.api, self.local, self.master, fixtures.ACCOUNT)
+        pointer = json.loads((self.local / m.PLANNING).read_text())
+        backup = m.run_directory(self.local, pointer["run_id"]) / "plan.sqlite"
+        self.assertTrue(backup.exists())
+        args = type("Args", (), {"local_dir": self.local, "expected_email": fixtures.ACCOUNT})()
+        with patch.object(d, "confirm_interactive", return_value=False):
+            m.reset_planning(args)
+        self.assertTrue((self.local / m.PLANNING).exists())
+        with patch.object(d, "confirm_interactive", return_value=True):
+            m.reset_planning(args)
+        self.assertFalse((self.local / m.PLANNING).exists())
+        self.assertTrue(backup.exists())
+        self.assertFalse(self.client.writes)
+
+    def test_planning_cache_corruption_is_rejected_without_gmail_writes(self):
+        def hook(kind):
+            if kind == "messages.list" and "from:a@example.invalid" in self.client.queries:
+                raise RuntimeError("pause")
+        self.client.on_request = hook
+        with self.assertRaisesRegex(RuntimeError, "pause"):
+            m.create_plan(self.api, self.local, self.master, fixtures.ACCOUNT)
+        self.client.on_request = None
+        checkpoint = json.loads((self.local / m.PLANNING).read_text())
+        dbpath = m.run_directory(self.local, checkpoint["run_id"]) / "plan.sqlite"
+        db = sqlite3.connect(dbpath)
+        db.execute("INSERT INTO queries VALUES('injected:query')")
+        db.commit()
+        db.close()
+        with self.assertRaisesRegex(d.DeploymentError, "検索キャッシュ"):
+            m.create_plan(self.api, self.local, self.master, fixtures.ACCOUNT)
+        self.assertFalse(self.client.writes)

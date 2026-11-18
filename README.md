@@ -73,6 +73,7 @@ docker compose run --rm \
 | **メタデータ読取りバッチサイズも指定して一括再分類** | `docker compose run --rm --service-ports deployer run --reclassify-existing --skip-unknown-message-labels --message-read-batch-size 5 --max-message-seconds 10800` |
 | **実行中ログの追跡（別端末から監視）** | `bash scripts/watch_reclassification.sh` |
 | **メール再分類の計画作成のみ** | `docker compose run --rm --service-ports deployer reclassify --plan-only` |
+| **破損・対象Master変更などで再開できない読取り計画を明示破棄** | `docker compose run --rm deployer reset-message-planning` |
 | **メール再分類の適用・再開** | `docker compose run --rm --service-ports deployer reclassify --resume RUN_ID` |
 | **指定実行のユーザーラベル復元・再開** | `docker compose run --rm --service-ports deployer restore-labels --run-id RUN_ID` |
 | **XMLの静的検証（オフライン）** | `docker compose run --rm --service-ports deployer validate` |
@@ -235,6 +236,8 @@ docker compose run --rm --service-ports deployer restore-labels --run-id RUN_ID
 - **計画作成中の中断再開（#29）**：メタデータ収集を完了すると `local/messages_planning.json` と `local/reclassification/<run-id>/plan.sqlite` に読取り専用のチェックポイントを作成します。ルール照合の途中や最終整合性チェックで停止した場合は、同じMaster・同じアカウント・同じラベル定義で通常の `run` または `reclassify` を再実行すると、保存済みのルール照合を再利用します。**未完成の計画は承認・適用できません。**
 - **変更差分の再照合**：Gmail履歴に現れた既存メールのラベル変更や削除を計画へ反映し、依存する状態依存検索はGmail自身で再検索してから影響メールのみ再分類します。新着メールは最初のスナップショット時の対象から除外します。履歴で説明できない欠落・対象外メールの新規流入・ラベル定義の変更・途中状態の不整合・履歴の取得失敗は書込み前に停止します。チェックポイントを削除・改変して問題を無視しないでください。
 - **旧版からの移行制限**：#29より前の実装で `manifest.json` 未作成のまま停止した `plan.sqlite` は、完全な初期IDと履歴位置を記録していないため、そのままの再開はできません。修正版での最初の計画作成は再取得が必要です。それ以降の中断・再開がチェックポイントの対象です。
+
+**計画を最初から作り直す必要がある場合**：途中状態やMasterの相違によりチェックポイントを再開できないときは、対応するMasterを再選択して再開するか、`docker compose run --rm deployer reset-message-planning` を実行して対話確認 `[y/N]` に同意してください。この操作は**Gmailの設定・メールに触れず**、未完了の読取り計画へのポインタのみを外し、古いSQLite・Masterのバックアップは残します。承認済みのフィルタ配備・メール更新が保留中なら破棄できません。
 
 ---
 

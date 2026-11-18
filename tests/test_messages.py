@@ -329,9 +329,10 @@ class MessageTests(unittest.TestCase):
 
     def test_snapshot_change_and_history_expiry_prevent_complete_plan(self):
         self.client.history_events = [{"labelsAdded": [{"message": {"id": "a"}, "labelIds": ["STARRED"]}]}]
-        with self.assertRaises(d.DeploymentError):
-            self.plan()
-        self.assertFalse(list(self.local.glob("reclassification/*/manifest.json")))
+        self.client.mail["a"]["labelIds"].append("STARRED")
+        planned = self.plan()
+        self.assertIn("STARRED", planned.before(planned.row("a")))
+        self.assertTrue(list(self.local.glob("reclassification/*/manifest.json")))
         self.client.history_events = []
         self.client.history_failure = RuntimeError("history 404")
         with self.assertRaises(RuntimeError):

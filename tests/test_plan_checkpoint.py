@@ -26,7 +26,7 @@ class PlanningCheckpointTests(unittest.TestCase):
         def hook(kind):
             if kind == "messages.list":
                 counts[0] += 1
-                if counts[0] == 6:
+                if counts[0] == 7:
                     raise RuntimeError("simulated failure after checkpoint")
         # No previous planner pointer; the metadata phase must finish first.
         self.client.on_request = hook
@@ -71,20 +71,22 @@ class PlanningCheckpointTests(unittest.TestCase):
         self.client = fixtures.Client(d.compile_xml(self.master))
         self.client.add("a")
         self.client.add("b")
-        self.client.hits = {"is:unread": {"a"}}
+        self.client.hits = {"is:unread": {"a"}, "(is:unread)": {"a"}}
         self.api = m.Gmail(self.client)
         seen = [False]
         def hook(kind):
-            if kind == "messages.list" and not seen[0] and "is:unread" in self.client.queries:
+            if kind == "messages.list" and not seen[0] and any(
+                    q and "is:unread" in q for q in self.client.queries):
                 self.client.mail["a"]["labelIds"].remove("UNREAD")
                 self.client.history_events.append({"labelsRemoved": [
                     {"message": {"id": "a"}, "labelIds": ["UNREAD"]}]})
                 self.client.hits["is:unread"] = set()
+                self.client.hits["(is:unread)"] = set()
                 seen[0] = True
         self.client.on_request = hook
         plan = self.make_plan()
         self.assertTrue(seen[0])
-        self.assertEqual(self.client.queries.count("is:unread"), 2)
+        self.assertEqual(sum(q is not None and "is:unread" in q for q in self.client.queries), 2)
         self.assertNotIn(self.client.id_to_label.get("Type/A"), plan.desired(plan.row("a")))
 
     def test_deleted_old_message_dropped_only_with_history_evidence(self):

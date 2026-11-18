@@ -2132,6 +2132,7 @@ def cmd_run(args):
         start_phase("[1/6] 最新Master XMLを選択・検証")
         print("[1/6] 最新Master XMLを選択・検証中...", flush=True)
         target_path = select_master(args.local_dir, args.target)
+        messages.require_planning_target(args.local_dir, target_path, args.expected_email)
         target = compile_xml(target_path, compilation=compilation, normalization=normalization)  # Before OAuth.
         print(f"      検証完了: {target_path.name}（{len(target)}件）", flush=True)
         if args.verbose:
@@ -2381,14 +2382,16 @@ def main(argv=None):
     group.add_argument("--resume", help="固定済みメール計画のrun-id")
     p.add_argument("-v", "--verbose", action="store_true")
     p.set_defaults(func=messages.command)
+    p = sub.add_parser("reset-message-planning", help="未完了のメール読取り計画だけを明示的に破棄（Gmail変更なし）")
+    p.set_defaults(func=messages.reset_planning)
     p = sub.add_parser("restore-labels", help="指定run-idで変更したユーザーラベルをバックアップから復元")
     p.add_argument("--run-id", required=True)
     p.add_argument("-v", "--verbose", action="store_true")
     p.set_defaults(func=messages.command)
-    for name in ("validate", "plan", "apply", "verify", "run", "reclassify", "restore-labels"):
+    for name in ("validate", "plan", "apply", "verify", "run", "reclassify", "restore-labels", "reset-message-planning"):
         sub.choices[name].add_argument("--local-dir", type=Path, default=default_local,
                                        help="Master XML保存フォルダ。既定はlocal/")
-    for name in ("plan", "apply", "verify", "run", "reclassify", "restore-labels"):
+    for name in ("plan", "apply", "verify", "run", "reclassify", "restore-labels", "reset-message-planning"):
         p = sub.choices[name]
         p.add_argument("--expected-email", help="対象Gmailアドレス。省略時はGMAIL_EXPECTED_EMAILを使用")
         p.add_argument("--client-secrets", type=Path, default=default_local / "credentials.json")
@@ -2419,7 +2422,7 @@ def main(argv=None):
                            "保留継続モードは--batch-size 1専用です")
                     max_batches = getattr(args, "max_batches", None)
                     demand(max_batches is None or max_batches > 0, "max-batchesは1以上で指定してください")
-                    if args.cmd in ("plan", "apply", "verify", "run", "reclassify", "restore-labels"):
+                    if args.cmd in ("plan", "apply", "verify", "run", "reclassify", "restore-labels", "reset-message-planning"):
                         args.expected_email = resolve_expected_email(args.expected_email)
                     if hasattr(args, "message_batch_size"):
                         demand(1 <= args.message_read_batch_size <= 50, "message-read-batch-sizeは1〜50です")
@@ -2430,7 +2433,7 @@ def main(argv=None):
                             demand(math.isfinite(args.max_message_seconds) and args.max_message_seconds > 0,
                                    "max-message-secondsは有限の正数です")
                             args._message_deadline = time.monotonic() + args.max_message_seconds
-                    with messages.exclusive_lock(args.local_dir) if args.cmd in ("apply", "reclassify", "restore-labels") else nullcontext():
+                    with messages.exclusive_lock(args.local_dir) if args.cmd in ("apply", "reclassify", "restore-labels", "reset-message-planning") else nullcontext():
                         if args.cmd == "apply":
                             demand(messages.pending(args.local_dir) is None, "メール更新が未完了です。先に再開・復元してください")
                         args.func(args)

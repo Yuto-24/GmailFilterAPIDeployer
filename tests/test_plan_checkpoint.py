@@ -184,3 +184,28 @@ class PlanningCheckpointTests(unittest.TestCase):
         with self.assertRaisesRegex(d.DeploymentError, "検索キャッシュ"):
             m.create_plan(self.api, self.local, self.master, fixtures.ACCOUNT)
         self.assertFalse(self.client.writes)
+
+    def test_950_of_994_rules_are_not_replayed_after_interruption(self):
+        rules = [{"from": f"sender{i}@example.invalid", "label": "Type/A"}
+                 for i in range(994)]
+        write_xml(self.master, rules)
+        self.client = fixtures.Client(d.compile_xml(self.master))
+        self.client.add("a")
+        self.api = m.Gmail(self.client)
+        def hook(kind):
+            if kind == "messages.list" and sum(q is not None for q in self.client.queries) >= 950:
+                raise RuntimeError("interrupt rule 951")
+        self.client.on_request = hook
+        with self.assertRaisesRegex(RuntimeError, "interrupt rule 951"):
+            m.create_plan(self.api, self.local, self.master, fixtures.ACCOUNT)
+        pointer = json.loads((self.local / m.PLANNING).read_text())
+        db = sqlite3.connect(m.run_directory(self.local, pointer["run_id"]) / "plan.sqlite")
+        self.assertEqual(db.execute("SELECT count(*) FROM rules").fetchone()[0], 950)
+        db.close()
+        self.client.on_request = None
+        plan = self.make_plan()
+        self.assertEqual(self.client.queries.count("from:sender0@example.invalid"), 1)
+        self.assertEqual(self.client.queries.count("from:sender949@example.invalid"), 1)
+        self.assertEqual(self.client.queries.count("from:sender993@example.invalid"), 1)
+        self.assertEqual(plan.manifest["summary"]["target"], 1)
+        self.assertEqual(self.client.writes, [])

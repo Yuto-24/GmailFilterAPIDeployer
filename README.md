@@ -73,6 +73,7 @@ docker compose run --rm \
 | **メタデータ読取りバッチサイズも指定して一括再分類** | `docker compose run --rm --service-ports deployer run --reclassify-existing --skip-unknown-message-labels --message-read-batch-size 5 --max-message-seconds 10800` |
 | **実行中ログの追跡（別端末から監視）** | `bash scripts/watch_reclassification.sh` |
 | **メール再分類の計画作成のみ** | `docker compose run --rm --service-ports deployer reclassify --plan-only` |
+| **読取り計画を明示破棄・破損ポインタを隔離** | `docker compose run --rm deployer reset-message-planning` |
 | **メール再分類の適用・再開** | `docker compose run --rm --service-ports deployer reclassify --resume RUN_ID` |
 | **指定実行のユーザーラベル復元・再開** | `docker compose run --rm --service-ports deployer restore-labels --run-id RUN_ID` |
 | **XMLの静的検証（オフライン）** | `docker compose run --rm --service-ports deployer validate` |
@@ -232,6 +233,16 @@ docker compose run --rm --service-ports deployer restore-labels --run-id RUN_ID
 - メール用OAuthは従来スコープに`gmail.modify`を追加し、既定で`local-dir/message_token.json`に保存します。配備用`token.json`は保持します。`--message-token PATH`で専用トークンの場所を指定できます。権限不足なら対話認証をやり直し、必要スコープとアカウントの照合が成功するまで既存ファイルを置き換えません。メール用の初回認証にも`--service-ports`を使用してください。
 - 未完了の再分類・復元があると、`run`は新しいフィルタ配備より先に保留状態を案内し、固定済み計画を照合・再開します。`local/messages_pending.json`と実行別バックアップ・進捗を保持してください。別Masterへの自動差し替え、バッチ全体の自動再送、競合の強制上書きはしません。復元時は現在のシステム状態を保持しますが、対象外フォルダへの移動、ユーザーラベルの外部変更、ラベル定義の変更・消失は停止理由になります。
 - 再分類の工程別進捗は「メール列挙（集計中）」「メタデータ取得」「ルール照合」「事前照合」「更新」「最終照合」をそれぞれ表示します。更新100%は最終照合完了を意味しません。再開時の更新済み件数は保存済み進捗DBから算出します。
+- **計画作成中の中断再開（#29）**：メタデータ収集を完了すると `local/messages_planning.json` と `local/reclassification/<run-id>/plan.sqlite` に読取り専用のチェックポイントを作成します。ルール照合の途中や最終整合性チェックで停止した場合は、同じMaster・同じアカウント・同じラベル定義で通常の `run` または `reclassify` を再実行すると、保存済みのルール照合を再利用します。**未完成の計画は承認・適用できません。**
+- **変更差分の再照合**：Gmail履歴に現れた既存メールのラベル変更や削除を計画へ反映し、状態依存検索は、履歴変更がなくてもGmail自身で再検索してから、ヒット集合が変わったメールを含めて再分類します。検索・最終メタデータ確認の区間に既存メールの履歴イベントがあれば、同じメールの再変更も含めて最大3回再照合し、安定しなければ停止します。新着メールは最初のスナップショット時の対象から除外します。履歴で説明できない欠落・対象外メールの新規流入・ラベル定義の変更・途中状態の不整合・履歴の取得失敗は書込み前に停止します。チェックポイントを削除・改変して問題を無視しないでください。
+- **旧版からの移行制限**：#29より前の実装で `manifest.json` 未作成のまま停止した `plan.sqlite` は、完全な初期IDと履歴位置を記録していないため、そのままの再開はできません。修正版での最初の計画作成は再取得が必要です。対象IDごとの状態を持たない初期v1チェックポイントも自動移行しません。`reset-message-planning` の対話確認でポインタを解除し、再取得してください。v2での中断・再開がチェックポイントの対象です。
+
+**計画を最初から作り直す必要がある場合**：途中状態やMasterの相違によりチェックポイントを再開できないときは、対応するMasterを再選択して再開するか、`docker compose run --rm deployer reset-message-planning` を実行して対話確認 `[y/N]` に同意してください。この操作は**Gmailの設定・メールに触れず**、未完了の読取り計画へのポインタのみを外し、古いSQLite・Masterのバックアップは残します。承認済みのフィルタ配備・メール更新が保留中なら破棄できません。
+
+**ポインタ自体が破損した場合の隔離復旧**：`reset-message-planning` は、形式・アカウント・run-idを検証できる未完了ポインタなら上記の通常解除を行います。JSONが壊れている、空オブジェクト、必須項目が欠けている場合は別の隔離確認を表示します。表示された `local-dir` が対象アカウントの保存先であることを確認して同意すると、元のバイト列を `messages_planning.invalid.<id>.json` へ退避し、新規計画を許可します。アカウントは破損データから検証できません。拒否時は変更しません。承認済み保留ポインタがある場合は隔離も拒否し、`reclassification/` 内のバックアップ・manifest・進捗には触れません。異なるアカウントの有効なポインタやsymlinkは隔離しません。
+
+**manifest保存直後に中断した場合**：同じMaster・アカウントで通常の計画作成を再実行してください。完成済みmanifestのdigest、run-id、アカウント、バックアップのハッシュ・件数を検証できた場合に限り、ファイル保護とポインタ解除を完了します。無効なmanifestや承認済みの保留処理があれば停止します。
+
 
 ---
 

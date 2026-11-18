@@ -80,8 +80,8 @@ class History:
             if self.c.history_failure:
                 raise self.c.history_failure
             start = int(kwargs.get("pageToken", "0"))
-            events = self.c.history_events
-            page = {"history": deepcopy(events[start:start + 2]), "historyId": "100"}
+            events = self.c.history_events[int(kwargs["startHistoryId"]) - 1:]
+            page = {"history": deepcopy(events[start:start + 2]), "historyId": str(len(self.c.history_events) + 1)}
             if start + 2 < len(events):
                 page["nextPageToken"] = str(start + 2)
             return page
@@ -99,7 +99,7 @@ class Users(FakeUsers):
         return History(self.p)
 
     def getProfile(self, **kwargs):
-        return self.p.request("getProfile", lambda: {"emailAddress": ACCOUNT, "historyId": "1"})
+        return self.p.request("getProfile", lambda: {"emailAddress": ACCOUNT, "historyId": str(len(self.p.history_events) + 1)})
 
 
 class Client(FakeClient):

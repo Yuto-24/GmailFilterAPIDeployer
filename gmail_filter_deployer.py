@@ -1926,6 +1926,9 @@ def cmd_apply(args):
     start_phase("[1/3] 承認計画の読込み")
     plan = json.loads(args.plan.read_text(encoding="utf-8"))
     normalization_for_plan(plan)  # Reject unknown interpretations before OAuth/API access.
+    import gmail_message_reclassifier as messages
+    messages.require_planning_target(args.local_dir, None, plan["account"],
+                                     target_sha256=plan["target_sha256"])
     start_phase("[2/3] Google OAuth認証とアカウント照合")
     client, creds = get_client(args.client_secrets, args.token, allow_auth=False)
     acct = account_email(creds)
@@ -2185,6 +2188,8 @@ def cmd_run(args):
         else:
             plan = make_plan(None, target_path, live, acct, labels, compilation=compilation,
                              normalization=normalization, live_rows=current)
+            messages.require_planning_target(args.local_dir, target_path, acct,
+                                             target_sha256=plan["target_sha256"])
             show_normalization_summary(plan, verbose=args.verbose)
             if not plan['add'] and not plan['remove']:
                 if normalization != "legacy":

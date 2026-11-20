@@ -246,6 +246,8 @@ class MessageTests(unittest.TestCase):
         plan = self.plan()
         def approve(prompt):
             self.client.mail["a"]["labelIds"].remove("UNREAD")
+            self.client.history_events.append({"labelsRemoved": [
+                {"message": {"id": "a"}, "labelIds": ["UNREAD"]}]})
             return True
         with patch.object(d, "confirm_interactive", side_effect=approve), patch("sys.stdin.isatty", return_value=True):
             with self.assertRaises(d.DeploymentError):

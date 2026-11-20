@@ -313,25 +313,46 @@ class Gmail:
         require(isinstance(row.get("historyId"), str) and row["historyId"].isdigit(), "履歴位置が不正です")
         return row["historyId"]
 
-    def changes(self, start):
+    def changes(self, start, *, minimum_history=None):
         """Return added, changed and explicitly deleted IDs since a history cursor."""
         added, changed, deleted, seen, token = set(), set(), set(), set(), None
         while True:
+            if minimum_history is not None:
+                self.check_deadline()
             args = {"userId": "me", "startHistoryId": start, "maxResults": 500}
             if token:
                 args["pageToken"] = token
             row = self.read("history.list", self.client.users().history().list(**args))
+            if minimum_history is not None:
+                require(isinstance(row.get("historyId"), str) and row["historyId"].isdigit()
+                        and int(row["historyId"]) >= int(minimum_history)
+                        and isinstance(row.get("history", []), list), "照合履歴の応答が不正です")
             for event in row.get("history", []):
+                if minimum_history is not None:
+                    require(isinstance(event, dict) and set(event) <= {
+                        "id", "messages", "messagesAdded", "messagesDeleted", "labelsAdded", "labelsRemoved"},
+                        "照合履歴のイベントが不正です")
                 for kind in ("messagesAdded", "messagesDeleted", "labelsAdded", "labelsRemoved"):
+                    if minimum_history is not None:
+                        require(isinstance(event.get(kind, []), list), "照合履歴のイベントが不正です")
                     for item in event.get(kind, []):
                         mid = item["message"]["id"]
+                        if minimum_history is not None:
+                            require(isinstance(mid, str) and mid, "照合履歴のメールIDが不正です")
                         changed.add(mid)
                         if kind == "messagesAdded":
                             added.add(mid)
                         if kind == "messagesDeleted":
                             deleted.add(mid)
-                changed.update(x["id"] for x in event.get("messages", []))
+                messages = event.get("messages", [])
+                if minimum_history is not None:
+                    require(isinstance(messages, list) and all(
+                        isinstance(x, dict) and isinstance(x.get("id"), str) and x["id"] for x in messages),
+                        "照合履歴のメールIDが不正です")
+                changed.update(x["id"] for x in messages)
             token = row.get("nextPageToken")
+            if minimum_history is not None:
+                require(token is None or isinstance(token, str) and token, "照合履歴のページ位置が不正です")
             if not token:
                 return added, changed, deleted
             require(token not in seen, "history.listのページが循環しています")
@@ -1005,7 +1026,145 @@ def validate_labels(api, plan):
             "ラベル定義がバックアップと一致しません")
 
 
-def reconcile(api, plan, journal, mode, *, phase="最終照合"):
+RECONCILIATION = "reconciliation.sqlite"
+
+
+def reconciliation_identity(plan, journal, mode):
+    """A read checkpoint never grants approval or invents write ownership."""
+    states = [tuple(row) for row in journal.db.execute(
+        "SELECT message,status FROM progress ORDER BY message")] if journal else []
+    intents = [tuple(row) for row in journal.db.execute(
+        "SELECT * FROM intents ORDER BY seq")] if journal else []
+    return hashlib.sha256(encode([1, plan.manifest["digest"], mode, states, intents]).encode()).hexdigest()
+
+
+class ReconciliationCheckpoint:
+    """Disposable read evidence, separate from the fixed plan and write journal."""
+    def __init__(self, plan, journal, mode):
+        path = plan.directory / RECONCILIATION
+        require(not path.is_symlink(), "照合進捗のsymlinkは使用できません")
+        self.db = connect_db(path)
+        try:
+            self.db.executescript("""
+                CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS verified(message TEXT PRIMARY KEY);
+            """)
+            require(self.db.execute("PRAGMA integrity_check").fetchone()[0] == "ok", "照合進捗DBが破損しています")
+            identity = reconciliation_identity(plan, journal, mode)
+            meta = dict(self.db.execute("SELECT key,value FROM meta"))
+            if meta.get("identity") != identity:
+                with self.db:
+                    self.db.execute("DELETE FROM verified")
+                    self.db.execute("DELETE FROM meta")
+                    self.db.execute("INSERT INTO meta VALUES('identity', ?)", (identity,))
+                self.cursor = None
+            else:
+                self.cursor = meta.get("cursor")
+                require(self.cursor is None or self.cursor.isdigit(), "照合進捗の履歴位置が不正です")
+            sync_directory(plan.directory)
+        except BaseException:
+            self.db.close()
+            raise
+
+    def advance(self, cursor, changed=None):
+        # Invalidation and cursor advancement must survive a crash together.
+        with self.db:
+            if changed is None:
+                self.db.execute("DELETE FROM verified")
+            else:
+                self.db.executemany("DELETE FROM verified WHERE message=?", ((mid,) for mid in changed))
+            self.db.execute("INSERT OR REPLACE INTO meta VALUES('cursor', ?)", (cursor,))
+        self.cursor = cursor
+
+    def close(self):
+        self.db.close()
+
+
+def discard_reconciliation(plan):
+    (plan.directory / RECONCILIATION).unlink(missing_ok=True)
+    sync_directory(plan.directory)
+
+
+def reconcile_checkpoint(api, plan, journal, mode, phase):
+    """Reuse only unchanged read evidence; establish a quiet interval before return."""
+    checkpoint = ReconciliationCheckpoint(plan, journal, mode)
+    try:
+        ids = {row["id"] for row in plan.rows()}
+        total = len(ids)
+        for _ in range(3):
+            api.check_deadline()
+            validate_labels(api, plan)
+            if mode == "apply":
+                api.filters_match(plan.rules, plan.labels, normalization=plan.manifest["normalization_version"])
+            cursor = api.history_start()
+            changed = None
+            if checkpoint.cursor is not None:
+                try:
+                    _, changed, _ = api.changes(checkpoint.cursor, minimum_history=cursor)
+                except Exception as exc:
+                    if getattr(getattr(exc, "resp", None), "status", None) != 404:
+                        raise
+                    print(f"[メール進捗] {phase}: 履歴期限切れのため全件を再照合します", flush=True)
+            checkpoint.advance(cursor, changed)
+            verified = {row[0] for row in checkpoint.db.execute("SELECT message FROM verified")}
+            require(verified <= ids, "照合進捗に計画外のメールがあります")
+            n = len(verified)
+            show_progress(phase, n, total, force=True)
+            if n:
+                print(f"[メール進捗] {phase}: 履歴確認済み{n}件を再利用、残り{total - n}件", flush=True)
+            try:
+                for mid, raw in api.snapshots(row["id"] for row in plan.rows() if row["id"] not in verified):
+                    try:
+                        observe(api, plan, journal, plan.row(mid), mode,
+                                now=api.metadata(mid, raw, plan.labels))
+                        # An owned pending intent may have been resolved. Persist
+                        # that state BEFORE caching the fact that this ID was checked.
+                        if journal and journal.db.in_transaction:
+                            journal.db.commit()
+                    except BaseException as exc:
+                        if journal:
+                            journal.event("conflict", {"message": mid, "error": str(exc)})
+                            journal.db.commit()
+                        raise
+                    checkpoint.db.execute("INSERT OR REPLACE INTO verified VALUES(?)", (mid,))
+                    n += 1
+                    if n % 50 == 0:
+                        checkpoint.db.commit()
+                    show_progress(phase, n, total)
+            finally:
+                checkpoint.db.commit()
+            # Do not subtract previously observed IDs: a second event for the same
+            # message during this interval must invalidate it again.
+            api.check_deadline()
+            try:
+                _, changed, _ = api.changes(cursor, minimum_history=cursor)
+            except Exception as exc:
+                if getattr(getattr(exc, "resp", None), "status", None) != 404:
+                    raise
+                checkpoint.advance(cursor)
+                checkpoint.cursor = None
+                continue
+            if changed & ids:
+                checkpoint.advance(cursor, changed & ids)
+                continue
+            validate_labels(api, plan)
+            if mode == "apply":
+                api.filters_match(plan.rules, plan.labels, normalization=plan.manifest["normalization_version"])
+            if journal:
+                journal.db.commit()
+            with checkpoint.db:
+                checkpoint.db.execute("UPDATE meta SET value=? WHERE key='identity'",
+                                      (reconciliation_identity(plan, journal, mode),))
+            show_progress(phase, total, total, force=True)
+            return
+        raise d.DeploymentError("照合中の変更または履歴期限切れが継続しています。固定計画から再開してください")
+    finally:
+        checkpoint.close()
+
+
+def reconcile(api, plan, journal, mode, *, phase="最終照合", checkpoint=False):
+    if checkpoint:
+        return reconcile_checkpoint(api, plan, journal, mode, phase)
     total = plan.manifest["summary"]["target"]
     show_progress(phase, 0, total)
     validate_labels(api, plan)
@@ -1037,6 +1196,7 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
     journal = Journal(plan) if (plan.directory / "progress.sqlite").exists() else None
     previous_deadline = api.deadline
     api.deadline = deadline
+    phase, write_started = "事前照合", False
     try:
         plan.verify_files()
         if authorization is not None:
@@ -1060,7 +1220,7 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
             journal.db.commit()
             save(local_dir / PENDING, {"run_id": plan.directory.name, "mode": mode,
                                       "digest": plan.manifest["digest"]})
-        reconcile(api, plan, journal, mode, phase="事前照合")
+        reconcile(api, plan, journal, mode, phase="事前照合", checkpoint=True)
         plan.summary()
         if journal:
             journal.report()
@@ -1076,7 +1236,10 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
         # Only interactive approval introduces a waiting interval after preflight.
         plan.verify_files()
         if authorization is None:
-            reconcile(api, plan, journal, mode, phase="承認後照合")
+            phase = "承認後照合"
+            reconcile(api, plan, journal, mode, phase="承認後照合", checkpoint=True)
+        # Remove reusable read evidence before ANY new durable write intent.
+        discard_reconciliation(plan)
         if journal is None:
             journal = Journal(plan, create=True)
         journal.set_meta("mode", mode)
@@ -1105,6 +1268,7 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
         completed_changes = counts.get(target_state, 0)
         show_progress("更新" if mode == "apply" else "復元", completed_changes, total_changes, force=True)
         batches = 0
+        phase = "更新直前照合"
         for (add, remove), all_ids in sorted(groups.items()):
             for offset in range(0, len(all_ids), batch_size):
                 api.check_deadline()
@@ -1128,6 +1292,7 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
                 journal.db.commit()  # Durable intent BEFORE any HTTP mutation.
                 failure = None
                 try:
+                    phase, write_started = "ラベル書込み", True
                     api.modify(ids, list(add), list(remove))
                 except BaseException as exc:
                     failure = exc
@@ -1135,6 +1300,7 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
                     journal.db.commit()
                 # Finish readback of an owned write before observing the time limit.
                 api.deadline = None
+                phase = "書込み後照合"
                 try:
                     # Even a successful empty batch response is not a per-message acknowledgement.
                     for mid, raw in api.snapshots(ids):
@@ -1154,6 +1320,8 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
                 completed_changes += len(ids)
                 show_progress("更新" if mode == "apply" else "復元",
                               completed_changes, total_changes, force=True)
+                phase = "更新直前照合"
+        phase = "最終照合"
         reconcile(api, plan, journal, mode, phase="最終照合")
         expected = {"applied"} if mode == "apply" else {"new", "restored"}
         require(all(row[0] in expected for row in journal.db.execute("SELECT status FROM progress")),
@@ -1182,6 +1350,10 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
         d.observation_outcome("メール処理は時間上限で保留（固定計画・進捗を保持）")
         return False
     except BaseException as exc:
+        write_state = ("この実行のラベル書込みは開始済みです。保存進捗から反映状況を照合してください"
+                       if write_started else "この実行のラベル書込みは未開始です")
+        exc.message_stop_context = (f"{phase}で停止。{write_state}。固定計画・バックアップを保持し、"
+                                    "同じrun-idから再開してください（再開時にも承認が必要です）")
         if journal:
             journal.set_meta("complete", "false")
             journal.db.execute("INSERT OR REPLACE INTO meta VALUES('eligible_verified', 'false')")

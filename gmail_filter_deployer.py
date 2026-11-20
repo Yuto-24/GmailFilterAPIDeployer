@@ -2444,10 +2444,12 @@ def main(argv=None):
                             demand(messages.pending(args.local_dir) is None, "メール更新が未完了です。先に再開・復元してください")
                         args.func(args)
             except DeploymentError as exc:
-                print("STOP: " + str(exc), file=sys.stderr)
+                context = getattr(exc, "message_stop_context", "")
+                print("STOP: " + (context + ": " if context else "") + str(exc), file=sys.stderr)
                 return 2
             except Exception as exc:
-                print("STOP: 予期しないエラーです。途中まで反映された可能性があります。planを再実行せず状態照合してください: " + str(exc), file=sys.stderr)
+                context = getattr(exc, "message_stop_context", None)
+                print("STOP: " + (context or "予期しないエラーです。途中まで反映された可能性があります。planを再実行せず状態照合してください") + ": " + str(exc), file=sys.stderr)
                 return 3
             return getattr(args, "exit_code", 0)
     except OSError as exc:

@@ -165,7 +165,7 @@ class TestOneLine(unittest.TestCase):
         self.assertIn('上記の内容で',prompts[2])
         self.assertEqual(before,d.counter([x['filter'] for x in d.api_fetch(self.client)[0]]))
         self.assertFalse((self.local/'run_pending.json').exists())
-        self.assertFalse((self.local/'logs').exists())
+        self.assertEqual(len(list((self.local/'logs').glob('*.log'))), 1)
 
     def test_sensitive_declined_but_basic_applied_after_final_consent(self):
         """Keep declined sensitive groups while applying the approved native-subject change."""

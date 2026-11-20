@@ -314,8 +314,8 @@ class Gmail:
         return row["historyId"]
 
     def changes(self, start):
-        """Return added IDs and IDs with any event since the fixed initial cursor."""
-        added, changed, seen, token = set(), set(), set(), None
+        """Return added, changed and explicitly deleted IDs since a history cursor."""
+        added, changed, deleted, seen, token = set(), set(), set(), set(), None
         while True:
             args = {"userId": "me", "startHistoryId": start, "maxResults": 500}
             if token:
@@ -328,10 +328,12 @@ class Gmail:
                         changed.add(mid)
                         if kind == "messagesAdded":
                             added.add(mid)
+                        if kind == "messagesDeleted":
+                            deleted.add(mid)
                 changed.update(x["id"] for x in event.get("messages", []))
             token = row.get("nextPageToken")
             if not token:
-                return added, changed
+                return added, changed, deleted
             require(token not in seen, "history.listのページが循環しています")
             seen.add(token)
 
@@ -361,14 +363,229 @@ def connect_db(path, *, readonly=False):
     return db
 
 
+def show_progress(phase, done=None, total=None, *, force=False):
+    """Progress reflects completed work in this invocation, not API log volume."""
+    if total is None:
+        print(f"[メール進捗] {phase}: 集計中" +
+              (f"（{done}件確認）" if done is not None else ""), flush=True)
+    elif force or done == 0 or done == total or done % 500 == 0:
+        percent = 100.0 if total == 0 else done * 100 / total
+        print(f"[メール進捗] {phase}: {done}/{total} ({percent:.1f}%)", flush=True)
+
+
+PLANNING = "messages_planning.json"
+PLANNING_SCHEMA = "gmail-message-planning-checkpoint/v2"
+MAX_RECONCILE_PASSES = 3
+
+
+def read_planning(path):
+    """An existing invalid pointer must never be mistaken for no checkpoint."""
+    try:
+        checkpoint = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, UnicodeError) as exc:
+        raise d.DeploymentError("計画ポインタが破損しています。READMEの隔離復旧手順を確認してください") from exc
+    required = {"schema", "run_id", "account", "master_sha256", "labels",
+                "skip_unknown_labels", "initial_count", "history_start",
+                "compilation_version", "normalization_version"}
+    require(isinstance(checkpoint, dict) and required <= checkpoint.keys(),
+            "計画ポインタの形式・必須項目が不正です")
+    return checkpoint
+
+
+def require_planning_target(local_dir, master, account, *, target_sha256=None):
+    """Never deploy a different Master over an in-progress message snapshot."""
+    path = local_dir / PLANNING
+    if not path.exists():
+        return
+    checkpoint = read_planning(path)
+    require(checkpoint.get("schema") in (PLANNING_SCHEMA, "gmail-message-planning-checkpoint/v1")
+            and checkpoint.get("account") == account
+            and checkpoint.get("master_sha256") == (target_sha256 or d.file_hash(master)),
+            "未完了のメール計画と配備先のMaster・アカウントが異なります。"
+            "配備前に計画を再開するか、明示的に計画を破棄してください")
+
+
+def reset_planning(args):
+    """Explicitly release a read-only, incomplete plan without deleting its audit DB."""
+    require(pending(args.local_dir) is None
+            and not (args.local_dir / "run_pending.json").exists(),
+            "承認済みの変更が未完了です。先にその計画を再開・復元してください")
+    path = args.local_dir / PLANNING
+    if not path.exists():
+        print("破棄対象の未完了メール計画はありません。", flush=True)
+        return
+    require(not path.is_symlink(), "計画ポインタのsymlinkは使用できません")
+    try:
+        checkpoint = read_planning(path)
+    except d.DeploymentError:
+        print(f"対象local-dir: {args.local_dir.resolve()}", flush=True)
+        print("計画ポインタが破損しており、アカウント・run-idを検証できません。"
+              "local-dirが対象アカウントのものか確認してください。", flush=True)
+        print("承認済みの保留ポインタはありません。破損ポインタを隔離保存し、"
+              "計画バックアップと進捗はすべて保持します。", flush=True)
+        if not d.confirm_interactive("破損ポインタを隔離して新規計画を許可しますか？ [y/N]: "):
+            print("隔離を見送りました。", flush=True)
+            return
+        archived = path.with_name(f"messages_planning.invalid.{uuid.uuid4().hex}.json")
+        path.rename(archived)
+        sync_directory(args.local_dir)
+        print(f"破損ポインタを隔離しました: {archived}", flush=True)
+        return
+    require(checkpoint.get("schema") in (PLANNING_SCHEMA, "gmail-message-planning-checkpoint/v1")
+            and checkpoint.get("account") == args.expected_email,
+            "計画の形式・アカウントが一致しません")
+    directory = run_directory(args.local_dir, checkpoint.get("run_id"))
+    require(directory.is_dir() and not (directory / "manifest.json").exists(),
+            "完了済みの計画または破損したチェックポイントです")
+    print(f"破棄対象: {directory}", flush=True)
+    print("計画の再開ポインタだけを解除します。過去のバックアップは保持し、"
+          "Gmailのフィルタ・メールは変更しません。", flush=True)
+    if not d.confirm_interactive("未完了の計画を破棄しますか？ [y/N]: "):
+        print("破棄を見送りました。", flush=True)
+        return
+    path.unlink()
+    sync_directory(args.local_dir)
+    print("未完了の計画ポインタを破棄しました。次回の再分類は最初から計画します。", flush=True)
+
+
+def _mutable_search(query):
+    """Only native address/subject predicates are independent of Gmail label state.
+
+    Everything else, including arbitrary Gmail query expressions, is refreshed
+    before finalization, even without history events. Do not interpret queries.
+    """
+    return not bool(re.fullmatch(r'(?:from|to|cc|bcc|subject):(?:"[^"]*"|[^\s]+)', query))
+
+
+def _plan_match(db, mid, rules, specs, name_ids):
+    """Recalculate one message using Gmail-owned, persisted query result sets."""
+    hits = {row[0] for row in db.execute("SELECT query FROM query_hits WHERE message=?", (mid,))}
+    db.execute("DELETE FROM matches WHERE message=?", (mid,))
+    db.execute("DELETE FROM desired_labels WHERE message=?", (mid,))
+    matched = 0
+    for number, (rule, spec) in enumerate(zip(rules, specs, strict=True), 1):
+        if all(any(q in hits for q in group) for group in spec["all"]) and (
+                not spec["exclude"] or spec["exclude"] not in hits):
+            matched += 1
+            db.execute("INSERT INTO matches VALUES(?,?)", (number, mid))
+            db.executemany("INSERT OR IGNORE INTO desired_labels VALUES(?,?)",
+                           ((mid, name_ids[x[6:]]) for x in rule["action"]["addLabelIds"]
+                            if x.startswith("label:")))
+    db.execute("UPDATE messages SET matches=? WHERE id=?", (matched, mid))
+
+
+def _planning_counts(db, initial_ids, skip_unknown_labels):
+    """Every initial ID has exactly one durable disposition."""
+    states = dict(db.execute("SELECT id,state FROM initial_ids"))
+    targets = {r[0] for r in db.execute("SELECT id FROM messages")}
+    held = {r[0] for r in db.execute("SELECT id FROM deferred")} if skip_unknown_labels else set()
+    require(states.keys() == initial_ids
+            and set(states.values()) <= {"target", "excluded", "deferred", "deleted"}
+            and targets == {mid for mid, state in states.items() if state == "target"}
+            and held == {mid for mid, state in states.items() if state == "deferred"},
+            "計画チェックポイントの対象ID状態が欠損・不整合です")
+    return sum(state == "excluded" for state in states.values()), len(held)
+
+
+def _plan_reconcile(api, db, labels, rules, specs, initial_ids, history_start,
+                    skip_unknown_labels):
+    """Commit metadata, dispositions, query hits and classifications together.
+
+    Roll back an interrupted/unstable pass. A fresh history interval includes
+    enumeration, all searches and the final paced metadata verification.
+    """
+    name_ids = {row["name"]: lid for lid, row in labels.items() if row["type"] == "user"}
+    for attempt in range(MAX_RECONCILE_PASSES):
+        cursor = api.history_start()
+        show_progress("計画最終照合（メール列挙）")
+        second_ids = set()
+        for mid in api.ids():
+            second_ids.add(mid)
+            if len(second_ids) % 500 == 0:
+                show_progress("計画最終照合（メール列挙）", len(second_ids))
+        show_progress("計画最終照合（メール列挙）", len(second_ids))
+        new_ids, changed, deleted = api.changes(history_start)
+        missing = initial_ids - second_ids
+        require(missing <= deleted, "メール列挙に削除履歴で説明できない欠落があります")
+        require(second_ids - new_ids <= initial_ids,
+                "メール列挙と変更履歴の新着IDが一致しません")
+        old_changes = (changed & initial_ids) | missing
+        changed_current = set()
+        with db:
+            def drop(mid, state):
+                db.execute("DELETE FROM messages WHERE id=?", (mid,))
+                for table in ("matches", "desired_labels", "query_hits"):
+                    db.execute(f"DELETE FROM {table} WHERE message=?", (mid,))
+                if skip_unknown_labels:
+                    db.execute("DELETE FROM deferred WHERE id=?", (mid,))
+                db.execute("UPDATE initial_ids SET state=? WHERE id=?", (state, mid))
+
+            for mid in missing:
+                drop(mid, "deleted")
+            for mid, raw in api.snapshots(sorted(old_changes & second_ids)):
+                saved = db.execute("SELECT * FROM messages WHERE id=?", (mid,)).fetchone()
+                try:
+                    now = api.metadata(mid, raw, labels)
+                except UnknownMessageLabels as exc:
+                    if not skip_unknown_labels:
+                        raise
+                    require(saved is not None or db.execute(
+                        "SELECT 1 FROM deferred WHERE id=?", (mid,)).fetchone(),
+                        "対象外メールのラベル状態が不明です。再計画してください")
+                    drop(mid, "deferred")
+                    db.execute("INSERT INTO deferred VALUES(?,?)", (mid, encode(exc.row)))
+                    continue
+                if saved is None:
+                    require(bool(set(now["labelIds"]) & EXCLUDED),
+                            "対象外だった既存メールが計画対象に入りました。新規計画が必要です")
+                    drop(mid, "excluded")
+                    continue
+                require(now["threadId"] == saved["thread_id"], "メッセージのスレッドが変更されています")
+                if set(now["labelIds"]) & EXCLUDED:
+                    drop(mid, "excluded")
+                    continue
+                db.execute("UPDATE messages SET before_labels=? WHERE id=?",
+                           (encode(now["labelIds"]), mid))
+                changed_current.add(mid)
+            target_ids = {r[0] for r in db.execute("SELECT id FROM messages")}
+            refresh = [row[0] for row in db.execute("SELECT query FROM queries")
+                       if _mutable_search(row[0])]
+            if refresh:
+                print(f"[メール計画] 状態依存の検索を再取得: {len(refresh)}条件", flush=True)
+            for query in refresh:
+                previous = {r[0] for r in db.execute(
+                    "SELECT message FROM query_hits WHERE query=?", (query,))}
+                ids = set(api.ids(query)) & target_ids
+                changed_current.update(previous ^ ids)
+                db.execute("DELETE FROM query_hits WHERE query=?", (query,))
+                db.executemany("INSERT INTO query_hits VALUES(?,?)", ((query, mid) for mid in ids))
+            for mid in sorted(changed_current):
+                _plan_match(db, mid, rules, specs, name_ids)
+            if old_changes:
+                print(f"[メール計画] 既存メールの差分再照合: {len(old_changes)}件", flush=True)
+            stable = True
+            for mid, raw in api.snapshots(sorted(old_changes & target_ids)):
+                saved = db.execute("SELECT before_labels,thread_id FROM messages WHERE id=?", (mid,)).fetchone()
+                now = api.metadata(mid, raw, labels)
+                if sorted(json.loads(saved[0])) != now["labelIds"] or saved[1] != now["threadId"]:
+                    stable = False
+            latest_new, interval_changes, _ = api.changes(cursor)
+            if stable and not interval_changes & initial_ids:
+                excluded, deferred = _planning_counts(db, initial_ids, skip_unknown_labels)
+                return excluded, deferred, len(new_ids | latest_new)
+            db.rollback()
+        print("[メール計画] 再照合中の変更を検出。差分を破棄して再試行", flush=True)
+    require(False, "再照合中も既存メールが変更されています。計画キャッシュを保持して停止")
+
+
 def create_plan(api, local_dir, master, account, *, skip_unknown_labels=False):
-    """Finish and hash a complete snapshot before making it eligible for approval."""
+    """Resume durable search work; publish only fully reconciled immutable plans."""
     require(pending(local_dir) is None, "未完了のメール更新があります。先に再開または復元してください")
     require(not (local_dir / "run_pending.json").exists(), "フィルタ配備が未完了です")
     original_hash = d.file_hash(master)
     templates = d.compile_xml(master)
     rules = user_rules(templates)
-    specs = [search_spec(t) for t in rules]  # All unsupported native forms fail before API reads.
+    specs = [search_spec(t) for t in rules]
     labels = api.labels()
     api.filters_match(rules, labels)
     user_ids = {lid for lid, row in labels.items() if row["type"] == "user"}
@@ -376,20 +593,74 @@ def create_plan(api, local_dir, master, account, *, skip_unknown_labels=False):
     for t in rules:
         require(all(x[6:] in name_ids for x in t["action"]["addLabelIds"] if x.startswith("label:")),
                 "Masterのユーザーラベルが存在しません")
-    run_id = uuid.uuid4().hex
-    directory = run_directory(local_dir, run_id)
-    directory.mkdir(parents=True, mode=0o700)
-    directory.chmod(0o700)
-    copied = directory / "master.xml"
-    with copied.open("xb") as f:
-        f.write(master.read_bytes())
-        f.flush()
-        os.fsync(f.fileno())
-    copied.chmod(0o600)
-    require(d.file_hash(copied) == original_hash == d.file_hash(master), "Masterが計画作成中に変更されました")
-    db = connect_db(directory / "plan.sqlite")
-    try:
+
+    checkpoint_path = local_dir / PLANNING
+    checkpoint = read_planning(checkpoint_path) if checkpoint_path.exists() else None
+    if checkpoint is not None:
+        require(checkpoint.get("schema") == PLANNING_SCHEMA
+                and checkpoint.get("account") == account
+                and checkpoint.get("master_sha256") == original_hash
+                and checkpoint.get("skip_unknown_labels") is skip_unknown_labels
+                and checkpoint.get("labels") == labels
+                and checkpoint.get("compilation_version") == d.CURRENT_COMPILATION
+                and checkpoint.get("normalization_version") == d.CURRENT_NORMALIZATION,
+                "未完了のメール計画とMaster・アカウント・ラベル・仕様が一致しません。計画を変更せず停止")
+        directory = run_directory(local_dir, checkpoint["run_id"])
+        copied = directory / "master.xml"
+        require(copied.is_file() and not copied.is_symlink() and file_digest(copied) == original_hash,
+                "保存済みMasterの整合性がありません")
+        if (directory / "manifest.json").exists():
+            plan = Plan(directory, account)
+            plan.close()
+            _finish_planning(local_dir, directory)
+            return directory
+        db = connect_db(directory / "plan.sqlite")
+        require(db.execute("PRAGMA integrity_check").fetchone()[0] == "ok",
+                "計画チェックポイントのDBが破損しています")
+        initial_ids = {r[0] for r in db.execute("SELECT id FROM initial_ids")}
+        require(len(initial_ids) == checkpoint["initial_count"],
+                "計画チェックポイントの対象ID件数が一致しません")
+        persisted = list(db.execute("SELECT number,template,spec FROM rules ORDER BY number"))
+        require(len(persisted) <= len(rules)
+                and all(row["number"] == i and row["template"] == encode(rules[i-1])
+                        and row["spec"] == encode(specs[i-1])
+                        for i, row in enumerate(persisted, 1)),
+                "保存済みルールがMasterのprefixと一致しません")
+        require(not db.execute("SELECT 1 FROM messages WHERE id NOT IN (SELECT id FROM initial_ids)").fetchone(),
+                "計画チェックポイントのメールIDが不正です")
+        allowed_queries = {q for spec in specs for group in spec["all"] for q in group}
+        allowed_queries.update(spec["exclude"] for spec in specs if spec["exclude"])
+        cached_queries = {row[0] for row in db.execute("SELECT query FROM queries")}
+        require(cached_queries <= allowed_queries and not db.execute(
+                    "SELECT 1 FROM query_hits WHERE query NOT IN (SELECT query FROM queries) "
+                    "OR message NOT IN (SELECT id FROM messages)").fetchone()
+                and not db.execute(
+                    "SELECT 1 FROM matches WHERE rule NOT IN (SELECT number FROM rules) "
+                    "OR message NOT IN (SELECT id FROM messages)").fetchone()
+                and not db.execute(
+                    "SELECT 1 FROM desired_labels WHERE message NOT IN (SELECT id FROM messages)").fetchone()
+                and all(row[0] in user_ids for row in db.execute("SELECT DISTINCT label FROM desired_labels")),
+                "計画チェックポイントの検索キャッシュ・分類の整合性がありません")
+        excluded, deferred = _planning_counts(db, initial_ids, skip_unknown_labels)
+        start = checkpoint["history_start"]
+        print(f"[メール計画] チェックポイント再開: ルール照合 {len(persisted)}/{len(rules)}"
+              "（既存メールの読取り結果を再利用）", flush=True)
+    else:
+        run_id = uuid.uuid4().hex
+        directory = run_directory(local_dir, run_id)
+        directory.mkdir(parents=True, mode=0o700)
+        directory.chmod(0o700)
+        copied = directory / "master.xml"
+        with copied.open("xb") as f:
+            f.write(master.read_bytes())
+            f.flush()
+            os.fsync(f.fileno())
+        copied.chmod(0o600)
+        require(d.file_hash(copied) == original_hash == d.file_hash(master),
+                "Masterが計画作成中に変更されました")
+        db = connect_db(directory / "plan.sqlite")
         db.executescript("""
+            CREATE TABLE initial_ids(id TEXT PRIMARY KEY, state TEXT NOT NULL);
             CREATE TABLE messages(id TEXT PRIMARY KEY, thread_id TEXT NOT NULL,
                 before_labels TEXT NOT NULL, desired TEXT NOT NULL, matches INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE rules(number INTEGER PRIMARY KEY, template TEXT NOT NULL, spec TEXT NOT NULL);
@@ -400,13 +671,19 @@ def create_plan(api, local_dir, master, account, *, skip_unknown_labels=False):
         """)
         if skip_unknown_labels:
             db.execute("CREATE TABLE deferred(id TEXT PRIMARY KEY, metadata TEXT NOT NULL)")
-        deferred = 0
         start = api.history_start()
-        first_ids = set(api.ids())
-        added, changed = api.changes(start)
-        require(not changed - added, "列挙中に既存メールが変更されました。計画を作り直してください")
+        show_progress("メール列挙")
+        first_ids = set()
+        for mid in api.ids():
+            first_ids.add(mid)
+            if len(first_ids) % 500 == 0:
+                show_progress("メール列挙", len(first_ids))
+        show_progress("メール列挙", len(first_ids))
+        added, _, _ = api.changes(start)
         initial_ids = first_ids - added
-        excluded = 0
+        db.executemany("INSERT INTO initial_ids VALUES(?,'target')", ((mid,) for mid in initial_ids))
+        excluded = deferred = 0
+        show_progress("メタデータ取得", 0, len(initial_ids))
         for n, (mid, raw) in enumerate(api.snapshots(sorted(initial_ids)), 1):
             try:
                 row = api.metadata(mid, raw, labels)
@@ -415,26 +692,40 @@ def create_plan(api, local_dir, master, account, *, skip_unknown_labels=False):
                     raise
                 db.execute("INSERT INTO deferred VALUES(?,?)", (mid, encode(exc.row)))
                 deferred += 1
-                continue
-            if set(row["labelIds"]) & EXCLUDED:
+                db.execute("UPDATE initial_ids SET state='deferred' WHERE id=?", (mid,))
+                row = None
+            if row is not None and set(row["labelIds"]) & EXCLUDED:
                 excluded += 1
-                continue
-            db.execute("INSERT INTO messages VALUES(?,?,?,?,0)",
-                       (mid, row["threadId"], encode(row["labelIds"]), "[]"))
-            if n % 500 == 0:
-                print(f"[メール計画] メタデータ取得 {n}/{len(initial_ids)}", flush=True)
+                db.execute("UPDATE initial_ids SET state='excluded' WHERE id=?", (mid,))
+                row = None
+            if row is not None:
+                db.execute("INSERT INTO messages VALUES(?,?,?,?,0)",
+                           (mid, row["threadId"], encode(row["labelIds"]), "[]"))
+            show_progress("メタデータ取得", n, len(initial_ids))
+        show_progress("メタデータ取得", len(initial_ids), len(initial_ids), force=True)
         db.commit()
+        save(checkpoint_path, {"schema": PLANNING_SCHEMA, "run_id": run_id, "account": account,
+             "master_sha256": original_hash, "compilation_version": d.CURRENT_COMPILATION,
+             "normalization_version": d.CURRENT_NORMALIZATION, "labels": labels,
+             "skip_unknown_labels": skip_unknown_labels, "initial_count": len(initial_ids),
+             "history_start": start, "excluded": excluded, "deferred": deferred})
+        persisted = []
+        print(f"[メール計画] チェックポイント保存: {directory}", flush=True)
 
+    try:
         def search(query):
             if not db.execute("SELECT 1 FROM queries WHERE query=?", (query,)).fetchone():
                 for mid in api.ids(query):
-                    db.execute("INSERT OR IGNORE INTO query_hits SELECT ?,id FROM messages WHERE id=?", (query, mid))
+                    db.execute("INSERT OR IGNORE INTO query_hits SELECT ?,id FROM messages WHERE id=?",
+                               (query, mid))
                 db.execute("INSERT INTO queries VALUES(?)", (query,))
                 db.commit()
             return {r[0] for r in db.execute("SELECT message FROM query_hits WHERE query=?", (query,))}
 
         target_ids = {r[0] for r in db.execute("SELECT id FROM messages")}
-        for number, (rule, spec) in enumerate(zip(rules, specs), 1):
+        show_progress("ルール照合", len(persisted), len(rules), force=True)
+        for number in range(len(persisted) + 1, len(rules) + 1):
+            rule, spec = rules[number - 1], specs[number - 1]
             matched = set(target_ids)
             for group in spec["all"]:
                 hits = set()
@@ -450,19 +741,18 @@ def create_plan(api, local_dir, master, account, *, skip_unknown_labels=False):
             db.executemany("INSERT OR IGNORE INTO desired_labels VALUES(?,?)",
                            ((mid, lid) for mid in matched for lid in ids))
             db.commit()
-            if number % 50 == 0:
-                print(f"[メール計画] ルール照合 {number}/{len(rules)}", flush=True)
-        for mid in target_ids:
-            desired = [r[0] for r in db.execute("SELECT label FROM desired_labels WHERE message=? ORDER BY label", (mid,))]
-            db.execute("UPDATE messages SET desired=? WHERE id=?", (encode(desired), mid))
-        second_ids = set(api.ids())
-        new_ids, changed = api.changes(start)
-        require(not changed - new_ids and second_ids - new_ids == initial_ids,
-                "計画中に既存メールが変更・増減しました。計画を作り直してください")
+            if number % 50 == 0 or number == len(rules):
+                show_progress("ルール照合", number, len(rules), force=True)
+        excluded, deferred, new_count = _plan_reconcile(
+            api, db, labels, rules, specs, initial_ids, start, skip_unknown_labels)
         require(api.labels() == labels, "計画中にラベル定義が変更されました")
         api.filters_match(rules, labels)
-        summary = {"target": len(target_ids), "changed": 0, "unchanged": 0, "unmatched": 0,
-                   "multiple": 0, "excluded": excluded, "new_arrivals": len(new_ids),
+        for (mid,) in list(db.execute("SELECT id FROM messages")):
+            desired = [r[0] for r in db.execute("SELECT label FROM desired_labels WHERE message=? ORDER BY label", (mid,))]
+            db.execute("UPDATE messages SET desired=? WHERE id=?", (encode(desired), mid))
+        summary = {"target": db.execute("SELECT count(*) FROM messages").fetchone()[0],
+                   "changed": 0, "unchanged": 0, "unmatched": 0, "multiple": 0,
+                   "excluded": excluded, "new_arrivals": new_count,
                    "skipped_rules": len(templates) - len(rules), "unsupported": 0}
         if skip_unknown_labels:
             summary["deferred_unknown_labels"] = deferred
@@ -477,16 +767,24 @@ def create_plan(api, local_dir, master, account, *, skip_unknown_labels=False):
         db.commit()
     finally:
         db.close()
-    manifest = {"schema": DEFERRED_SCHEMA if skip_unknown_labels else SCHEMA, "search_version": SEARCH_VERSION, "run_id": run_id,
-                "compilation_version": d.CURRENT_COMPILATION, "normalization_version": d.CURRENT_NORMALIZATION,
+    manifest = {"schema": DEFERRED_SCHEMA if skip_unknown_labels else SCHEMA,
+                "search_version": SEARCH_VERSION, "run_id": directory.name,
+                "compilation_version": d.CURRENT_COMPILATION,
+                "normalization_version": d.CURRENT_NORMALIZATION,
                 "account": account, "labels": labels, "history_start": start,
                 "files": {"master.xml": file_digest(copied), "plan.sqlite": file_digest(directory / "plan.sqlite")},
                 "summary": summary, "additions": dict(additions), "removals": dict(removals)}
     manifest["digest"] = d.json_hash(manifest)
-    save(directory / "manifest.json", manifest)  # Only complete plans have a manifest.
-    (directory / "plan.sqlite").chmod(0o400)
-    copied.chmod(0o400)
+    save(directory / "manifest.json", manifest)
+    _finish_planning(local_dir, directory)
     return directory
+
+
+def _finish_planning(local_dir, directory):
+    (directory / "plan.sqlite").chmod(0o400)
+    (directory / "master.xml").chmod(0o400)
+    (local_dir / PLANNING).unlink()
+    sync_directory(local_dir)
 
 
 class Plan:
@@ -707,11 +1005,13 @@ def validate_labels(api, plan):
             "ラベル定義がバックアップと一致しません")
 
 
-def reconcile(api, plan, journal, mode):
+def reconcile(api, plan, journal, mode, *, phase="最終照合"):
+    total = plan.manifest["summary"]["target"]
+    show_progress(phase, 0, total)
     validate_labels(api, plan)
     if mode == "apply":
         api.filters_match(plan.rules, plan.labels, normalization=plan.manifest["normalization_version"])
-    for mid, raw in api.snapshots(row["id"] for row in plan.rows()):
+    for n, (mid, raw) in enumerate(api.snapshots(row["id"] for row in plan.rows()), 1):
         row = plan.row(mid)
         try:
             observe(api, plan, journal, row, mode, now=api.metadata(mid, raw, plan.labels))
@@ -720,6 +1020,8 @@ def reconcile(api, plan, journal, mode):
                 journal.event("conflict", {"message": row["id"], "error": str(exc)})
                 journal.db.commit()
             raise
+        show_progress(phase, n, total)
+    show_progress(phase, total, total, force=True)
     if journal:
         journal.db.commit()
 
@@ -758,7 +1060,7 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
             journal.db.commit()
             save(local_dir / PENDING, {"run_id": plan.directory.name, "mode": mode,
                                       "digest": plan.manifest["digest"]})
-        reconcile(api, plan, journal, mode)
+        reconcile(api, plan, journal, mode, phase="事前照合")
         plan.summary()
         if journal:
             journal.report()
@@ -774,7 +1076,7 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
         # Only interactive approval introduces a waiting interval after preflight.
         plan.verify_files()
         if authorization is None:
-            reconcile(api, plan, journal, mode)
+            reconcile(api, plan, journal, mode, phase="承認後照合")
         if journal is None:
             journal = Journal(plan, create=True)
         journal.set_meta("mode", mode)
@@ -796,6 +1098,12 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
                 old, new = new, old
             key = (tuple(sorted(new - old)), tuple(sorted(old - new)))
             groups.setdefault(key, []).append(row["id"])
+        counts = dict(journal.db.execute("SELECT status,count(*) FROM progress GROUP BY status"))
+        total_changes = (sum(counts.values()) if mode == "apply"
+                         else counts.get("applied", 0) + counts.get("restored", 0))
+        target_state = "applied" if mode == "apply" else "restored"
+        completed_changes = counts.get(target_state, 0)
+        show_progress("更新" if mode == "apply" else "復元", completed_changes, total_changes, force=True)
         batches = 0
         for (add, remove), all_ids in sorted(groups.items()):
             for offset in range(0, len(all_ids), batch_size):
@@ -843,8 +1151,10 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
                 expected = "applied" if mode == "apply" else "restored"
                 require(all(journal.state(mid) == expected for mid in ids), "メール更新が一部未反映です。再開してください")
                 batches += 1
-                print(f"[メール更新] {batches}バッチ読戻し確認済み", flush=True)
-        reconcile(api, plan, journal, mode)
+                completed_changes += len(ids)
+                show_progress("更新" if mode == "apply" else "復元",
+                              completed_changes, total_changes, force=True)
+        reconcile(api, plan, journal, mode, phase="最終照合")
         expected = {"applied"} if mode == "apply" else {"new", "restored"}
         require(all(row[0] in expected for row in journal.db.execute("SELECT status FROM progress")),
                 "メール更新の未確認進捗が残っています")
@@ -858,6 +1168,7 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
         if not complete:
             print(f"既知のラベルを持つ対象メールは照合済み。未知のラベルを持つ{plan.deferred_count}通は未変更で保留です。"
                   "保留IDは計画DBのdeferred表に保存しました。解消後は新しい計画で確認してください。", flush=True)
+        print("[メール進捗] 全工程完了" if complete else "[メール進捗] 対象照合完了（一部保留）", flush=True)
         d.observation_outcome("メール復元全件照合済み" if mode == "restore" else
                               "メール再分類全件照合済み" if complete else "メール再分類は一部保留（未知のラベル）")
         return complete

@@ -125,6 +125,38 @@ class FilterSnapshotRetryTests(unittest.TestCase):
             with self.assertRaises(m.MessageTimeLimit):
                 api.filters_match(self.templates, self.labels)
         self.assertEqual(client.calls, 1)
+        records = self.records()
+        self.assertEqual(len(records), 1)
+        self.assertFalse(records[0]["recovered"])
+        self.assertEqual([x["attempt"] for x in records[0]["attempts"]], [1])
+        self.assertEqual(len(records[0]["last_mismatch"]["master_only"]), 1)
+
+    def test_followup_api_failure_preserves_prior_mismatch_and_original_exception(self):
+        failure = RuntimeError("second filters.list failed")
+        api, client = self.api([self.snapshot[:-1], failure])
+        with patch.object(m.time, "sleep") as sleep:
+            with self.assertRaises(RuntimeError) as caught:
+                api.filters_match(self.templates, self.labels)
+        self.assertIs(caught.exception, failure)
+        self.assertEqual(client.calls, 2)
+        sleep.assert_called_once_with(30)
+        records = self.records()
+        self.assertEqual(len(records), 1)
+        self.assertFalse(records[0]["recovered"])
+        self.assertEqual([x["attempt"] for x in records[0]["attempts"]], [1])
+        self.assertEqual(len(records[0]["last_mismatch"]["master_only"]), 1)
+
+    def test_backoff_interruption_preserves_diagnostics_and_interrupt(self):
+        stop = KeyboardInterrupt()
+        api, client = self.api([self.snapshot[:-1], self.snapshot])
+        with patch.object(m.time, "sleep", side_effect=stop):
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                api.filters_match(self.templates, self.labels)
+        self.assertIs(caught.exception, stop)
+        self.assertEqual(client.calls, 1)
+        records = self.records()
+        self.assertEqual(len(records), 1)
+        self.assertFalse(records[0]["recovered"])
 
 
 if __name__ == "__main__":

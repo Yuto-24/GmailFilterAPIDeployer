@@ -384,30 +384,37 @@ class Gmail:
         expected = user_rules(rules)
         expected_counts = d.counter(expected)
         attempts, differences = [], None
-        for attempt in range(len(FILTER_MATCH_DELAYS_SECONDS) + 1):
-            self.check_deadline()
-            rows = self.read("filters.list", self.client.users().settings().filters().list(userId="me"))
-            # Malformed API data and unknown label IDs still stop immediately.
-            require(isinstance(rows.get("filter", []), list),
-                    "Gmailフィルタ一覧の形式が不正です")
-            live = [d.live_as_template(x, names, normalization=normalization)
-                    for x in rows.get("filter", [])]
-            observed = user_rules(live)
-            if d.counter(observed) == expected_counts:
-                if attempts:
-                    self._record_filter_mismatch(attempts, differences, recovered=True)
-                    print(f"[メール照合] フィルタ再照合{attempt + 1}/{len(FILTER_MATCH_DELAYS_SECONDS) + 1}回目で完全一致を確認", flush=True)
-                return
-            missing, unexpected = d.delta(observed, expected)
-            differences = {"master_only": missing, "gmail_only": unexpected}
-            attempts.append({"attempt": attempt + 1, "gmail_filters": len(live),
-                             "gmail_user_rules": len(observed), "master_user_rules": len(expected),
-                             "master_only": len(missing), "gmail_only": len(unexpected)})
-            if attempt < len(FILTER_MATCH_DELAYS_SECONDS):
-                delay = FILTER_MATCH_DELAYS_SECONDS[attempt]
-                print(f"[メール照合] フィルタ不一致（Masterのみ{len(missing)}件 / Gmailのみ{len(unexpected)}件）。"
-                      f"{delay}秒待って再取得します（{attempt + 2}/{len(FILTER_MATCH_DELAYS_SECONDS) + 1}回目）", flush=True)
-                time.sleep(delay)
+        try:
+            for attempt in range(len(FILTER_MATCH_DELAYS_SECONDS) + 1):
+                self.check_deadline()
+                rows = self.read("filters.list", self.client.users().settings().filters().list(userId="me"))
+                # Malformed API data and unknown label IDs still stop immediately.
+                require(isinstance(rows.get("filter", []), list),
+                        "Gmailフィルタ一覧の形式が不正です")
+                live = [d.live_as_template(x, names, normalization=normalization)
+                        for x in rows.get("filter", [])]
+                observed = user_rules(live)
+                if d.counter(observed) == expected_counts:
+                    if attempts:
+                        self._record_filter_mismatch(attempts, differences, recovered=True)
+                        print(f"[メール照合] フィルタ再照合{attempt + 1}/{len(FILTER_MATCH_DELAYS_SECONDS) + 1}回目で完全一致を確認", flush=True)
+                    return
+                missing, unexpected = d.delta(observed, expected)
+                differences = {"master_only": missing, "gmail_only": unexpected}
+                attempts.append({"attempt": attempt + 1, "gmail_filters": len(live),
+                                 "gmail_user_rules": len(observed), "master_user_rules": len(expected),
+                                 "master_only": len(missing), "gmail_only": len(unexpected)})
+                if attempt < len(FILTER_MATCH_DELAYS_SECONDS):
+                    delay = FILTER_MATCH_DELAYS_SECONDS[attempt]
+                    print(f"[メール照合] フィルタ不一致（Masterのみ{len(missing)}件 / Gmailのみ{len(unexpected)}件）。"
+                          f"{delay}秒待って再取得します（{attempt + 2}/{len(FILTER_MATCH_DELAYS_SECONDS) + 1}回目）", flush=True)
+                    time.sleep(delay)
+        except BaseException:
+            # Preserve observed drift even if the deadline, another read, or
+            # interruption ends the retry before the final comparison.
+            if attempts:
+                self._record_filter_mismatch(attempts, differences, recovered=False)
+            raise
         self._record_filter_mismatch(attempts, differences, recovered=False)
         raise d.DeploymentError(
             "ユーザーラベル用フィルタがMasterと一致しません（3回照合しても不一致）。"

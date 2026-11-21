@@ -46,8 +46,7 @@ docker compose build
 docker compose run --rm \
 --service-ports deployer run \ # 初回OAuth用ポートを開放し、検証〜承認〜配備〜検証を一括実行
 --reclassify-existing \ # フィルタ配備後に既存メールのユーザーラベルも自動で再分類
---skip-unknown-message-labels \ # ラベル一覧に存在しないIDを含むメールはエラー停止せず保留
---max-message-seconds 10800 # メール再分類の実行時間上限（約3時間）を設定して安全に途中保留
+--skip-unknown-message-labels # ラベル一覧に存在しないIDを含むメールはエラー停止せず保留
 ```
 
 *(※ シェルにそのまま貼り付ける場合は、`# ...` のコメント部分を除いて実行してください)*
@@ -56,9 +55,10 @@ docker compose run --rm \
 docker compose run --rm \
 --service-ports deployer run \
 --reclassify-existing \
---skip-unknown-message-labels \
---max-message-seconds 10800
+--skip-unknown-message-labels
 ```
+
+通常は実行時間の上限を設けず、メール再分類の全工程完了を目指します。作業時間を区切って保留・再開したい場合だけ、上記コマンドの末尾に `--max-message-seconds 10800` を任意で追加してください。この時間上限は強制終了ではなく、計画作成や送信済みバッチの読戻しなど、安全な区切りまで処理が続く場合があります。
 
 ---
 
@@ -66,11 +66,12 @@ docker compose run --rm \
 
 | 用途 | コマンド |
 |---|---|
-| **日常の実行（フィルタ更新＋過去メール再分類）** | `docker compose run --rm --service-ports deployer run --reclassify-existing --skip-unknown-message-labels --max-message-seconds 10800` |
+| **日常の実行（フィルタ更新＋過去メール再分類）** | `docker compose run --rm --service-ports deployer run --reclassify-existing --skip-unknown-message-labels` |
 | **フィルタ配備のみ（再分類なし・最小構成）** | `docker compose run --rm --service-ports deployer run` |
 | **フィルタごとの処理内容も詳細表示して配備** | `docker compose run --rm --service-ports deployer run -v` |
 | **未確定操作を保留して継続する長時間配備** | `docker compose run --rm --service-ports deployer run --defer-unconfirmed` |
-| **メタデータ読取りバッチサイズも指定して一括再分類** | `docker compose run --rm --service-ports deployer run --reclassify-existing --skip-unknown-message-labels --message-read-batch-size 5 --max-message-seconds 10800` |
+| **メタデータ読取りバッチサイズも指定して一括再分類** | `docker compose run --rm --service-ports deployer run --reclassify-existing --skip-unknown-message-labels --message-read-batch-size 5` |
+| **実行時間を区切って途中保留（任意）** | `docker compose run --rm --service-ports deployer run --reclassify-existing --skip-unknown-message-labels --max-message-seconds 10800` |
 | **実行中ログの追跡（別端末から監視）** | `bash scripts/watch_reclassification.sh` |
 | **メール再分類の計画作成のみ** | `docker compose run --rm --service-ports deployer reclassify --plan-only` |
 | **読取り計画を明示破棄・破損ポインタを隔離** | `docker compose run --rm deployer reset-message-planning` |
@@ -208,7 +209,7 @@ docker compose run --rm deployer apply --help
 #### 一括自動実行オプション（`run`）
 
 ```bash
-docker compose run --rm --service-ports deployer run --reclassify-existing --skip-unknown-message-labels --message-read-batch-size 5 --max-message-seconds 10800
+docker compose run --rm --service-ports deployer run --reclassify-existing --skip-unknown-message-labels --message-read-batch-size 5
 ```
 
 - `--reclassify-existing`：起動時に対象アカウント・Master・手動分を含むユーザーラベルの置換範囲を確認し、メール用OAuthを先に完了します。フィルタの配備・Master照合後、バックアップ、検索、再分類と読戻しまで自動で続けます。メール処理直前の追加承認は不要です。既存のフィルタ差分・Action/Delete・Trashの承認は従来どおり必要です。指定しなければ従来の準備確認とメール更新の個別承認を使います。復元は一括承認の対象外です。
@@ -217,7 +218,7 @@ docker compose run --rm --service-ports deployer run --reclassify-existing --ski
 
 最小メタデータの`messages.get`に限り、HTTP 400の理由がすべて`failedPrecondition`の場合も、読み取りを最大3回まで再試行します。待機は1秒・2秒を基準に各0〜1秒のジッターを加え、各バッチ試行にも毎秒4件を目安にした待機を適用します。バッチ内に恒久的なエラーがあれば再試行せず停止し、部分的な読み取り結果は使いません。その他の400、認証・権限エラー、メタデータの不正は引き続き停止します。書き込みの自動再送は追加しません。
 
-- `--max-message-seconds 10800`：起動から約3時間を目安にメール処理を保留します。初回はハッシュ付き計画・バックアップの完成を待ってから上限を確認するため、計画が長引く場合は目安を超えます。送信済みバッチは読戻しを終えてから止めます。起動時承認を使う場合、適用前の全件照合から固定計画と承認済み進捗を保持するので、時間上限でも`messages_pending.json`を残し、同じMaster・オプションの`run`で再開できます。終了コード4で、全件完了とは表示しません。送信意図が一件もない状態で時間上限以外のエラーになった場合は、バックアップと失敗記録を残して保留ポインタを解除し、再計画を可能にします。送信意図があれば保留ポインタを維持します。指定しなければ時間上限はありません。起動時承認後の再分類では追加の承認待ちがないため、適用前の全件照合は1回です。個別の対話承認では承認前後とも照合しますが、承認待ち中に変化していないメールのGETは省きます。
+- `--max-message-seconds 10800`（任意）：起動から約3時間を目安にメール処理を保留します。初回はハッシュ付き計画・バックアップの完成を待ってから上限を確認するため、計画が長引く場合は目安を超えます。送信済みバッチは読戻しを終えてから止めます。起動時承認を使う場合、適用前の全件照合から固定計画と承認済み進捗を保持するので、時間上限でも`messages_pending.json`を残し、同じMaster・オプションの`run`で再開できます。終了コード4で、全件完了とは表示しません。送信意図が一件もない状態で時間上限以外のエラーになった場合は、バックアップと失敗記録を残して保留ポインタを解除し、再計画を可能にします。送信意図があれば保留ポインタを維持します。指定しなければ時間上限はありません。起動時承認後の再分類では追加の承認待ちがないため、適用前の全件照合は1回です。個別の対話承認では承認前後とも照合しますが、承認待ち中に変化していないメールのGETは省きます。
 
 > **注意**：対象メールの列挙と複数回の照合が必要なため、メール数によっては3時間を超えることがあります。処理中は既存メールの既読状態・ラベルを他のクライアントで変更すると、外部変更として停止する場合があります。
 

@@ -28,6 +28,7 @@ RUN_AUTHORIZATION_POLICY = "replace-eligible-user-labels/v1"
 EXCLUDED = frozenset({"SENT", "DRAFT", "SPAM", "TRASH", "CHAT"})
 SYSTEM_IDS = EXCLUDED | {"INBOX", "UNREAD", "STARRED", "IMPORTANT", "DRAFTS", "ALL"}
 PENDING = "messages_pending.json"
+FILTER_MATCH_DELAYS_SECONDS = (30, 60)
 ATOM = r'[^\s{}()"\\:]+'
 QUOTED = r'"[^"\\]*"'
 
@@ -187,12 +188,13 @@ def transient_metadata_error(exc):
 
 class Gmail:
     """One-attempt writes; bounded read retries, minimal message projections."""
-    def __init__(self, client, verbose=False, read_batch_size=1):
+    def __init__(self, client, verbose=False, read_batch_size=1, *, diagnostics_dir=None):
         require(isinstance(read_batch_size, int) and 1 <= read_batch_size <= 50,
                 "メール読取りバッチ件数は1〜50です")
         self.client, self.verbose = client, verbose
         self.read_batch_size = read_batch_size
         self.deadline = None
+        self.diagnostics_dir = Path(diagnostics_dir) if diagnostics_dir is not None else None
 
     def read(self, kind, request):
         transient = transient_metadata_error if kind == "messages.get" else None
@@ -358,13 +360,65 @@ class Gmail:
             require(token not in seen, "history.listのページが循環しています")
             seen.add(token)
 
+    def _record_filter_mismatch(self, attempts, differences, *, recovered):
+        """Keep private rule-level evidence outside the fixed plan and write journal."""
+        if self.diagnostics_dir is None:
+            return
+        try:
+            self.diagnostics_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self.diagnostics_dir.chmod(0o700)
+            path = self.diagnostics_dir / (
+                "message_filter_mismatch_"
+                + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+                + "_" + uuid.uuid4().hex[:8] + ".json")
+            d.save_json(path, {"recovered": recovered, "attempts": attempts,
+                               "last_mismatch": differences})
+            print(f"[メール照合] フィルタ不一致の診断ログ: {path}", flush=True)
+        except OSError as exc:
+            # A diagnostic write failure must not bypass the comparison or mask it.
+            print(f"[メール照合] フィルタ診断ログを保存できませんでした: {type(exc).__name__}", flush=True)
+
     def filters_match(self, rules, labels, *, normalization=d.CURRENT_NORMALIZATION):
+        """Retry only complete, well-formed filter snapshots with semantic drift."""
         names = {lid: row["name"] for lid, row in labels.items()}
-        rows = self.read("filters.list", self.client.users().settings().filters().list(userId="me"))
-        live = [d.live_as_template(x, names, normalization=normalization)
-                for x in rows.get("filter", [])]
-        require(d.counter(user_rules(live)) == d.counter(user_rules(rules)),
-                "ユーザーラベル用フィルタがMasterと一致しません。再分類を見送ります")
+        expected = user_rules(rules)
+        expected_counts = d.counter(expected)
+        attempts, differences = [], None
+        try:
+            for attempt in range(len(FILTER_MATCH_DELAYS_SECONDS) + 1):
+                self.check_deadline()
+                rows = self.read("filters.list", self.client.users().settings().filters().list(userId="me"))
+                # Malformed API data and unknown label IDs still stop immediately.
+                require(isinstance(rows.get("filter", []), list),
+                        "Gmailフィルタ一覧の形式が不正です")
+                live = [d.live_as_template(x, names, normalization=normalization)
+                        for x in rows.get("filter", [])]
+                observed = user_rules(live)
+                if d.counter(observed) == expected_counts:
+                    if attempts:
+                        self._record_filter_mismatch(attempts, differences, recovered=True)
+                        print(f"[メール照合] フィルタ再照合{attempt + 1}/{len(FILTER_MATCH_DELAYS_SECONDS) + 1}回目で完全一致を確認", flush=True)
+                    return
+                missing, unexpected = d.delta(observed, expected)
+                differences = {"master_only": missing, "gmail_only": unexpected}
+                attempts.append({"attempt": attempt + 1, "gmail_filters": len(live),
+                                 "gmail_user_rules": len(observed), "master_user_rules": len(expected),
+                                 "master_only": len(missing), "gmail_only": len(unexpected)})
+                if attempt < len(FILTER_MATCH_DELAYS_SECONDS):
+                    delay = FILTER_MATCH_DELAYS_SECONDS[attempt]
+                    print(f"[メール照合] フィルタ不一致（Masterのみ{len(missing)}件 / Gmailのみ{len(unexpected)}件）。"
+                          f"{delay}秒待って再取得します（{attempt + 2}/{len(FILTER_MATCH_DELAYS_SECONDS) + 1}回目）", flush=True)
+                    time.sleep(delay)
+        except BaseException:
+            # Preserve observed drift even if the deadline, another read, or
+            # interruption ends the retry before the final comparison.
+            if attempts:
+                self._record_filter_mismatch(attempts, differences, recovered=False)
+            raise
+        self._record_filter_mismatch(attempts, differences, recovered=False)
+        raise d.DeploymentError(
+            "ユーザーラベル用フィルタがMasterと一致しません（3回照合しても不一致）。"
+            "既存メールの更新を停止しました。診断ログを確認してください")
 
     def modify(self, ids, add, remove):
         return d.timed_operation("Gmail messages.batchModify", lambda:
@@ -1381,7 +1435,8 @@ def message_client(args):
             "メール用トークンは配備用トークン・クライアント秘密情報と別のファイルにしてください")
     client, _ = d.get_client(args.client_secrets, token, allow_auth=sys.stdin.isatty(),
         scopes=d.SCOPES + ["https://www.googleapis.com/auth/gmail.modify"], expected_email=args.expected_email)
-    return Gmail(client, getattr(args, "verbose", False), getattr(args, "message_read_batch_size", 1))
+    return Gmail(client, getattr(args, "verbose", False), getattr(args, "message_read_batch_size", 1),
+                diagnostics_dir=args.local_dir / "logs" / "diagnostics")
 
 
 def authorize_run(args):

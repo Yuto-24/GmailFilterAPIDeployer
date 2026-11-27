@@ -80,12 +80,12 @@ class ReconciliationCheckpointTests(unittest.TestCase):
 
     def test_change_during_approval_is_detected_before_any_write(self):
         def approve(question):
-            self.client.mail["a"]["labelIds"].remove("UNREAD")
+            self.client.mail["a"]["labelIds"].append("TRASH")
             self.changed("a")
             return True
         with patch("sys.stdin.isatty", return_value=True), \
                 patch.object(d, "confirm_interactive", side_effect=approve), \
-                self.assertRaisesRegex(d.DeploymentError, "システム状態の外部変更") as caught:
+                self.assertRaisesRegex(d.DeploymentError, "所属が変更") as caught:
             m.execute(self.api, self.plan_obj, self.local)
         self.assertEqual(self.reads, ["a", "b", "c", "d", "a"])
         self.assertIn("承認後照合", caught.exception.message_stop_context)
@@ -117,10 +117,10 @@ class ReconciliationCheckpointTests(unittest.TestCase):
         self.reads.clear()
         def hook(kind):
             if kind == "messages.get" and self.reads[-1] == "d":
-                self.client.mail["a"]["labelIds"].remove("UNREAD")
+                self.client.mail["a"]["labelIds"].append("TRASH")
                 self.changed("a")
         self.client.on_request = hook
-        with self.assertRaisesRegex(d.DeploymentError, "システム状態の外部変更"):
+        with self.assertRaisesRegex(d.DeploymentError, "所属が変更"):
             self.reconcile()
         self.assertEqual(self.reads, ["c", "d", "a"])
         self.assertEqual(self.client.writes, [])
@@ -180,11 +180,11 @@ class ReconciliationCheckpointTests(unittest.TestCase):
         def expire_after_scan(*args, **kwargs):
             calls[0] += 1
             if calls[0] == 1:
-                self.client.mail["a"]["labelIds"].remove("UNREAD")
+                self.client.mail["a"]["labelIds"].append("TRASH")
                 raise ApiError(404, "notFound")
             return original(*args, **kwargs)
         with patch.object(self.api, "changes", side_effect=expire_after_scan), \
-                self.assertRaisesRegex(d.DeploymentError, "システム状態の外部変更"):
+                self.assertRaisesRegex(d.DeploymentError, "所属が変更"):
             self.execute(self.plan_obj)
         self.assertEqual(self.reads, ["a", "b", "c", "d", "a"])
         self.assertEqual(self.client.writes, [])

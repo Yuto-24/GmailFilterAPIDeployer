@@ -2,9 +2,9 @@
 
 - ID: message-reconciliation-checkpoint
 - Status: verified
-- Scope: `gmail_message_reclassifier.py`, fixed-plan preflight and postapproval reconciliation
+- Scope: `gmail_message_reclassifier.py`, fixed-plan preflight, postapproval and final reconciliation
 - Trigger / search terms: Issue #31, interrupted reconciliation, history expiry, repeated events, pending intent
-- Last verified: 2026-11-20, synthetic regressions with the Google SDK installed and network disabled
+- Last verified: 2026-11-28, synthetic regressions with the Google SDK installed and network disabled
 - Evidence: [regression tests](../../../tests/test_reconciliation_checkpoint.py), [canonical specification](../../issue-6-message-reclassification.md#固定計画の照合再開issue-31)
 
 ## Observation and cause
@@ -23,4 +23,4 @@ There are two separate durable states: evidence that metadata was checked, and t
 
 ## Limits
 
-These are synthetic safety and request-count results, not production timing or a guarantee of atomic Gmail state. Planning checkpoint v2 has different rules; use [message-planning-consistency](message-planning-consistency.md) for unfinished plans. Final reconciliation is still a full read, and the existing no-intent pending-pointer cleanup rule remains in effect.
+These are synthetic safety and request-count results, not production timing or a guarantee of atomic Gmail state. Planning checkpoint v2 has different rules; use [message-planning-consistency](message-planning-consistency.md) for unfinished plans. Issue #35 extends history validation to interrupted final scans. Use final-stage evidence across renewed approval only when the journal has no remaining writes. Arbitrary Gmail queries may depend on time without a history event, so drift checks relying on them need fresh evaluation. See the [system drift regressions](../../../tests/test_message_system_drift.py).

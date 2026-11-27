@@ -245,9 +245,9 @@ class MessageTests(unittest.TestCase):
     def test_changed_during_final_prompt_stops_before_write(self):
         plan = self.plan()
         def approve(prompt):
-            self.client.mail["a"]["labelIds"].remove("UNREAD")
-            self.client.history_events.append({"labelsRemoved": [
-                {"message": {"id": "a"}, "labelIds": ["UNREAD"]}]})
+            self.client.mail["a"]["labelIds"].append("SPAM")
+            self.client.history_events.append({"labelsAdded": [
+                {"message": {"id": "a"}, "labelIds": ["SPAM"]}]})
             return True
         with patch.object(d, "confirm_interactive", side_effect=approve), patch("sys.stdin.isatty", return_value=True):
             with self.assertRaises(d.DeploymentError):

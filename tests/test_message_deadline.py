@@ -66,8 +66,8 @@ class MessageDeadlineTests(unittest.TestCase):
     def test_upfront_preflight_conflict_without_any_intent_allows_fresh_plan(self):
         plan = self.plan()
         args = self.authorize()
-        self.client.mail['a']['labelIds'].remove('UNREAD')
-        with self.assertRaisesRegex(d.DeploymentError, 'システム状態の外部変更'):
+        self.client.mail['a']['labelIds'].append('TRASH')
+        with self.assertRaisesRegex(d.DeploymentError, '所属が変更'):
             m.execute(self.api, plan, self.local, authorization=args._message_authorization)
         self.assertEqual(self.client.writes, [])
         self.assertFalse((self.local/m.PENDING).exists())

@@ -1,6 +1,6 @@
 """Message-only label replacement with immutable plans and durable, reversible intents.
 
-Searches run before any writes. Settings compilation remains in the deployer;
+Planning and drift checks use Gmail search results. Settings compilation remains in the deployer;
 this module never submits system labels, deletes messages, or creates labels.
 """
 from __future__ import annotations
@@ -26,7 +26,11 @@ DEFERRED_SCHEMA = "gmail-message-reclassification/v2"
 SEARCH_VERSION = "message-search/v1"
 RUN_AUTHORIZATION_POLICY = "replace-eligible-user-labels/v1"
 EXCLUDED = frozenset({"SENT", "DRAFT", "SPAM", "TRASH", "CHAT"})
-SYSTEM_IDS = EXCLUDED | {"INBOX", "UNREAD", "STARRED", "IMPORTANT", "DRAFTS", "ALL"}
+STAR_TYPES = {"YELLOW_STAR", "ORANGE_STAR", "RED_STAR", "PURPLE_STAR", "BLUE_STAR", "GREEN_STAR",
+              "RED_BANG", "ORANGE_GUILLEMET", "YELLOW_BANG", "GREEN_CHECK", "BLUE_INFO", "PURPLE_QUESTION"}
+ORDINARY_SYSTEM = STAR_TYPES | {"STARRED", "UNREAD", "IMPORTANT", "INBOX", "CATEGORY_PERSONAL",
+                                "CATEGORY_SOCIAL", "CATEGORY_PROMOTIONS", "CATEGORY_UPDATES", "CATEGORY_FORUMS"}
+SYSTEM_IDS = EXCLUDED | ORDINARY_SYSTEM | {"DRAFTS", "ALL"}
 PENDING = "messages_pending.json"
 FILTER_MATCH_DELAYS_SECONDS = (30, 60)
 ATOM = r'[^\s{}()"\\:]+'
@@ -900,7 +904,20 @@ class Plan:
                         "保留メールの件数不一致")
             self.labels = m["labels"]
             self.users = {lid for lid, row in self.labels.items() if row["type"] == "user"}
-            self.rules = [json.loads(row[0]) for row in self.db.execute("SELECT template FROM rules ORDER BY number")]
+            self.rules = []
+            name_ids = {self.labels[lid]["name"]: lid for lid in self.users}
+            self.classification_rules = []
+            self.query_dependencies = {}
+            for saved in self.db.execute("SELECT template,spec FROM rules ORDER BY number"):
+                rule, spec = json.loads(saved["template"]), json.loads(saved["spec"])
+                self.rules.append(rule)
+                targets = {name_ids[x[6:]] for x in rule["action"]["addLabelIds"] if x.startswith("label:")}
+                self.classification_rules.append((spec["all"], spec["exclude"], targets))
+                queries = [q for group in spec["all"] for q in group] + [spec["exclude"]]
+                for query in filter(None, queries):
+                    self.query_dependencies[query] = query_dependency(query, name_ids)
+            self.check_searches = any(kind != "immutable" for kind in self.query_dependencies.values())
+            self.has_opaque_query = "opaque" in self.query_dependencies.values()
             for row in self.rows():
                 require(set(json.loads(row["before_labels"])) <= self.labels.keys() and
                         set(json.loads(row["desired"])) <= self.users and not self.before(row) & EXCLUDED,
@@ -1040,7 +1057,43 @@ class Journal:
               "競合検出累計": self.db.execute("SELECT count(*) FROM events WHERE kind='conflict'").fetchone()[0]}), flush=True)
 
 
-def observe(api, plan, journal, row, mode, *, now=None):
+def query_dependency(query, user_names):
+    # Recognize only entire, simple predicates. Gmail evaluates every mutable
+    # expression; this distinction controls which evidence we can reuse.
+    atom = query[1:-1] if query.startswith("(") and query.endswith(")") else query
+    if re.fullmatch(r'(?:from|to|cc|bcc|subject):(?:[\w@.+/-]+|"[^"\\]*")', atom):
+        return "immutable"
+    # An exact custom-label predicate is independent of system flags. Use its
+    # planned Gmail membership even after our own write removes that label.
+    if re.fullmatch(r"label:[\w/-]+", atom) and atom[6:] in user_names and "/" in atom[6:]:
+        return "immutable"
+    if re.fullmatch(r'(?:is:(?:read|unread|starred|important)|in:(?:inbox|archive)|'
+                    r'category:(?:primary|social|promotions|updates|forums))', atom) or (
+            atom.startswith("has:") and atom[4:] in {s.lower().replace("_", "-") for s in STAR_TYPES}):
+        return "system"
+    return "opaque"
+
+
+def verify_classification(api, plan, mid, owned_change, detail, searches):
+    def hit(query):
+        dependency = plan.query_dependencies[query]
+        if dependency == "immutable":
+            return plan.db.execute("SELECT 1 FROM query_hits WHERE query=? AND message=?",
+                                   (query, mid)).fetchone() is not None
+        if owned_change and dependency == "opaque":
+            raise d.DeploymentError(detail + " 所有するユーザーラベル更新と検索条件の影響を分離できません")
+        if query not in searches:
+            searches[query] = set(api.ids(query))
+        return mid in searches[query]
+
+    labels = set()
+    for groups, negative, targets in plan.classification_rules:
+        if all(any(hit(q) for q in group) for group in groups) and not (negative and hit(negative)):
+            labels.update(targets)
+    require(labels == plan.desired(plan.row(mid)), detail + " Gmail検索による分類結果が固定計画と異なります")
+
+
+def observe(api, plan, journal, row, mode, *, now=None, phase="照合", searches=None):
     """Resolve only an owned intent; exact new-state observation alone is insufficient."""
     mid = row["id"]
     status = journal.state(mid) if journal else "new"
@@ -1049,17 +1102,26 @@ def observe(api, plan, journal, row, mode, *, now=None):
     now = now if now is not None else api.message(mid, plan.labels)
     actual = set(now["labelIds"])
     before, desired = plan.before(row), plan.desired(row)
-    require(now["threadId"] == row["thread_id"] and not actual & EXCLUDED, "対象メールの所属が変更されています: " + mid)
-    if mode == "apply":
-        require(actual - plan.users == before - plan.users, "システム状態の外部変更: " + mid)
+    planned_system, live_system = before - plan.users, actual - plan.users
+    delta = planned_system ^ live_system
+    detail = (f"{phase} メール {mid} システムラベル差分 "
+              f"追加={sorted(live_system - planned_system)} 削除={sorted(planned_system - live_system)}")
+    require(now["threadId"] == row["thread_id"] and not actual & EXCLUDED,
+            detail + " 対象メールの所属が変更されています")
     old = before & plan.users
     current = actual & plan.users
     if status in ("new", "unchanged", "restored"):
-        require(current == old, "未変更メールのユーザーラベル競合: " + mid)
+        require(current == old, detail + " 未変更メールのユーザーラベル競合")
     elif status == "applied":
-        require(current == desired, "更新済みメールのユーザーラベル競合: " + mid)
+        require(current == desired, detail + " 更新済みメールのユーザーラベル競合")
     elif status in ("pending", "restore_pending"):
-        require(current in (old, desired), "結果不明メールのユーザーラベル競合: " + mid)
+        require(current in (old, desired), detail + " 結果不明メールのユーザーラベル競合")
+    if mode == "apply" and delta:
+        require(delta <= ORDINARY_SYSTEM, detail + " 未対応のシステム状態のため分類への影響が不明です")
+        if plan.check_searches:
+            verify_classification(api, plan, mid, current != old, detail, searches if searches is not None else {})
+        print(detail + " 許容（固定計画の分類と一致）", flush=True)
+    if status in ("pending", "restore_pending"):
         if status == "pending":
             journal.set_state(mid, "applied" if current == desired else "new")
         else:
@@ -1083,18 +1145,18 @@ def validate_labels(api, plan):
 RECONCILIATION = "reconciliation.sqlite"
 
 
-def reconciliation_identity(plan, journal, mode):
+def reconciliation_identity(plan, journal, mode, stage):
     """A read checkpoint never grants approval or invents write ownership."""
     states = [tuple(row) for row in journal.db.execute(
         "SELECT message,status FROM progress ORDER BY message")] if journal else []
     intents = [tuple(row) for row in journal.db.execute(
         "SELECT * FROM intents ORDER BY seq")] if journal else []
-    return hashlib.sha256(encode([1, plan.manifest["digest"], mode, states, intents]).encode()).hexdigest()
+    return hashlib.sha256(encode([2, plan.manifest["digest"], mode, stage, states, intents]).encode()).hexdigest()
 
 
 class ReconciliationCheckpoint:
     """Disposable read evidence, separate from the fixed plan and write journal."""
-    def __init__(self, plan, journal, mode):
+    def __init__(self, plan, journal, mode, stage):
         path = plan.directory / RECONCILIATION
         require(not path.is_symlink(), "照合進捗のsymlinkは使用できません")
         self.db = connect_db(path)
@@ -1104,7 +1166,7 @@ class ReconciliationCheckpoint:
                 CREATE TABLE IF NOT EXISTS verified(message TEXT PRIMARY KEY);
             """)
             require(self.db.execute("PRAGMA integrity_check").fetchone()[0] == "ok", "照合進捗DBが破損しています")
-            identity = reconciliation_identity(plan, journal, mode)
+            identity = reconciliation_identity(plan, journal, mode, stage)
             meta = dict(self.db.execute("SELECT key,value FROM meta"))
             if meta.get("identity") != identity:
                 with self.db:
@@ -1139,9 +1201,9 @@ def discard_reconciliation(plan):
     sync_directory(plan.directory)
 
 
-def reconcile_checkpoint(api, plan, journal, mode, phase):
+def reconcile_checkpoint(api, plan, journal, mode, phase, stage):
     """Reuse only unchanged read evidence; establish a quiet interval before return."""
-    checkpoint = ReconciliationCheckpoint(plan, journal, mode)
+    checkpoint = ReconciliationCheckpoint(plan, journal, mode, stage)
     try:
         ids = {row["id"] for row in plan.rows()}
         total = len(ids)
@@ -1153,6 +1215,7 @@ def reconcile_checkpoint(api, plan, journal, mode, phase):
             cursor = api.history_start()
             changed = None
             if checkpoint.cursor is not None:
+                require(int(checkpoint.cursor) <= int(cursor), "照合進捗の履歴位置が現在より先です")
                 try:
                     _, changed, _ = api.changes(checkpoint.cursor, minimum_history=cursor)
                 except Exception as exc:
@@ -1166,11 +1229,13 @@ def reconcile_checkpoint(api, plan, journal, mode, phase):
             show_progress(phase, n, total, force=True)
             if n:
                 print(f"[メール進捗] {phase}: 履歴確認済み{n}件を再利用、残り{total - n}件", flush=True)
+            searches = {}
             try:
                 for mid, raw in api.snapshots(row["id"] for row in plan.rows() if row["id"] not in verified):
                     try:
-                        observe(api, plan, journal, plan.row(mid), mode,
-                                now=api.metadata(mid, raw, plan.labels))
+                        row = plan.row(mid)
+                        now = api.metadata(mid, raw, plan.labels)
+                        observe(api, plan, journal, row, mode, now=now, phase=phase, searches=searches)
                         # An owned pending intent may have been resolved. Persist
                         # that state BEFORE caching the fact that this ID was checked.
                         if journal and journal.db.in_transaction:
@@ -1180,7 +1245,10 @@ def reconcile_checkpoint(api, plan, journal, mode, phase):
                             journal.event("conflict", {"message": mid, "error": str(exc)})
                             journal.db.commit()
                         raise
-                    checkpoint.db.execute("INSERT OR REPLACE INTO verified VALUES(?)", (mid,))
+                    # Arbitrary searches can change with time, without message history.
+                    if (mode == "restore" or not plan.has_opaque_query or
+                            set(now["labelIds"]) - plan.users == plan.before(row) - plan.users):
+                        checkpoint.db.execute("INSERT OR REPLACE INTO verified VALUES(?)", (mid,))
                     n += 1
                     if n % 50 == 0:
                         checkpoint.db.commit()
@@ -1208,7 +1276,7 @@ def reconcile_checkpoint(api, plan, journal, mode, phase):
                 journal.db.commit()
             with checkpoint.db:
                 checkpoint.db.execute("UPDATE meta SET value=? WHERE key='identity'",
-                                      (reconciliation_identity(plan, journal, mode),))
+                                      (reconciliation_identity(plan, journal, mode, stage),))
             show_progress(phase, total, total, force=True)
             return
         raise d.DeploymentError("照合中の変更または履歴期限切れが継続しています。固定計画から再開してください")
@@ -1216,9 +1284,9 @@ def reconcile_checkpoint(api, plan, journal, mode, phase):
         checkpoint.close()
 
 
-def reconcile(api, plan, journal, mode, *, phase="最終照合", checkpoint=False):
+def reconcile(api, plan, journal, mode, *, phase="最終照合", checkpoint=False, stage="prewrite"):
     if checkpoint:
-        return reconcile_checkpoint(api, plan, journal, mode, phase)
+        return reconcile_checkpoint(api, plan, journal, mode, phase, stage)
     total = plan.manifest["summary"]["target"]
     show_progress(phase, 0, total)
     validate_labels(api, plan)
@@ -1237,6 +1305,25 @@ def reconcile(api, plan, journal, mode, *, phase="最終照合", checkpoint=Fals
     show_progress(phase, total, total, force=True)
     if journal:
         journal.db.commit()
+
+
+def observe_batch(api, plan, journal, ids, mode, phase, *, sent_systems=None):
+    """A shared query result belongs to one stable interval on one side of a write."""
+    for _ in range(MAX_RECONCILE_PASSES):
+        cursor = api.history_start() if mode == "apply" and plan.check_searches else None
+        searches, systems = {}, {}
+        for mid, raw in api.snapshots(ids):
+            now = api.metadata(mid, raw, plan.labels)
+            systems[mid] = sorted(set(now["labelIds"]) - plan.users)
+            if mode == "restore" and sent_systems is not None:
+                require(systems[mid] == sent_systems[mid], "送信中にシステム状態が変更されました: " + mid)
+            observe(api, plan, journal, plan.row(mid), mode, now=now, phase=phase, searches=searches)
+        if not searches:
+            return systems
+        _, changed, _ = api.changes(cursor, minimum_history=cursor)
+        if changed.isdisjoint(ids):
+            return systems
+    raise d.DeploymentError(f"{phase}中に対象メールの変更が続き、検索結果を確認できません")
 
 
 def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=None, authorization=None, deadline=None):
@@ -1274,7 +1361,11 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
             journal.db.commit()
             save(local_dir / PENDING, {"run_id": plan.directory.name, "mode": mode,
                                       "digest": plan.manifest["digest"]})
-        reconcile(api, plan, journal, mode, phase="事前照合", checkpoint=True)
+        final_states = {"applied"} if mode == "apply" else {"new", "restored"}
+        final_only = journal is not None and all(
+            row[0] in final_states for row in journal.db.execute("SELECT DISTINCT status FROM progress"))
+        stage = "final" if final_only else "prewrite"
+        reconcile(api, plan, journal, mode, phase="事前照合", checkpoint=True, stage=stage)
         plan.summary()
         if journal:
             journal.report()
@@ -1291,9 +1382,10 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
         plan.verify_files()
         if authorization is None:
             phase = "承認後照合"
-            reconcile(api, plan, journal, mode, phase="承認後照合", checkpoint=True)
+            reconcile(api, plan, journal, mode, phase="承認後照合", checkpoint=True, stage=stage)
         # Remove reusable read evidence before ANY new durable write intent.
-        discard_reconciliation(plan)
+        if not final_only:
+            discard_reconciliation(plan)
         if journal is None:
             journal = Journal(plan, create=True)
         journal.set_meta("mode", mode)
@@ -1334,11 +1426,7 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
                 validate_labels(api, plan)
                 if mode == "apply":
                     api.filters_match(plan.rules, plan.labels, normalization=plan.manifest["normalization_version"])
-                systems = {}
-                for mid, raw in api.snapshots(ids):
-                    now = observe(api, plan, journal, plan.row(mid), mode,
-                                  now=api.metadata(mid, raw, plan.labels))
-                    systems[mid] = sorted(set(now["labelIds"]) - plan.users)
+                systems = observe_batch(api, plan, journal, ids, mode, phase)
                 journal.db.execute("INSERT INTO intents(mode,ids,add_labels,remove_labels,systems) VALUES(?,?,?,?,?)",
                                    (mode, encode(ids), encode(add), encode(remove), encode(systems)))
                 for mid in ids:
@@ -1357,11 +1445,7 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
                 phase = "書込み後照合"
                 try:
                     # Even a successful empty batch response is not a per-message acknowledgement.
-                    for mid, raw in api.snapshots(ids):
-                        now = api.metadata(mid, raw, plan.labels)
-                        require(sorted(set(now["labelIds"]) - plan.users) == systems[mid],
-                                "送信中にシステム状態が変更されました: " + mid)
-                        observe(api, plan, journal, plan.row(mid), mode, now=now)
+                    observe_batch(api, plan, journal, ids, mode, phase, sent_systems=systems)
                 finally:
                     api.deadline = deadline
                 journal.db.commit()
@@ -1376,15 +1460,15 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
                               completed_changes, total_changes, force=True)
                 phase = "更新直前照合"
         phase = "最終照合"
-        reconcile(api, plan, journal, mode, phase="最終照合")
-        expected = {"applied"} if mode == "apply" else {"new", "restored"}
-        require(all(row[0] in expected for row in journal.db.execute("SELECT status FROM progress")),
+        reconcile(api, plan, journal, mode, phase=phase, checkpoint=True, stage="final")
+        require(all(row[0] in final_states for row in journal.db.execute("SELECT status FROM progress")),
                 "メール更新の未確認進捗が残っています")
         complete = mode == "restore" or plan.deferred_count == 0
         journal.set_meta("complete", "true" if complete else "false")
         journal.db.execute("INSERT OR REPLACE INTO meta VALUES('eligible_verified', 'true')")
         journal.event("verified", {"mode": mode, "deferred_unknown_labels": plan.deferred_count})
         journal.db.commit()
+        discard_reconciliation(plan)
         (local_dir / PENDING).unlink()
         sync_directory(local_dir)
         if not complete:
@@ -1406,8 +1490,9 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
     except BaseException as exc:
         write_state = ("この実行のラベル書込みは開始済みです。保存進捗から反映状況を照合してください"
                        if write_started else "この実行のラベル書込みは未開始です")
+        command = ("restore-labels --run-id " if mode == "restore" else "reclassify --resume ") + plan.directory.name
         exc.message_stop_context = (f"{phase}で停止。{write_state}。固定計画・バックアップを保持し、"
-                                    "同じrun-idから再開してください（再開時にも承認が必要です）")
+                                    f"原因確認後、docker compose run --rm --service-ports deployer {command}（再承認が必要です）")
         if journal:
             journal.set_meta("complete", "false")
             journal.db.execute("INSERT OR REPLACE INTO meta VALUES('eligible_verified', 'false')")

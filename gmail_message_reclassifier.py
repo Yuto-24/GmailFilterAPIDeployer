@@ -1307,6 +1307,25 @@ def reconcile(api, plan, journal, mode, *, phase="最終照合", checkpoint=Fals
         journal.db.commit()
 
 
+def observe_batch(api, plan, journal, ids, mode, phase, *, sent_systems=None):
+    """A shared query result belongs to one stable interval on one side of a write."""
+    for _ in range(MAX_RECONCILE_PASSES):
+        cursor = api.history_start() if mode == "apply" and plan.check_searches else None
+        searches, systems = {}, {}
+        for mid, raw in api.snapshots(ids):
+            now = api.metadata(mid, raw, plan.labels)
+            systems[mid] = sorted(set(now["labelIds"]) - plan.users)
+            if mode == "restore" and sent_systems is not None:
+                require(systems[mid] == sent_systems[mid], "送信中にシステム状態が変更されました: " + mid)
+            observe(api, plan, journal, plan.row(mid), mode, now=now, phase=phase, searches=searches)
+        if not searches:
+            return systems
+        _, changed, _ = api.changes(cursor, minimum_history=cursor)
+        if changed.isdisjoint(ids):
+            return systems
+    raise d.DeploymentError(f"{phase}中に対象メールの変更が続き、検索結果を確認できません")
+
+
 def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=None, authorization=None, deadline=None):
     """Validate, ask once for this invocation, send durable intents, and read back."""
     require(mode in ("apply", "restore"), "メール更新modeが不正です")
@@ -1407,11 +1426,7 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
                 validate_labels(api, plan)
                 if mode == "apply":
                     api.filters_match(plan.rules, plan.labels, normalization=plan.manifest["normalization_version"])
-                systems = {}
-                for mid, raw in api.snapshots(ids):
-                    now = observe(api, plan, journal, plan.row(mid), mode,
-                                  now=api.metadata(mid, raw, plan.labels), phase=phase)
-                    systems[mid] = sorted(set(now["labelIds"]) - plan.users)
+                systems = observe_batch(api, plan, journal, ids, mode, phase)
                 journal.db.execute("INSERT INTO intents(mode,ids,add_labels,remove_labels,systems) VALUES(?,?,?,?,?)",
                                    (mode, encode(ids), encode(add), encode(remove), encode(systems)))
                 for mid in ids:
@@ -1430,12 +1445,7 @@ def execute(api, plan, local_dir, *, mode="apply", batch_size=50, max_batches=No
                 phase = "書込み後照合"
                 try:
                     # Even a successful empty batch response is not a per-message acknowledgement.
-                    for mid, raw in api.snapshots(ids):
-                        now = api.metadata(mid, raw, plan.labels)
-                        if mode == "restore":
-                            require(sorted(set(now["labelIds"]) - plan.users) == systems[mid],
-                                    "送信中にシステム状態が変更されました: " + mid)
-                        observe(api, plan, journal, plan.row(mid), mode, now=now, phase=phase)
+                    observe_batch(api, plan, journal, ids, mode, phase, sent_systems=systems)
                 finally:
                     api.deadline = deadline
                 journal.db.commit()

@@ -73,6 +73,34 @@ class SystemDriftTests(unittest.TestCase):
         self.assertEqual(self.client.queries, [predicate, predicate])
         self.assertEqual(len(self.client.writes), 1)
 
+    def test_batch_shares_search_only_within_one_stable_phase(self):
+        plan, predicate = self.query_plan("in:inbox")
+        self.client.add("b")
+        self.client.hits[predicate].add("b")
+        plan = self.plan()
+        self.client.page_size = 50
+        for mid in "ab":
+            self.client.mail[mid]["labelIds"].remove("UNREAD")
+        self.client.queries.clear()
+        run_batch = m.observe_batch
+        calls = []
+        def observe_group(*args, **kwargs):
+            start = len(self.client.queries)
+            if kwargs.get("sent_systems") is None:
+                # A repeat event inside the first prewrite search invalidates it.
+                def once(kind):
+                    if kind == "messages.list":
+                        self.client.history_events.append({"messages": [{"id": "a"}]})
+                        self.client.on_request = None
+                self.client.on_request = once
+            result = run_batch(*args, **kwargs)
+            calls.append(self.client.queries[start:])
+            return result
+        with patch.object(m, "observe_batch", side_effect=observe_group):
+            self.assertTrue(self.execute(plan))
+        self.assertEqual(calls, [[predicate, predicate], [predicate]])
+        self.assertEqual(len(self.client.writes), 1)
+
     def test_unrecognized_system_label_in_saved_catalog_blocks(self):
         self.client.systems.add("FUTURE_SYSTEM")
         plan = self.plan()
